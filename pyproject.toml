@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "variant-annotation"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "click",
+    "python-dotenv",
+    "requests",
+    "biopython",
+    "variant-translation==1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black",
+]
+tests = []
+mapping = [
+    "dcd-mapping @ git+https://github.com/VariantEffect/dcd_mapping2.git@mavedb-main",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]

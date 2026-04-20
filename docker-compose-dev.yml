@@ -1,0 +1,91 @@
+services:
+  map-variants:
+    build: .
+    platform: linux/amd64
+    profiles:
+      - tools
+    depends_on:
+      - cdot
+      - db
+      - seqrepo
+      - uta
+    env_file:
+      - settings/.env.dev
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+    entrypoint: ["python", "-m", "src.map_variants"]
+    command: ["--help"]
+    volumes:
+      - .:/usr/src/app
+      - variant-annotation-seqrepo:/usr/local/share/seqrepo
+      - ${VARIANT_DATA_DIR:-./data}:/work
+
+  reverse-translate-proteins:
+    build: .
+    platform: linux/amd64
+    profiles:
+      - tools
+    depends_on:
+      - seqrepo
+      - uta
+    env_file:
+      - settings/.env.dev
+    entrypoint: ["python", "-m", "src.reverse_translate_protein_variants"]
+    command: ["--help"]
+    volumes:
+      - .:/usr/src/app
+      - variant-annotation-seqrepo:/usr/local/share/seqrepo
+      - ${VARIANT_DATA_DIR:-./data}:/work
+
+  cdot:
+    build:
+      context: https://github.com/VariantEffect/cdot_rest.git
+    image: cdot-rest
+    command: bash -c "gunicorn cdot_rest.wsgi:application --bind 0.0.0.0:8000"
+    env_file:
+      - settings/.env.dev
+    depends_on:
+      - redis
+      - seqrepo
+    ports:
+      - "8011:8000"
+    volumes:
+      - variant-annotation-seqrepo:/usr/local/share/seqrepo
+
+  db:
+    image: postgres:14
+    env_file:
+      - settings/.env.dev
+    ports:
+      - "5442:5432"
+    expose:
+      - 5432
+    volumes:
+      - variant-annotation-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7.2.3
+    env_file:
+      - settings/.env.dev
+    ports:
+      - "6382:6379"
+    volumes:
+      - variant-annotation-redis:/data
+
+  seqrepo:
+    image: biocommons/seqrepo:2024-12-20
+    volumes:
+      - variant-annotation-seqrepo:/usr/local/share/seqrepo
+
+  uta:
+    image: biocommons/uta:uta_20241220
+    environment:
+      POSTGRES_PASSWORD: ${UTA_POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - ./data/uta/uta_20241220.pgd.gz:/tmp/uta_20241220.pgd.gz:ro
+
+volumes:
+  variant-annotation-data:
+  variant-annotation-redis:
+  variant-annotation-seqrepo:
