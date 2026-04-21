@@ -10,7 +10,7 @@ services:
       - seqrepo
       - uta
     env_file:
-      - settings/.env.dev
+      - settings/.env
     environment:
       DB_HOST: db
       DB_PORT: 5432
@@ -30,7 +30,7 @@ services:
       - seqrepo
       - uta
     env_file:
-      - settings/.env.dev
+      - settings/.env
     entrypoint: ["python", "-m", "src.reverse_translate_protein_variants"]
     command: ["--help"]
     volumes:
@@ -44,7 +44,7 @@ services:
     profiles:
       - tools
     env_file:
-      - settings/.env.dev
+      - settings/.env
     environment:
       CLINVAR_CACHE_DIR: /clinvar-cache
     entrypoint: ["python", "-m", "src.annotate_clinvar"]
@@ -60,7 +60,7 @@ services:
     profiles:
       - tools
     env_file:
-      - settings/.env.dev
+      - settings/.env
     environment:
       GNOMAD_CACHE_DIR: /gnomad-cache
     entrypoint: ["python", "-m", "src.annotate_gnomad"]
@@ -76,7 +76,7 @@ services:
     image: cdot-rest
     command: bash -c "gunicorn cdot_rest.wsgi:application --bind 0.0.0.0:8000"
     env_file:
-      - settings/.env.dev
+      - settings/.env
     depends_on:
       - redis
       - seqrepo
@@ -88,7 +88,7 @@ services:
   db:
     image: postgres:14
     env_file:
-      - settings/.env.dev
+      - settings/.env
     ports:
       - "5442:5432"
     expose:
@@ -99,7 +99,7 @@ services:
   redis:
     image: redis:7.2.3
     env_file:
-      - settings/.env.dev
+      - settings/.env
     ports:
       - "6382:6379"
     volumes:
