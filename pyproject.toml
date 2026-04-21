@@ -25,13 +25,36 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "black",
+    "ruff",
 ]
-tests = []
+publish = [
+    "build",
+    "twine",
+]
+tests = [
+    "pytest",
+]
 mapping = [
     "dcd-mapping @ git+https://github.com/VariantEffect/dcd_mapping2.git@mavedb-main",
 ]
 
+[project.urls]
+"Homepage" = "https://github.com/bbi-lab/variant-annotation"
+"Bug Tracker" = "https://github.com/bbi-lab/variant-annotation/issues"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.format]
+line-ending = "lf"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+namespaces = true
+
+[tool.variant-translation.build-instructions]
+build_command = "python -m build"
+check_command = "python -m twine check dist/*"
+upload_command = "python -m twine upload dist/*"
