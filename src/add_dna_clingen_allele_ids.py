@@ -161,6 +161,30 @@ def _is_dna_variant_row(
     return bool(raw_nt) and not bool(raw_pro)
 
 
+def _validate_clingen_id_prefix(
+    existing_id: str,
+    is_dna_row: bool,
+    row_index: int,
+) -> None:
+    """Validate that ClinGen allele ID has the correct prefix based on variant type.
+    
+    DNA variants should have IDs starting with "CA" (ClinGen Allele).
+    Protein variants should have IDs starting with "PA" (Protein Allele).
+    
+    Raises ValueError if the prefix doesn't match the variant type.
+    """
+    if not existing_id:
+        return
+    
+    expected_prefix = "CA" if is_dna_row else "PA"
+    if not existing_id.startswith(expected_prefix):
+        variant_type = "DNA" if is_dna_row else "protein"
+        raise ValueError(
+            f"Row {row_index}: Invalid ClinGen allele ID prefix for {variant_type} variant. "
+            f"Expected prefix '{expected_prefix}' but got '{existing_id[:2]}' in '{existing_id}'"
+        )
+
+
 def build_dna_clingen_value(
     row: dict[str, str],
     *,
@@ -233,7 +257,17 @@ def add_dna_clingen_allele_ids(
     lookup_cache: dict[str, str] = {}
     populated = 0
 
-    for row in rows:
+    for row_index, row in enumerate(rows, start=2):  # Start at 2 (header is row 1)
+        existing_id = (row.get(clingen_allele_id_col) or "").strip()
+        is_dna_row = _is_dna_variant_row(
+            row,
+            raw_hgvs_nt_col=raw_hgvs_nt_col,
+            raw_hgvs_pro_col=raw_hgvs_pro_col,
+        )
+        
+        # Validate ClinGen allele ID prefix matches variant type
+        _validate_clingen_id_prefix(existing_id, is_dna_row, row_index)
+        
         value = build_dna_clingen_value(
             row,
             clingen_allele_id_col=clingen_allele_id_col,
