@@ -1,5 +1,14 @@
 # variant-annotation
 
+## License
+
+This project is licensed under the GNU Affero General Public License v3.0 or
+later. See the [LICENSE](LICENSE) file.
+
+The AGPL choice reflects that parts of the variant-mapping pipeline are
+intentionally modeled on established MaveDB workflow behavior and may include
+adapted implementation ideas or logic in that area of the codebase.
+
 ## Prerequisites
 
 - [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/install/)

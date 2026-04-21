@@ -1,5 +1,12 @@
 """Map variants from a CSV/TSV input file to human-genome reference HGVS strings.
 
+Provenance
+----------
+This module is intentionally modeled on MaveDB variant-processing behavior and
+its workflow decomposition. If this file contains copied or adapted logic from
+MaveDB, treat it as AGPL-coupled when assigning a project license or when
+extracting code into a separate repository.
+
 This script is a standalone approximation of two MaveDB pipeline jobs:
 
 1. The VRS mapping job (``map_variants_for_score_set`` in ``mavedb-api``): aligns a

@@ -1,5 +1,13 @@
 """Reverse-translate mapped protein-only variants into HGVS c./g. candidates.
 
+Provenance
+----------
+This module was developed for this repository's standalone pipeline. It
+interoperates with src.map_variants output columns and project-specific Docker
+tooling, but it does not claim to be a direct extraction of a MaveDB module.
+Review it separately from src.map_variants when deciding what code is
+AGPL-coupled versus independently licensable.
+
 This is the second step of the variant-annotation pipeline. It only processes
 rows that represent assay-level protein variants, defined as rows with a
 non-blank protein HGVS value and blank c./g. HGVS values. Reverse-translated

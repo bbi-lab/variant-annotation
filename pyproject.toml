@@ -5,13 +5,22 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "variant-annotation"
 version = "0.1.0"
+authors = [
+    { name="Jeremy Stone", email="74574922+jstone-dev@users.noreply.github.com" },
+]
+description = "Genetic variant mapping and annotation pipeline"
+readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "GNU Affero General Public License v3 or later (AGPL-3.0-or-later)" }
+classifiers = [
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+]
 dependencies = [
     "click",
     "python-dotenv",
     "requests",
     "biopython",
-    "variant-translation==1.0.0",
+    "variant-translation==1.1.0b1",
 ]
 
 [project.optional-dependencies]
