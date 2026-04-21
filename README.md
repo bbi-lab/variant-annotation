@@ -18,7 +18,7 @@ adapted implementation ideas or logic in that area of the codebase.
 
 ## Development setup
 
-All pipeline scripts and services run in Docker. The development environment is defined in `docker-compose-dev.yml` and includes the following services:
+All pipeline scripts and services run in Docker. The development environment is defined in `compose.yaml` and includes the following services:
 
 **Annotation pipeline tools** (run with `--profile tools`):
 - **map-variants**: Maps variants to GRCh38 HGVS (includes BLAT, SeqRepo, Gene Normalizer)
@@ -75,7 +75,7 @@ This step is required for transcript lookups in `reverse_translate_protein_varia
 ### 3. Build and start services
 
 ```bash
-docker compose -f docker-compose-dev.yml up --build
+docker compose up --build
 ```
 
 This will:
@@ -92,7 +92,7 @@ The `cdot` service is built from source at [github.com/VariantEffect/cdot_rest](
 In a new terminal (while services are running):
 
 ```bash
-docker compose -f docker-compose-dev.yml exec app bash
+docker compose exec app bash
 ```
 
 This opens an interactive shell in the app container where you can run Python commands, tests, or scripts. Your code changes in the host repository are immediately visible in the container (via bind mount).
@@ -359,9 +359,10 @@ src/scripts/run_annotate_gnomad.sh variants_clinvar.tsv variants_final.tsv
 ClinVar and gnomAD annotation steps use Docker volumes to persist caches:
 
 ```yaml
-# In docker-compose-dev.yml
+# In compose.yaml
 
 volumes:
+```
   variant-annotation-clinvar-cache:
   variant-annotation-gnomad-cache:
 
@@ -490,7 +491,7 @@ The `map-variants` command automatically enables error-driven retry with progres
    Then pre-split your input file by gene/target sequence group before rerunning.
 
 4. **Increase Docker memory limit**:
-   Edit `docker-compose-dev.yml` and add memory limits under the `map-variants` service:
+  Edit `compose.yaml` and add memory limits under the `map-variants` service:
    ```yaml
    services:
      map-variants:
@@ -520,7 +521,7 @@ For more details on chunking options, see the [BLAT Error 137 Retry Strategy](#b
 **Problem: Reverse translation produces no candidates**
 - Ensure `mapped_hgvs_p` (protein HGVS) is present and well-formed (e.g., `p.Ala406Thr`)
 - Check that `mapped_hgvs_c` and `mapped_hgvs_g` are empty (DNA variants won't be re-translated)
-- Verify the UTA database is running: `docker compose -f docker-compose-dev.yml logs uta`
+- Verify the UTA database is running: `docker compose logs uta`
 - Check for codon degeneracy; some protein changes have very few DNA backtranslations
 
 **Problem: Reverse translation is slow**
@@ -542,7 +543,7 @@ For more details on chunking options, see the [BLAT Error 137 Retry Strategy](#b
 ### Step 4: add_variant_position_alleles Issues
 
 **Problem: Parsing errors or missing ref alleles**
-- UTA database may not be running; start it: `docker compose -f docker-compose-dev.yml up uta`
+- UTA database may not be running; start it: `docker compose up uta`
 - Some variants may have incomplete HGVS strings; safe to skip these rows
 - Check logs for specific HGVS parsing errors
 
@@ -560,14 +561,14 @@ For more details on chunking options, see the [BLAT Error 137 Retry Strategy](#b
 
 **Problem: Docker permission denied on cache volume**
 - Ensure `variant-annotation-clinvar-cache` volume exists: `docker volume ls | grep clinvar`
-- If missing, start Docker Compose once: `docker compose -f docker-compose-dev.yml up -d`
+- If missing, start Docker Compose once: `docker compose up -d`
 
 ### Step 6: annotate_gnomad Issues
 
 **Problem: "Hail is required for gnomAD annotation"**
 - gnomAD extra not installed; reinstall: `pip install -e '.[gnomad]'`
 - Ensure Java is available on the system (required by Hail)
-- In Docker, restart and rebuild: `docker compose -f docker-compose-dev.yml up --build`
+- In Docker, restart and rebuild: `docker compose up --build`
 
 **Problem: Hail table download stalls or fails**
 - First-time download from GCP public data can take 10–30 minutes

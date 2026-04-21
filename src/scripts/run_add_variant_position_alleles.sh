@@ -89,7 +89,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-exec docker compose -f docker-compose-dev.yml --profile tools run \
+exec docker compose --profile tools run \
   ${compose_build_flag:+$compose_build_flag} ${compose_no_cache_flag:+$compose_no_cache_flag} --rm --no-deps \
   --entrypoint python map-variants \
   -m src.add_variant_position_alleles "$input_in_container" "$output_in_container" "${mapped_args[@]}"
