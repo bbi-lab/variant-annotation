@@ -390,19 +390,19 @@ This ensures caches survive container restarts and are shared across runs.
                     │ clingen_allele_id   │
                     └─────────────────────┘
                                ↓
-              ┌────────────────────────────────┐
-              │ Is variant protein-only?       │
+              ┌───────────────────────────────┐
+              │ Is variant protein-only?      │
               │ (no c./g., yes p.)            │
               └────┬─────────────────┬────────┘
                    │ YES             │ NO
                    ↓                 │
-        ┌──────────────────────┐    │
-        │ reverse_translate    │    │
-        │ _protein_variants    │    │ (DNA variants pass through)
-        │                      │    │
-        │ Output: candidates   │    │
-        │ in c./g. format      │    │
-        └──────────────────────┘    │
+        ┌──────────────────────┐     │
+        │ reverse_translate    │     │
+        │ _protein_variants    │     │ (DNA variants pass through)
+        │                      │     │
+        │ Output: candidates   │     │
+        │ in c./g. format      │     │
+        └──────────────────────┘     │
                    │                 │
                    └─────────────┬───┘
                                  ↓
@@ -419,10 +419,10 @@ This ensures caches survive container restarts and are shared across runs.
               └────┬─────────────────┬───────────┘
                    │ YES             │ NO
                    ↓                 │
-        ┌────────────────────────┐  │
-        │ add_variant_position   │  │
-        │ _alleles               │  │
-        └────────────────────────┘  │
+        ┌────────────────────────┐   │
+        │ add_variant_position   │   │
+        │ _alleles               │   │
+        └────────────────────────┘   │
                    │                 │
                    └─────────────┬───┘
                                  ↓
@@ -431,12 +431,12 @@ This ensures caches survive container restarts and are shared across runs.
               └────┬─────────────────┬───────────┘
                    │ YES             │ NO
                    ↓                 │
-        ┌─────────────────────────┐ │
-        │ annotate_clinvar        │ │
-        │                         │ │
-        │ Caches: NCBI ClinVar    │ │
-        │ TSV (monthly)           │ │
-        └─────────────────────────┘ │
+        ┌─────────────────────────┐  │
+        │ annotate_clinvar        │  │
+        │                         │  │
+        │ Caches: NCBI ClinVar    │  │
+        │ TSV (monthly)           │  │
+        └─────────────────────────┘  │
                    │                 │
                    └─────────────┬───┘
                                  ↓
@@ -445,12 +445,12 @@ This ensures caches survive container restarts and are shared across runs.
               └────┬─────────────────┬───────────┘
                    │ YES             │ NO
                    ↓                 │
-        ┌─────────────────────────┐ │
-        │ annotate_gnomad         │ │
-        │                         │ │
-        │ Caches: Hail table      │ │
-        │ (indexed, keyed by CAID)│ │
-        └─────────────────────────┘ │
+        ┌─────────────────────────┐  │
+        │ annotate_gnomad         │  │
+        │                         │  │
+        │ Caches: Hail table      │  │
+        │ (indexed, keyed by CAID)│  │
+        └─────────────────────────┘  │
                    │                 │
                    └─────────────┬───┘
                                  ↓
