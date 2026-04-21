@@ -32,6 +32,7 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 import psycopg2  # type: ignore[import-untyped]
+from src.add_variant_position_alleles import _parse_hgvs
 
 load_dotenv()
 
@@ -258,6 +259,100 @@ def _resolve_transcript_accession(
     return ""
 
 
+def _split_hgvs_candidates(joined_hgvs: str) -> list[str]:
+    text = (joined_hgvs or "").strip()
+    if not text:
+        return []
+    return [part.strip() for part in text.split("|")]
+
+
+def _derive_joined_hgvs_fields(
+    joined_hgvs: str,
+    *,
+    resolve_missing_ref_alleles: bool,
+) -> tuple[str, str, str, str, str, str]:
+    candidates = _split_hgvs_candidates(joined_hgvs)
+    if not candidates:
+        return "", "", "", "", "", ""
+
+    starts: list[str] = []
+    stops: list[str] = []
+    refs: list[str] = []
+    alts: list[str] = []
+    touches_intronic: list[str] = []
+    spans_intron: list[str] = []
+
+    for candidate in candidates:
+        if not candidate:
+            starts.append("")
+            stops.append("")
+            refs.append("")
+            alts.append("")
+            touches_intronic.append("")
+            spans_intron.append("")
+            continue
+
+        start, stop, ref, alt, touches_intronic_region, spans_intronic_region = _parse_hgvs(
+            candidate,
+            resolve_missing_ref_alleles=resolve_missing_ref_alleles,
+        )
+        starts.append(start or "")
+        stops.append(stop or "")
+        refs.append(ref or "")
+        alts.append(alt or "")
+        touches_intronic.append("true" if touches_intronic_region else "false")
+        spans_intron.append("true" if spans_intronic_region else "false")
+
+    return (
+        "|".join(starts),
+        "|".join(stops),
+        "|".join(refs),
+        "|".join(alts),
+        "|".join(touches_intronic),
+        "|".join(spans_intron),
+    )
+
+
+def _populate_derived_hgvs_columns(
+    row: dict[str, str],
+    *,
+    mapped_hgvs_g_col: str,
+    mapped_hgvs_c_col: str,
+    mapped_hgvs_g_start_col: str,
+    mapped_hgvs_g_stop_col: str,
+    mapped_hgvs_g_ref_col: str,
+    mapped_hgvs_g_alt_col: str,
+    mapped_hgvs_c_start_col: str,
+    mapped_hgvs_c_stop_col: str,
+    mapped_hgvs_c_ref_col: str,
+    mapped_hgvs_c_alt_col: str,
+    touches_intronic_region_col: str,
+    spans_intron_col: str,
+    resolve_missing_ref_alleles: bool,
+) -> None:
+    g_start, g_stop, g_ref, g_alt, _, _ = _derive_joined_hgvs_fields(
+        row.get(mapped_hgvs_g_col, ""),
+        resolve_missing_ref_alleles=resolve_missing_ref_alleles,
+    )
+    c_start, c_stop, c_ref, c_alt, touches_intronic_region, spans_intron = _derive_joined_hgvs_fields(
+        row.get(mapped_hgvs_c_col, ""),
+        resolve_missing_ref_alleles=resolve_missing_ref_alleles,
+    )
+
+    row[mapped_hgvs_g_start_col] = g_start
+    row[mapped_hgvs_g_stop_col] = g_stop
+    row[mapped_hgvs_g_ref_col] = g_ref
+    row[mapped_hgvs_g_alt_col] = g_alt
+
+    row[mapped_hgvs_c_start_col] = c_start
+    row[mapped_hgvs_c_stop_col] = c_stop
+    row[mapped_hgvs_c_ref_col] = c_ref
+    row[mapped_hgvs_c_alt_col] = c_alt
+
+    row[touches_intronic_region_col] = touches_intronic_region
+    row[spans_intron_col] = spans_intron
+
+
 def reverse_translate_protein_variants(
     input_file: str,
     output_file: str,
@@ -267,6 +362,17 @@ def reverse_translate_protein_variants(
     mapped_hgvs_p_col: str = "mapped_hgvs_p",
     mapping_error_col: str = "mapping_error",
     assayed_variant_level_col: str = "assayed_variant_level",
+    mapped_hgvs_g_start_col: str = "mapped_hgvs_g_start",
+    mapped_hgvs_g_stop_col: str = "mapped_hgvs_g_stop",
+    mapped_hgvs_g_ref_col: str = "mapped_hgvs_g_ref",
+    mapped_hgvs_g_alt_col: str = "mapped_hgvs_g_alt",
+    mapped_hgvs_c_start_col: str = "mapped_hgvs_c_start",
+    mapped_hgvs_c_stop_col: str = "mapped_hgvs_c_stop",
+    mapped_hgvs_c_ref_col: str = "mapped_hgvs_c_ref",
+    mapped_hgvs_c_alt_col: str = "mapped_hgvs_c_alt",
+    touches_intronic_region_col: str = "touches_intronic_region",
+    spans_intron_col: str = "spans_intron",
+    resolve_missing_ref_alleles: bool = True,
     transcript_fallback_columns: tuple[str, ...] = (),
     assembly: str = "GRCh38",
     include_indels: bool = False,
@@ -382,6 +488,22 @@ def reverse_translate_protein_variants(
                     row.get(mapping_error_col, ""),
                     block_errors[offset],
                 )
+            _populate_derived_hgvs_columns(
+                row,
+                mapped_hgvs_g_col=mapped_hgvs_g_col,
+                mapped_hgvs_c_col=mapped_hgvs_c_col,
+                mapped_hgvs_g_start_col=mapped_hgvs_g_start_col,
+                mapped_hgvs_g_stop_col=mapped_hgvs_g_stop_col,
+                mapped_hgvs_g_ref_col=mapped_hgvs_g_ref_col,
+                mapped_hgvs_g_alt_col=mapped_hgvs_g_alt_col,
+                mapped_hgvs_c_start_col=mapped_hgvs_c_start_col,
+                mapped_hgvs_c_stop_col=mapped_hgvs_c_stop_col,
+                mapped_hgvs_c_ref_col=mapped_hgvs_c_ref_col,
+                mapped_hgvs_c_alt_col=mapped_hgvs_c_alt_col,
+                touches_intronic_region_col=touches_intronic_region_col,
+                spans_intron_col=spans_intron_col,
+                resolve_missing_ref_alleles=resolve_missing_ref_alleles,
+            )
             writer.writerow(row)
             out_handle.flush()
 
@@ -395,7 +517,23 @@ def reverse_translate_protein_variants(
                 raise ValueError(f"Input file {input_file!r} is empty or missing a header row.")
 
             out_fieldnames = list(in_fieldnames)
-            for col in (mapped_hgvs_g_col, mapped_hgvs_c_col, mapped_hgvs_p_col, mapping_error_col, assayed_variant_level_col):
+            for col in (
+                mapped_hgvs_g_col,
+                mapped_hgvs_c_col,
+                mapped_hgvs_p_col,
+                mapping_error_col,
+                assayed_variant_level_col,
+                mapped_hgvs_g_start_col,
+                mapped_hgvs_g_stop_col,
+                mapped_hgvs_g_ref_col,
+                mapped_hgvs_g_alt_col,
+                mapped_hgvs_c_start_col,
+                mapped_hgvs_c_stop_col,
+                mapped_hgvs_c_ref_col,
+                mapped_hgvs_c_alt_col,
+                touches_intronic_region_col,
+                spans_intron_col,
+            ):
                 if col not in out_fieldnames:
                     out_fieldnames.append(col)
 
@@ -437,6 +575,22 @@ def reverse_translate_protein_variants(
                     if pending_block:
                         flush_block(writer, out_fh, pending_block, pending_block_start_idx)
                         pending_block.clear()
+                    _populate_derived_hgvs_columns(
+                        row,
+                        mapped_hgvs_g_col=mapped_hgvs_g_col,
+                        mapped_hgvs_c_col=mapped_hgvs_c_col,
+                        mapped_hgvs_g_start_col=mapped_hgvs_g_start_col,
+                        mapped_hgvs_g_stop_col=mapped_hgvs_g_stop_col,
+                        mapped_hgvs_g_ref_col=mapped_hgvs_g_ref_col,
+                        mapped_hgvs_g_alt_col=mapped_hgvs_g_alt_col,
+                        mapped_hgvs_c_start_col=mapped_hgvs_c_start_col,
+                        mapped_hgvs_c_stop_col=mapped_hgvs_c_stop_col,
+                        mapped_hgvs_c_ref_col=mapped_hgvs_c_ref_col,
+                        mapped_hgvs_c_alt_col=mapped_hgvs_c_alt_col,
+                        touches_intronic_region_col=touches_intronic_region_col,
+                        spans_intron_col=spans_intron_col,
+                        resolve_missing_ref_alleles=resolve_missing_ref_alleles,
+                    )
                     writer.writerow(row)
                     out_fh.flush()
 
@@ -480,6 +634,23 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="assayed_variant_level_col",
         default="assayed_variant_level",
         help="Output column name distinguishing dna vs protein assay level.",
+    )
+    parser.add_argument("--mapped-hgvs-g-start", dest="mapped_hgvs_g_start_col", default="mapped_hgvs_g_start")
+    parser.add_argument("--mapped-hgvs-g-stop", dest="mapped_hgvs_g_stop_col", default="mapped_hgvs_g_stop")
+    parser.add_argument("--mapped-hgvs-g-ref", dest="mapped_hgvs_g_ref_col", default="mapped_hgvs_g_ref")
+    parser.add_argument("--mapped-hgvs-g-alt", dest="mapped_hgvs_g_alt_col", default="mapped_hgvs_g_alt")
+    parser.add_argument("--mapped-hgvs-c-start", dest="mapped_hgvs_c_start_col", default="mapped_hgvs_c_start")
+    parser.add_argument("--mapped-hgvs-c-stop", dest="mapped_hgvs_c_stop_col", default="mapped_hgvs_c_stop")
+    parser.add_argument("--mapped-hgvs-c-ref", dest="mapped_hgvs_c_ref_col", default="mapped_hgvs_c_ref")
+    parser.add_argument("--mapped-hgvs-c-alt", dest="mapped_hgvs_c_alt_col", default="mapped_hgvs_c_alt")
+    parser.add_argument("--touches-intronic-region", dest="touches_intronic_region_col", default="touches_intronic_region")
+    parser.add_argument("--spans-intron", dest="spans_intron_col", default="spans_intron")
+    parser.add_argument(
+        "--resolve-missing-ref-alleles",
+        dest="resolve_missing_ref_alleles",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Fill missing ref allele for accession-backed del/delins-like HGVS via HGVS normalization.",
     )
     parser.add_argument(
         "--transcript-fallback-column",
@@ -530,6 +701,17 @@ def main(argv: Optional[list[str]] = None) -> None:
         mapped_hgvs_p_col=args.mapped_hgvs_p_col,
         mapping_error_col=args.mapping_error_col,
         assayed_variant_level_col=args.assayed_variant_level_col,
+        mapped_hgvs_g_start_col=args.mapped_hgvs_g_start_col,
+        mapped_hgvs_g_stop_col=args.mapped_hgvs_g_stop_col,
+        mapped_hgvs_g_ref_col=args.mapped_hgvs_g_ref_col,
+        mapped_hgvs_g_alt_col=args.mapped_hgvs_g_alt_col,
+        mapped_hgvs_c_start_col=args.mapped_hgvs_c_start_col,
+        mapped_hgvs_c_stop_col=args.mapped_hgvs_c_stop_col,
+        mapped_hgvs_c_ref_col=args.mapped_hgvs_c_ref_col,
+        mapped_hgvs_c_alt_col=args.mapped_hgvs_c_alt_col,
+        touches_intronic_region_col=args.touches_intronic_region_col,
+        spans_intron_col=args.spans_intron_col,
+        resolve_missing_ref_alleles=args.resolve_missing_ref_alleles,
         transcript_fallback_columns=tuple(args.transcript_fallback_columns),
         assembly=args.assembly,
         include_indels=args.include_indels,
