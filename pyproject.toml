@@ -27,15 +27,18 @@ dependencies = [
 dev = [
     "ruff",
 ]
+gnomad = [
+    "hail",
+]
+mapping = [
+    "dcd-mapping @ git+https://github.com/VariantEffect/dcd_mapping2.git@mavedb-main",
+]
 publish = [
     "build",
     "twine",
 ]
 tests = [
     "pytest",
-]
-mapping = [
-    "dcd-mapping @ git+https://github.com/VariantEffect/dcd_mapping2.git@mavedb-main",
 ]
 
 [project.urls]

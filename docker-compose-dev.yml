@@ -54,6 +54,22 @@ services:
       - variant-annotation-clinvar-cache:/clinvar-cache
       - ${VARIANT_DATA_DIR:-./data}:/work
 
+  annotate-gnomad:
+    build: .
+    platform: linux/amd64
+    profiles:
+      - tools
+    env_file:
+      - settings/.env.dev
+    environment:
+      GNOMAD_CACHE_DIR: /gnomad-cache
+    entrypoint: ["python", "-m", "src.annotate_gnomad"]
+    command: ["--help"]
+    volumes:
+      - .:/usr/src/app
+      - variant-annotation-gnomad-cache:/gnomad-cache
+      - ${VARIANT_DATA_DIR:-./data}:/work
+
   cdot:
     build:
       context: https://github.com/VariantEffect/cdot_rest.git
@@ -106,3 +122,4 @@ volumes:
   variant-annotation-redis:
   variant-annotation-seqrepo:
   variant-annotation-clinvar-cache:
+  variant-annotation-gnomad-cache:

@@ -7,6 +7,7 @@ RUN apt-get clean && apt-get update && apt-get install -y \
 	build-essential \
 	curl \
 	git \
+	openjdk-17-jre-headless \
 	libbz2-dev \
 	libcurl4-openssl-dev \
 	libgsl0-dev \
@@ -47,7 +48,7 @@ RUN mkdir /usr/src/app
 WORKDIR /usr/src/app
 COPY . .
 
-RUN pip install -e '.[dev,tests,mapping]'
+RUN pip install -e '.[dev,gnomad,mapping,tests]'
 # Under linux/amd64 emulation on Apple Silicon, default polars runtime may
 # require CPU features (AVX/AVX2/FMA) unavailable via emulation.
 RUN pip install --upgrade "polars[rtcompat]<1.38.0"
