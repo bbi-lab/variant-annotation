@@ -501,7 +501,7 @@ def _process_case1_batch(
 ) -> list[
     tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]
 ]:
-    """Process a batch of case-1 HGVS values, querying ClinGen concurrently.
+    """Process a batch of class-1 HGVS values, querying ClinGen concurrently.
 
     Returns one ``(mapped_hgvs_c, mapped_hgvs_g, mapped_hgvs_p, error,
     clingen_allele_id)`` tuple per input string in the same order.
@@ -1012,7 +1012,10 @@ def map_variants(
     limit: Optional[int] = None,
     drop_columns: tuple[str, ...] = (),
     max_clingen_concurrency: int = 5,
-    preserve_order: str = "no",
+    dcd_chunk_on_137: bool = True,
+    dcd_chunk_size_on_137: int = 500,
+    dcd_max_retry_attempts: int = 3,
+    preserve_order: str = "groups",
     merge_existing_files: tuple[str, ...] = (),
     merge_match_columns: tuple[str, ...] = (),
 ) -> None:
@@ -1046,18 +1049,25 @@ def map_variants(
             after *skip* are processed.
         drop_columns: Column names to omit from the output file. Useful for removing
             large columns such as ``target_sequence`` that are not needed downstream.
+        dcd_chunk_on_137: If True, automatically retry groups that fail with BLAT
+            error code 137 using chunked processing. Disabled by default for
+            static chunking.
+        dcd_chunk_size_on_137: Initial chunk size applied on first BLAT 137 retry
+            (default: 500).
+        dcd_max_retry_attempts: Maximum number of retry attempts with progressively
+            smaller chunks (default: 3).
         merge_existing_files: One or more existing annotated CSV/TSV files whose
             mapped results should be reused. Matching rows are emitted directly and
             skipped from fresh processing.
         merge_match_columns: Additional columns that must match for merge reuse,
             in addition to ``raw_hgvs_nt_col`` and ``raw_hgvs_pro_col``.
         preserve_order: Order guarantee for output rows. Options are:
-            'no' (default): Write immediately as results arrive; groups may appear
+            'no': Write immediately as results arrive; groups may appear
                 out-of-order. Fastest mode.
             'index': Buffer by row index to guarantee exact input order. Rows emit
                 incrementally when the next contiguous index is available.
-            'groups': Assume groups are contiguous in input; buffer by group. More
-                efficient than 'index' when this assumption holds.
+            'groups' (default): Preserve input order while processing groups; buffers
+                by row index and emits incrementally.
     """
     in_sep = _detect_separator(input_file)
     out_sep = _detect_separator(output_file)
@@ -1299,8 +1309,8 @@ def map_variants(
 
             case = _detect_case(raw_nt, raw_pro)
 
-            # Process each contiguous case-1 block as soon as we encounter the
-            # first non-case-1 row that follows it.
+            # Process each contiguous class-1 block as soon as we encounter the
+            # first non-class-1 row that follows it.
             if case != 1 and pending_case1_rows:
                 _flush_case1_rows(pending_case1_rows)
 
@@ -1377,11 +1387,68 @@ def map_variants(
                             len(target_seqs),
                         )
 
-                    row_entries = [(r[0], r[2], r[3], r[4]) for r in group_rows]
-                    per_row, transcript_nm = loop.run_until_complete(
-                        _run_dcd_mapping_pipeline(group_name, target_seq, row_entries, dcd)
-                    )
                     group_rows_by_idx = {r[0]: r[1] for r in group_rows}
+                    row_entries = [(r[0], r[2], r[3], r[4]) for r in group_rows]
+
+                    # Try to process the full group; retry with chunking on BLAT error 137
+                    per_row = None
+                    transcript_nm = None
+                    last_error = None
+
+                    for attempt in range(1, dcd_max_retry_attempts + 1):
+                        try:
+                            per_row, transcript_nm = loop.run_until_complete(
+                                _run_dcd_mapping_pipeline(group_name, target_seq, row_entries, dcd)
+                            )
+                            break  # Success; exit retry loop
+                        except Exception as exc:
+                            exc_str = str(exc)
+                            last_error = exc
+                            if dcd_chunk_on_137 and "error code 137" in exc_str and attempt < dcd_max_retry_attempts:
+                                # Retry with chunking: half the remaining size each retry
+                                chunk_sz = max(1, dcd_chunk_size_on_137 // (2 ** (attempt - 1)))
+                                logger.warning(
+                                    "Group %r failed with BLAT error 137 (attempt %d/%d); retrying with chunk_size=%d.",
+                                    group_name,
+                                    attempt,
+                                    dcd_max_retry_attempts,
+                                    chunk_sz,
+                                )
+                                # Process row_entries as chunks
+                                per_row = []
+                                for start_idx in range(0, len(row_entries), chunk_sz):
+                                    chunk_entries = row_entries[start_idx : start_idx + chunk_sz]
+                                    chunk_name = f"{group_name}#retry{attempt}_chunk{start_idx // chunk_sz + 1}"
+                                    try:
+                                        chunk_per_row, chunk_tx = loop.run_until_complete(
+                                            _run_dcd_mapping_pipeline(chunk_name, target_seq, chunk_entries, dcd)
+                                        )
+                                        per_row.extend(chunk_per_row)
+                                        if transcript_nm is None:
+                                            transcript_nm = chunk_tx
+                                    except Exception as chunk_exc:
+                                        logger.error(
+                                            "Chunk %s failed: %s",
+                                            chunk_name,
+                                            _format_exc(chunk_exc),
+                                        )
+                                        # Fail individual rows in this chunk
+                                        for orig_idx, _, _, _ in chunk_entries:
+                                            per_row.append((orig_idx, None, f"BLAT chunk failed: {_format_exc(chunk_exc)}"))
+                                break  # Chunked attempt completed; exit retry loop
+                            else:
+                                # No retry, or non-137 error
+                                raise
+
+                    # If all retries failed, record errors for all rows
+                    if per_row is None:
+                        logger.error(
+                            "Group %r failed after %d attempt(s): %s",
+                            group_name,
+                            dcd_max_retry_attempts,
+                            _format_exc(last_error) if last_error else "unknown error",
+                        )
+                        per_row = [(orig_idx, None, _format_exc(last_error)) for orig_idx, _, _, _ in row_entries]
 
                     # Collect all HGVS strings that need ClinGen queries
                     hgvs_queries = []  # List of (orig_idx, row, hgvs_assay) tuples
@@ -1476,7 +1543,7 @@ def map_variants(
                 loop.close()
 
         # Safety net: emit any buffered rows that could not be flushed during normal flow.
-        if preserve_order == "index" and pending_results:
+        if preserve_order in {"index", "groups"} and pending_results:
             logger.warning(
                 "Preserve-order flush: %d buffered rows remained at end of run.",
                 len(pending_results),
@@ -1636,15 +1703,38 @@ def map_variants(
     help="Maximum number of concurrent ClinGen Allele Registry API requests.",
 )
 @click.option(
+    "--dcd-chunk-on-137/--no-dcd-chunk-on-137",
+    "dcd_chunk_on_137",
+    default=True,
+    show_default=True,
+    help="Automatically retry groups with BLAT error 137 using chunked processing.",
+)
+@click.option(
+    "--dcd-chunk-size-on-137",
+    "dcd_chunk_size_on_137",
+    default=500,
+    show_default=True,
+    type=int,
+    help="Initial chunk size for BLAT 137 retry.",
+)
+@click.option(
+    "--dcd-max-retry-attempts",
+    "dcd_max_retry_attempts",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Maximum number of retry attempts with progressively smaller chunks.",
+)
+@click.option(
     "--preserve-order",
     type=click.Choice(["no", "index", "groups"], case_sensitive=False),
-    default="no",
+    default="groups",
     show_default=True,
     help=(
         "Order guarantee mode: "
         "'no' writes immediately (potentially out of order); "
         "'index' buffers by row index to guarantee exact input order; "
-        "'groups' buffers by group assuming groups are contiguous in input (more efficient)."
+        "'groups' preserves input order while processing groups (recommended default)."
     ),
 )
 @click.option(
@@ -1691,6 +1781,9 @@ def main(
     limit: Optional[int],
     drop_columns: tuple[str, ...],
     max_clingen_concurrency: int,
+    dcd_chunk_on_137: bool,
+    dcd_chunk_size_on_137: int,
+    dcd_max_retry_attempts: int,
     preserve_order: str,
     merge_existing_files: tuple[str, ...],
     merge_match_columns: tuple[str, ...],
@@ -1729,6 +1822,9 @@ def main(
         limit=limit,
         drop_columns=drop_columns,
         max_clingen_concurrency=max_clingen_concurrency,
+        dcd_chunk_on_137=dcd_chunk_on_137,
+        dcd_chunk_size_on_137=dcd_chunk_size_on_137,
+        dcd_max_retry_attempts=dcd_max_retry_attempts,
         preserve_order=preserve_order,
         merge_existing_files=merge_existing_files,
         merge_match_columns=merge_match_columns,

@@ -112,6 +112,36 @@ the row is skipped from new mapping work.
 
 The output file is written back to the same host-mounted folder.
 
+### BLAT Error 137 Retry Strategy
+
+When processing large groups of variants, the BLAT process may fail with error code 137
+(SIGKILL), typically caused by insufficient memory. The `map-variants` command includes
+automatic error-driven retry with progressive chunking to handle this gracefully.
+
+Retry options:
+
+- `--dcd-chunk-on-137` / `--no-dcd-chunk-on-137` (default: enabled)
+  Automatically retry groups that fail with BLAT error 137 by splitting them into
+  progressively smaller chunks.
+
+- `--dcd-chunk-size-on-137 SIZE` (default: 500)
+  Initial chunk size for the first retry attempt. On subsequent retries, the chunk
+  size is halved each time (500 → 250 → 125, etc.).
+
+- `--dcd-max-retry-attempts N` (default: 3)
+  Maximum number of retry attempts allowed before recording the group as failed.
+
+Example with retry tuning:
+
+```bash
+src/scripts/run_map_variants.sh input.tsv output.tsv \
+	--dcd-chunk-on-137 \
+	--dcd-chunk-size-on-137 300 \
+	--dcd-max-retry-attempts 4
+```
+
+For more details on error handling, see the **Troubleshooting** section below.
+
 ## Local installation (without Docker)
 
 Install the package in editable mode with all extras:
@@ -131,3 +161,52 @@ Install only the runtime dependencies:
 ```bash
 pip install -e .
 ```
+
+## Troubleshooting
+
+### BLAT Error 137 (SIGKILL / Out of Memory)
+
+**Symptom:** Mapping fails with error message: "BLAT process returned error code 137"
+
+**Root Cause:** The BLAT subprocess was killed by the operating system due to out-of-memory
+(OOM) conditions. This typically occurs when processing very large groups of variants in a
+single BLAT run, as each variant pair requires significant memory for alignment.
+
+**Solution:** The `map-variants` command automatically enables error-driven retry with
+progressive chunking by default. No manual intervention is usually needed. In cases where
+error 137 still persists:
+
+1. **Reduce initial chunk size** (default: 500):
+   ```bash
+   src/scripts/run_map_variants.sh input.tsv output.tsv --dcd-chunk-size-on-137 250
+   ```
+
+2. **Increase maximum retry attempts** (default: 3):
+   ```bash
+   src/scripts/run_map_variants.sh input.tsv output.tsv --dcd-max-retry-attempts 5
+   ```
+
+3. **Disable retry and use manual chunking** (only if needed):
+   ```bash
+   src/scripts/run_map_variants.sh input.tsv output.tsv --no-dcd-chunk-on-137
+   ```
+   Then pre-split your input file by gene/target sequence group before rerunning.
+
+4. **Increase Docker memory limit**:
+   Edit `docker-compose-dev.yml` and add memory limits under the `map-variants` service:
+   ```yaml
+   services:
+     map-variants:
+       mem_limit: 8g  # or higher as needed
+       memswap_limit: 8g
+   ```
+
+5. **Create a retry input file** with only failed rows from a prior run:
+   - The output file will contain error rows with the mapping error column populated
+   - Filter to only error 137 rows: `error_code_137.tsv`
+   - Rerun on this smaller file with aggressive chunking:
+   ```bash
+   src/scripts/run_map_variants.sh error_code_137.tsv output_retry.tsv \
+       --dcd-chunk-size-on-137 100 \
+       --dcd-max-retry-attempts 5
+   ```
