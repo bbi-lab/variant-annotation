@@ -70,6 +70,24 @@ services:
       - variant-annotation-gnomad-cache:/gnomad-cache
       - ${VARIANT_DATA_DIR:-./data}:/work
 
+  annotate-spliceai:
+    build: .
+    platform: linux/amd64
+    profiles:
+      - tools
+    env_file:
+      - settings/.env
+    environment:
+      SPLICEAI_CACHE_DIR: /spliceai-cache
+      SPLICEAI_PRECOMPUTED_SNV_VCF: /spliceai-cache/spliceai_scores.masked.snv.hg38.vcf.gz
+      SPLICEAI_PRECOMPUTED_INDEL_VCF: /spliceai-cache/spliceai_scores.masked.indel.hg38.vcf.gz
+    entrypoint: ["python", "-m", "src.annotate_spliceai"]
+    command: ["--help"]
+    volumes:
+      - .:/usr/src/app
+      - variant-annotation-spliceai-cache:/spliceai-cache
+      - ${VARIANT_DATA_DIR:-./data}:/work
+
   cdot:
     build:
       context: https://github.com/VariantEffect/cdot_rest.git
@@ -123,3 +141,4 @@ volumes:
   variant-annotation-seqrepo:
   variant-annotation-clinvar-cache:
   variant-annotation-gnomad-cache:
+  variant-annotation-spliceai-cache:

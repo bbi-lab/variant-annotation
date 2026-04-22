@@ -25,6 +25,7 @@ All pipeline scripts and services run in Docker. The development environment is 
 - **reverse-translate-proteins**: Reverse-translates protein variants to DNA candidates
 - **annotate-clinvar**: Annotates with ClinVar clinical significance
 - **annotate-gnomad**: Annotates with gnomAD allele frequencies
+- **annotate-spliceai**: Annotates with SpliceAI splice-impact scores
 
 **Data and dependency services** (always running):
 - **cdot**: Transcript coordinate data service
@@ -192,6 +193,8 @@ Input variants
 [5] annotate_clinvar (optional) ──→ ClinVar clinical significance
     ↓
 [6] annotate_gnomad (optional) ──→ gnomAD allele frequencies
+  ↓
+[7] annotate_spliceai (optional) ──→ SpliceAI delta scores
     ↓
 Output: fully annotated variants
 ```
@@ -330,6 +333,45 @@ src/scripts/run_annotate_gnomad.sh output_clinvar.tsv output_final.tsv \
 - Supports custom DNA ID column via `--dna-clingen-allele-id-col` if needed
 - Cache refresh: use `--refresh-cache` flag to re-download the source table
 
+### Step 7: Annotate with SpliceAI Scores (Optional)
+
+**Purpose:** Add SpliceAI splice-impact scores per DNA HGVS candidate.
+
+**Input columns:** `mapped_hgvs_g` (from step 1 or step 2)
+
+**Output columns:** `spliceai_ds_ag`, `spliceai_ds_al`, `spliceai_ds_dg`, `spliceai_ds_dl`, `spliceai_dp_ag`, `spliceai_dp_al`, `spliceai_dp_dg`, `spliceai_dp_dl`, `spliceai_max_delta_score`
+
+**Precomputed mode (recommended):**
+```bash
+src/scripts/run_annotate_spliceai.sh output_clinvar.tsv output_spliceai.tsv \
+  --mode precomputed \
+  --precomputed-snv-vcf spliceai_scores.masked.snv.hg38.vcf.gz \
+  --precomputed-indel-vcf spliceai_scores.masked.indel.hg38.vcf.gz
+```
+
+**One-time cache/index preparation (optional):**
+```bash
+src/scripts/run_annotate_spliceai.sh output_clinvar.tsv output_spliceai.tsv \
+  --mode precomputed \
+  --precomputed-snv-vcf spliceai_scores.masked.snv.hg38.vcf.gz \
+  --precomputed-indel-vcf spliceai_scores.masked.indel.hg38.vcf.gz \
+  --prepare-cache-only
+```
+
+**Compute mode (slow, requires local SpliceAI/TensorFlow install):**
+```bash
+src/scripts/run_annotate_spliceai.sh output_clinvar.tsv output_spliceai.tsv \
+  --mode compute \
+  --genome /usr/src/app/path/to/reference.fa.gz \
+  --annotation grch38
+```
+
+**Notes:**
+- In precomputed mode, source VCFs are copied into the SpliceAI cache volume and indexed (`.tbi`) if needed.
+- For protein-derived rows with multiple DNA candidates, all SpliceAI output columns are pipe-delimited and position-aligned.
+- `spliceai_max_delta_score` is `max(DS_AG, DS_AL, DS_DG, DS_DL)` for each candidate.
+- Precomputed files can have coverage limitations (for example, missing classes of indels).
+
 ### Complete Pipeline Example
 
 Processing a file end-to-end:
@@ -352,11 +394,17 @@ src/scripts/run_annotate_clinvar.sh variants_parsed.tsv variants_clinvar.tsv
 
 # Annotate with gnomAD (optional, first time includes download)
 src/scripts/run_annotate_gnomad.sh variants_clinvar.tsv variants_final.tsv
+
+# Annotate with SpliceAI (optional)
+src/scripts/run_annotate_spliceai.sh variants_final.tsv variants_spliceai.tsv \
+  --mode precomputed \
+  --precomputed-snv-vcf spliceai_scores.masked.snv.hg38.vcf.gz \
+  --precomputed-indel-vcf spliceai_scores.masked.indel.hg38.vcf.gz
 ```
 
 ### Data Volume Management
 
-ClinVar and gnomAD annotation steps use Docker volumes to persist caches:
+ClinVar, gnomAD, and SpliceAI annotation steps use Docker volumes to persist caches:
 
 ```yaml
 # In compose.yaml
@@ -365,6 +413,7 @@ volumes:
 ```
   variant-annotation-clinvar-cache:
   variant-annotation-gnomad-cache:
+  variant-annotation-spliceai-cache:
 
 services:
   annotate-clinvar:
@@ -374,6 +423,10 @@ services:
   annotate-gnomad:
     volumes:
       - variant-annotation-gnomad-cache:/gnomad-cache
+
+  annotate-spliceai:
+    volumes:
+      - variant-annotation-spliceai-cache:/spliceai-cache
 ```
 
 This ensures caches survive container restarts and are shared across runs.
@@ -781,6 +834,20 @@ TP53	CA123456|CA123457||	Pathogenic	0.00234	0.00234	1547
 
 (Default version is `v4.1`; customize with `--gnomad-version` flag)
 
+#### Step 7: annotate_spliceai
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `spliceai_ds_ag` | float | Acceptor gain delta score |
+| `spliceai_ds_al` | float | Acceptor loss delta score |
+| `spliceai_ds_dg` | float | Donor gain delta score |
+| `spliceai_ds_dl` | float | Donor loss delta score |
+| `spliceai_dp_ag` | float | Acceptor gain delta position |
+| `spliceai_dp_al` | float | Acceptor loss delta position |
+| `spliceai_dp_dg` | float | Donor gain delta position |
+| `spliceai_dp_dl` | float | Donor loss delta position |
+| `spliceai_max_delta_score` | float | Max of DS_AG, DS_AL, DS_DG, DS_DL |
+
 ---
 
 ### Key Properties of Pipe-Delimited Columns
@@ -789,6 +856,7 @@ When a row has multiple DNA candidates (from reverse translation), the following
 - `mapped_hgvs_c`
 - `mapped_hgvs_g`
 - `dna_clingen_allele_id`
+- `spliceai_*` output columns (after step 7)
 
 **Important:** Empty slots are preserved (e.g., `CA1||CA3` has 3 candidates, 2nd without a match).
 This ensures positional alignment across all downstream annotations.
