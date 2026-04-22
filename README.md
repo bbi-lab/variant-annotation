@@ -269,7 +269,7 @@ src/scripts/run_add_dna_clingen_allele_ids.sh output_rt.tsv output_clingen.tsv
 
 **Input columns:** `mapped_hgvs_g`, `mapped_hgvs_c`, `mapped_hgvs_p`
 
-**Output columns:** For each HGVS column, adds `<column>_start`, `<column>_stop`, `<column>_ref`, `<column>_alt`. Also adds `touches_intronic_region`, `spans_intron`
+**Output columns:** For each HGVS column (g./c./p.), `<column>_start`, `<column>_stop`, `<column>_ref`, `<column>_alt`. The columns derived from the HGVS g. and c. columns are pipe-delimited (to handle multiple reverse translations of protein variants), but those derived from the HGVS p. column are not. Also adds pipe-delimited `touches_intronic_region` and `spans_intron` (both boolean flags as strings)
 
 **Command:**
 ```bash
@@ -555,7 +555,37 @@ This ensures caches survive container restarts and are shared across runs.
                    │                 │
                    └─────────────┬───┘
                                  ↓
-                       OUTPUT (annotated variants)
+              ┌──────────────────────────────────┐
+              │ Want SpliceAI splice scores?     │
+              └────┬─────────────────┬───────────┘
+                   │ YES             │ NO
+                   ↓                 │
+        ┌─────────────────────────┐  │
+        │ annotate_spliceai       │  │
+        │                         │  │
+        │ Caches: precomputed     │  │
+        │ VCFs or uses compute    │  │
+        │ mode with TensorFlow    │  │
+        └─────────────────────────┘  │
+                   │                 │
+                   └─────────────┬───┘
+                                 ↓
+              ┌──────────────────────────────────┐
+              │ Want one row per DNA variant?    │
+              │ (flatten multi-candidate rows)   │
+              └────┬─────────────────┬───────────┘
+                   │ YES             │ NO
+                   ↓                 │
+        ┌─────────────────────────┐  │
+        │ flatten_dna_variants    │  │
+        │                         │  │
+        │ Drops protein-only rows │  │
+        │ (no DNA variants)       │  │
+        └─────────────────────────┘  │
+                   │                 │
+                   └─────────────┬───┘
+                                 ↓
+                       OUTPUT (fully annotated variants)
 ```
 
 ## Troubleshooting Pipeline Issues
