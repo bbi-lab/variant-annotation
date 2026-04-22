@@ -25,15 +25,15 @@ from typing import Any, Callable, Optional
 logger = logging.getLogger(__name__)
 
 SPLICEAI_COLS = [
-    "spliceai_ds_ag",
-    "spliceai_ds_al",
-    "spliceai_ds_dg",
-    "spliceai_ds_dl",
-    "spliceai_dp_ag",
-    "spliceai_dp_al",
-    "spliceai_dp_dg",
-    "spliceai_dp_dl",
-    "spliceai_max_delta_score",
+    "spliceai.ds_ag",
+    "spliceai.ds_al",
+    "spliceai.ds_dg",
+    "spliceai.ds_dl",
+    "spliceai.dp_ag",
+    "spliceai.dp_al",
+    "spliceai.dp_dg",
+    "spliceai.dp_dl",
+    "spliceai.max_delta_score",
 ]
 
 NC_TO_CHROM_GRCH38 = {
@@ -150,14 +150,14 @@ def parse_spliceai_info(info: str, alt: Optional[str] = None) -> dict[str, str]:
 
         found = True
         current = {
-            "spliceai_ds_ag": ds_ag,
-            "spliceai_ds_al": ds_al,
-            "spliceai_ds_dg": ds_dg,
-            "spliceai_ds_dl": ds_dl,
-            "spliceai_dp_ag": dp_ag,
-            "spliceai_dp_al": dp_al,
-            "spliceai_dp_dg": dp_dg,
-            "spliceai_dp_dl": dp_dl,
+            "spliceai.ds_ag": ds_ag,
+            "spliceai.ds_al": ds_al,
+            "spliceai.ds_dg": ds_dg,
+            "spliceai.ds_dl": ds_dl,
+            "spliceai.dp_ag": dp_ag,
+            "spliceai.dp_al": dp_al,
+            "spliceai.dp_dg": dp_dg,
+            "spliceai.dp_dl": dp_dl,
         }
         for key, value in current.items():
             if key not in max_vals or value > max_vals[key]:
@@ -167,21 +167,21 @@ def parse_spliceai_info(info: str, alt: Optional[str] = None) -> dict[str, str]:
         return _empty_score_dict()
 
     ds_max = max(
-        max_vals["spliceai_ds_ag"],
-        max_vals["spliceai_ds_al"],
-        max_vals["spliceai_ds_dg"],
-        max_vals["spliceai_ds_dl"],
+        max_vals["spliceai.ds_ag"],
+        max_vals["spliceai.ds_al"],
+        max_vals["spliceai.ds_dg"],
+        max_vals["spliceai.ds_dl"],
     )
     out = {
-        "spliceai_ds_ag": _fmt_score(max_vals["spliceai_ds_ag"]),
-        "spliceai_ds_al": _fmt_score(max_vals["spliceai_ds_al"]),
-        "spliceai_ds_dg": _fmt_score(max_vals["spliceai_ds_dg"]),
-        "spliceai_ds_dl": _fmt_score(max_vals["spliceai_ds_dl"]),
-        "spliceai_dp_ag": _fmt_score(max_vals["spliceai_dp_ag"]),
-        "spliceai_dp_al": _fmt_score(max_vals["spliceai_dp_al"]),
-        "spliceai_dp_dg": _fmt_score(max_vals["spliceai_dp_dg"]),
-        "spliceai_dp_dl": _fmt_score(max_vals["spliceai_dp_dl"]),
-        "spliceai_max_delta_score": _fmt_score(ds_max),
+        "spliceai.ds_ag": _fmt_score(max_vals["spliceai.ds_ag"]),
+        "spliceai.ds_al": _fmt_score(max_vals["spliceai.ds_al"]),
+        "spliceai.ds_dg": _fmt_score(max_vals["spliceai.ds_dg"]),
+        "spliceai.ds_dl": _fmt_score(max_vals["spliceai.ds_dl"]),
+        "spliceai.dp_ag": _fmt_score(max_vals["spliceai.dp_ag"]),
+        "spliceai.dp_al": _fmt_score(max_vals["spliceai.dp_al"]),
+        "spliceai.dp_dg": _fmt_score(max_vals["spliceai.dp_dg"]),
+        "spliceai.dp_dl": _fmt_score(max_vals["spliceai.dp_dl"]),
+        "spliceai.max_delta_score": _fmt_score(ds_max),
     }
     return out
 
@@ -708,7 +708,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             ann = annotate_row_with_scores(row, args.hgvs_g_col, hgvs_score_map)
             row.update(ann)
             writer.writerow(row)
-            if ann["spliceai_max_delta_score"].replace("|", "").strip():
+            if ann["spliceai.max_delta_score"].replace("|", "").strip():
                 annotated_rows += 1
 
     logger.info("Done. %d/%d rows received SpliceAI annotations", annotated_rows, len(rows))

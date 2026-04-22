@@ -339,7 +339,7 @@ src/scripts/run_annotate_gnomad.sh output_clinvar.tsv output_final.tsv \
 
 **Input columns:** `mapped_hgvs_g` (from step 1 or step 2)
 
-**Output columns:** `spliceai_ds_ag`, `spliceai_ds_al`, `spliceai_ds_dg`, `spliceai_ds_dl`, `spliceai_dp_ag`, `spliceai_dp_al`, `spliceai_dp_dg`, `spliceai_dp_dl`, `spliceai_max_delta_score`
+**Output columns:** `spliceai.ds_ag`, `spliceai.ds_al`, `spliceai.ds_dg`, `spliceai.ds_dl`, `spliceai.dp_ag`, `spliceai.dp_al`, `spliceai.dp_dg`, `spliceai.dp_dl`, `spliceai.max_delta_score`
 
 **Precomputed mode (recommended):**
 ```bash
@@ -369,7 +369,7 @@ src/scripts/run_annotate_spliceai.sh output_clinvar.tsv output_spliceai.tsv \
 **Notes:**
 - In precomputed mode, source VCFs are copied into the SpliceAI cache volume and indexed (`.tbi`) if needed.
 - For protein-derived rows with multiple DNA candidates, all SpliceAI output columns are pipe-delimited and position-aligned.
-- `spliceai_max_delta_score` is `max(DS_AG, DS_AL, DS_DG, DS_DL)` for each candidate.
+- `spliceai.max_delta_score` is `max(DS_AG, DS_AL, DS_DG, DS_DL)` for each candidate.
 - Precomputed files can have coverage limitations (for example, missing classes of indels).
 
 ### Complete Pipeline Example
@@ -838,25 +838,36 @@ TP53	CA123456|CA123457||	Pathogenic	0.00234	0.00234	1547
 
 | Column | Type | Description |
 |--------|------|-------------|
-| `spliceai_ds_ag` | float | Acceptor gain delta score |
-| `spliceai_ds_al` | float | Acceptor loss delta score |
-| `spliceai_ds_dg` | float | Donor gain delta score |
-| `spliceai_ds_dl` | float | Donor loss delta score |
-| `spliceai_dp_ag` | float | Acceptor gain delta position |
-| `spliceai_dp_al` | float | Acceptor loss delta position |
-| `spliceai_dp_dg` | float | Donor gain delta position |
-| `spliceai_dp_dl` | float | Donor loss delta position |
-| `spliceai_max_delta_score` | float | Max of DS_AG, DS_AL, DS_DG, DS_DL |
+| `spliceai.ds_ag` | float | Acceptor gain delta score |
+| `spliceai.ds_al` | float | Acceptor loss delta score |
+| `spliceai.ds_dg` | float | Donor gain delta score |
+| `spliceai.ds_dl` | float | Donor loss delta score |
+| `spliceai.dp_ag` | float | Acceptor gain delta position |
+| `spliceai.dp_al` | float | Acceptor loss delta position |
+| `spliceai.dp_dg` | float | Donor gain delta position |
+| `spliceai.dp_dl` | float | Donor loss delta position |
+| `spliceai.max_delta_score` | float | Max of DS_AG, DS_AL, DS_DG, DS_DL |
 
 ---
 
 ### Key Properties of Pipe-Delimited Columns
 
 When a row has multiple DNA candidates (from reverse translation), the following columns are pipe-delimited:
+
+**Core DNA variant columns:**
 - `mapped_hgvs_c`
 - `mapped_hgvs_g`
 - `dna_clingen_allele_id`
-- `spliceai_*` output columns (after step 7)
+
+**Parsed position/allele columns (from Step 4):**
+- `mapped_hgvs_g_start`, `mapped_hgvs_g_stop`, `mapped_hgvs_g_ref`, `mapped_hgvs_g_alt`
+- `mapped_hgvs_c_start`, `mapped_hgvs_c_stop`, `mapped_hgvs_c_ref`, `mapped_hgvs_c_alt`
+- `touches_intronic_region`, `spans_intron`
+
+**Annotation columns:**
+- `spliceai.*` output columns (after step 7)
+- `clinvar.*` output columns (after step 5)
+- `gnomad.*` output columns (after step 6)
 
 **Important:** Empty slots are preserved (e.g., `CA1||CA3` has 3 candidates, 2nd without a match).
 This ensures positional alignment across all downstream annotations.
