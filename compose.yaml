@@ -88,6 +88,19 @@ services:
       - variant-annotation-spliceai-cache:/spliceai-cache
       - ${VARIANT_DATA_DIR:-./data}:/work
 
+  flatten-dna-variants:
+    build: .
+    platform: linux/amd64
+    profiles:
+      - tools
+    env_file:
+      - settings/.env
+    entrypoint: ["python", "/usr/src/app/src/flatten_dna_variants.py"]
+    command: ["--help"]
+    volumes:
+      - .:/usr/src/app
+      - ${VARIANT_DATA_DIR:-./data}:/work
+
   cdot:
     build:
       context: https://github.com/VariantEffect/cdot_rest.git

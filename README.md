@@ -26,6 +26,7 @@ All pipeline scripts and services run in Docker. The development environment is 
 - **annotate-clinvar**: Annotates with ClinVar clinical significance
 - **annotate-gnomad**: Annotates with gnomAD allele frequencies
 - **annotate-spliceai**: Annotates with SpliceAI splice-impact scores
+- **flatten-dna-variants**: Flattens multi-candidate DNA variants to one row per variant
 
 **Data and dependency services** (always running):
 - **cdot**: Transcript coordinate data service
@@ -195,8 +196,10 @@ Input variants
 [6] annotate_gnomad (optional) ──→ gnomAD allele frequencies
   ↓
 [7] annotate_spliceai (optional) ──→ SpliceAI delta scores
+  ↓
+[8] flatten_dna_variants (optional) ──→ flattened DNA-only variants
     ↓
-Output: fully annotated variants
+Output: one row per DNA variant (or fully annotated variants)
 ```
 
 ### Step 1: Map Variants (Required)
@@ -372,6 +375,47 @@ src/scripts/run_annotate_spliceai.sh output_clinvar.tsv output_spliceai.tsv \
 - `spliceai.max_delta_score` is `max(DS_AG, DS_AL, DS_DG, DS_DL)` for each candidate.
 - Precomputed files can have coverage limitations (for example, missing classes of indels).
 
+### Step 8: Flatten DNA Variants (Optional)
+
+**Purpose:** For annotated variant files with multi-candidate DNA variants (from reverse translation), produce a flattened output where each DNA candidate has its own row. This is useful when you want one row per DNA variant instead of pipe-delimited lists.
+
+**Input columns:** `mapped_hgvs_g`, `mapped_hgvs_c`, `dna_clingen_allele_id`, and any annotation columns (spliceai.*, clinvar.*, gnomad.*)
+
+**Output columns:** All input columns, with pipe-delimited columns expanded to one row per candidate
+
+**Command:**
+```bash
+src/scripts/run_flatten_dna_variants.sh annotated.tsv dna_variants.tsv
+```
+
+**Explicit column specification (if auto-detection doesn't work):**
+```bash
+src/scripts/run_flatten_dna_variants.sh annotated.tsv dna_variants.tsv \
+  --dna-variant-columns mapped_hgvs_g,mapped_hgvs_c,dna_clingen_allele_id
+```
+
+**Notes:**
+- Drops all protein-only rows without DNA reverse translations (rows where all DNA variant columns are empty)
+- Expands pipe-delimited columns: `mapped_hgvs_g`, `mapped_hgvs_c`, `dna_clingen_allele_id`, and any annotation columns
+- Non-list columns (e.g., gene_symbol, raw_hgvs_pro) are repeated across expanded rows
+- Useful for downstream analysis that requires one genomic variant per row
+- If all rows are protein-only without DNA variants, the script will error and produce no output
+
+**Example input (with multi-candidate row):**
+```
+raw_hgvs_nt    raw_hgvs_pro    mapped_hgvs_g              mapped_hgvs_c                  dna_clingen_allele_id    spliceai.max_delta_score
+              p.Arg175His     g.1A>T|g.2A>T|g.3A>T      c.1A>T|c.2A>T|c.3A>T          CA1|CA2|CA3             0.5|0.7|0.3
+```
+
+**Example output (3 rows):**
+```
+raw_hgvs_nt    raw_hgvs_pro    mapped_hgvs_g    mapped_hgvs_c    dna_clingen_allele_id    spliceai.max_delta_score
+              p.Arg175His     g.1A>T           c.1A>T           CA1                      0.5
+              p.Arg175His     g.2A>T           c.2A>T           CA2                      0.7
+              p.Arg175His     g.3A>T           c.3A>T           CA3                      0.3
+```
+
+
 ### Complete Pipeline Example
 
 Processing a file end-to-end:
@@ -401,6 +445,9 @@ src/scripts/run_annotate_spliceai.sh variants_final.tsv variants_spliceai.tsv \
   --precomputed-snv-vcf spliceai_scores.masked.snv.hg38.vcf.gz \
   --precomputed-indel-vcf spliceai_scores.masked.indel.hg38.vcf.gz
 ```
+
+# Flatten multi-candidate variants to one row per DNA variant (optional)
+src/scripts/run_flatten_dna_variants.sh variants_spliceai.tsv variants_dna_only.tsv
 
 ### Data Volume Management
 
@@ -848,6 +895,15 @@ TP53	CA123456|CA123457||	Pathogenic	0.00234	0.00234	1547
 | `spliceai.dp_dl` | float | Donor loss delta position |
 | `spliceai.max_delta_score` | float | Max of DS_AG, DS_AL, DS_DG, DS_DL |
 
+#### Step 8: flatten_dna_variants
+
+**No new columns are added in Step 8.** Instead, pipe-delimited columns from previous steps are expanded so that each DNA candidate gets its own row. The output file contains all columns from the input file, but with:
+- One row per DNA candidate (instead of one row per protein with pipe-delimited candidates)
+- Non-list columns (e.g., `raw_hgvs_pro`, `gene_symbol`) repeated across the expanded rows
+- Protein-only rows (without DNA variants) dropped entirely
+
+This step is a format transformation, not an annotation enrichment.
+
 ---
 
 ### Key Properties of Pipe-Delimited Columns
@@ -873,6 +929,8 @@ When a row has multiple DNA candidates (from reverse translation), the following
 This ensures positional alignment across all downstream annotations.
 
 When annotating, the pipeline tries candidates in order and returns the first successful match.
+
+**Note on Step 8 (flatten_dna_variants):** This optional step converts pipe-delimited columns into separate rows, with one row per DNA candidate. After flattening, there are no more pipe-delimited values in these columns—each candidate has its own row.
 
 ## Local installation (without Docker)
 
