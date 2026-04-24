@@ -185,6 +185,35 @@ def _detect_case(raw_nt: Optional[str], raw_pro: Optional[str]) -> Optional[int]
     return None
 
 
+def _load_targets_file(
+    targets_file: str,
+    target_name_col: str,
+) -> dict[str, dict[str, str]]:
+    """Load a targets file and return a dict mapping target_name → row dict.
+
+    The targets file must contain a *target_name_col* column.  All other columns
+    are carried along so they can be merged onto input rows before processing.
+    """
+    sep = _detect_separator(targets_file)
+    targets: dict[str, dict[str, str]] = {}
+    with open(targets_file, newline="") as fh:
+        reader = csv.DictReader(fh, delimiter=sep)
+        if reader.fieldnames is None:
+            raise ValueError(f"Targets file {targets_file!r} is empty or has no header.")
+        if target_name_col not in reader.fieldnames:
+            raise ValueError(
+                f"Targets file {targets_file!r} is missing the required "
+                f"target_name column {target_name_col!r}. "
+                f"Available columns: {', '.join(reader.fieldnames)}"
+            )
+        for row in reader:
+            name = (row.get(target_name_col) or "").strip()
+            if name:
+                targets[name] = dict(row)
+    logger.info("Loaded %d targets from %s", len(targets), targets_file)
+    return targets
+
+
 def _load_existing_results(
     existing_files: tuple[str, ...],
     mapped_hgvs_g_col: str,
@@ -1003,6 +1032,8 @@ def map_variants(
     target_sequence_col: str = "target_sequence",
     target_type_col: Optional[str] = "target_type",
     group_by_col: str = "target_sequence",
+    targets_file: Optional[str] = None,
+    target_name_col: str = "target_name",
     mapped_hgvs_g_col: str = "mapped_hgvs_g",
     mapped_hgvs_c_col: str = "mapped_hgvs_c",
     mapped_hgvs_p_col: str = "mapped_hgvs_p",
@@ -1073,6 +1104,11 @@ def map_variants(
     out_sep = _detect_separator(output_file)
     started = time.monotonic()
 
+    # Load optional targets file and build name → target-row lookup.
+    targets_lookup: dict[str, dict[str, str]] = {}
+    if targets_file is not None:
+        targets_lookup = _load_targets_file(targets_file, target_name_col)
+
     def _write_result_row(
         writer: csv.DictWriter,
         out_handle,
@@ -1101,8 +1137,20 @@ def map_variants(
             logger.warning("Input file %s is empty or missing a header; nothing to do.", input_file)
             return
 
+        # Determine extra columns introduced by the targets file (not already in input).
+        targets_extra_cols: list[str] = []
+        if targets_lookup:
+            # Use the first target row to discover available columns.
+            sample_target = next(iter(targets_lookup.values()))
+            targets_extra_cols = [
+                c for c in sample_target if c not in in_fieldnames and c != target_name_col
+            ]
+
         # Output columns: preserve original order and append new columns if absent.
         out_fieldnames = list(in_fieldnames)
+        for col in targets_extra_cols:
+            if col not in out_fieldnames:
+                out_fieldnames.append(col)
         for col in [
             mapped_hgvs_g_col,
             mapped_hgvs_c_col,
@@ -1285,6 +1333,24 @@ def map_variants(
 
             idx = n_total
             n_total += 1
+
+            # Merge target-file columns onto the row (input columns take precedence).
+            if targets_lookup:
+                target_name = (row.get(target_name_col) or "").strip()
+                target_row = targets_lookup.get(target_name)
+                if target_row is None:
+                    logger.warning(
+                        "Row %d: target_name %r not found in targets file; "
+                        "target_sequence and other target columns will be empty.",
+                        src_idx,
+                        target_name,
+                    )
+                else:
+                    for col, val in target_row.items():
+                        if col == target_name_col:
+                            continue
+                        if not row.get(col):
+                            row[col] = val
 
             raw_nt = row.get(raw_hgvs_nt_col) or ""
             raw_pro = row.get(raw_hgvs_pro_col) or ""
@@ -1759,6 +1825,23 @@ def map_variants(
     ),
 )
 @click.option(
+    "--targets-file",
+    "targets_file",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    help=(
+        "Optional CSV/TSV file containing target sequences and other target-level columns. "
+        "Joined to the input file on the column specified by --target-name."
+    ),
+)
+@click.option(
+    "--target-name",
+    "target_name_col",
+    default="target_name",
+    show_default=True,
+    help="Column name used to join the input file to --targets-file.",
+)
+@click.option(
     "--verbose",
     "-v",
     is_flag=True,
@@ -1787,6 +1870,8 @@ def main(
     preserve_order: str,
     merge_existing_files: tuple[str, ...],
     merge_match_columns: tuple[str, ...],
+    targets_file: Optional[str],
+    target_name_col: str,
     verbose: bool,
 ) -> None:
     """Map variants in INPUT_FILE to human-genome HGVS strings and write OUTPUT_FILE.
@@ -1828,6 +1913,8 @@ def main(
         preserve_order=preserve_order,
         merge_existing_files=merge_existing_files,
         merge_match_columns=merge_match_columns,
+        targets_file=targets_file,
+        target_name_col=target_name_col,
     )
 
 

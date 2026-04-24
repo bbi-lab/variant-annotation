@@ -8,6 +8,7 @@ Usage: src/scripts/run_map_variants.sh <input-file> <output-file> [map_variants 
 Examples:
   src/scripts/run_map_variants.sh input.tsv output.tsv
   src/scripts/run_map_variants.sh input.tsv output.tsv --group-by gene_symbol
+  src/scripts/run_map_variants.sh input.tsv output.tsv --targets-file data/targets.tsv
 
 Notes:
   - Paths are interpreted relative to /work in the container.
@@ -16,6 +17,7 @@ Notes:
   - Images are reused by default for fast runs.
   - Add --rebuild-image to force rebuilding the map-variants image.
   - Add --no-build-cache with --rebuild-image for a clean rebuild.
+  - --targets-file and --merge-existing paths are mapped to the container automatically.
 EOF
   exit 1
 fi
@@ -106,6 +108,28 @@ while [[ $# -gt 0 ]]; do
         mapped_args+=("--merge-existing=$(map_to_container_path "$merge_path" app)")
       else
         mapped_args+=("--merge-existing=$(map_to_container_path "$merge_path")")
+      fi
+      shift
+      ;;
+    --targets-file)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --targets-file requires a file argument" >&2
+        exit 2
+      fi
+      mapped_args+=("--targets-file")
+      if [[ "$input_in_container" == /usr/src/app/* ]]; then
+        mapped_args+=("$(map_to_container_path "$2" app)")
+      else
+        mapped_args+=("$(map_to_container_path "$2")")
+      fi
+      shift 2
+      ;;
+    --targets-file=*)
+      targets_path="${1#*=}"
+      if [[ "$input_in_container" == /usr/src/app/* ]]; then
+        mapped_args+=("--targets-file=$(map_to_container_path "$targets_path" app)")
+      else
+        mapped_args+=("--targets-file=$(map_to_container_path "$targets_path")")
       fi
       shift
       ;;

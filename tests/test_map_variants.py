@@ -129,6 +129,166 @@ def test_map_variants_no_retry_when_137_retry_disabled(tmp_path, monkeypatch):
         )
 
 
+# ---------------------------------------------------------------------------
+# Targets-file tests
+# ---------------------------------------------------------------------------
+
+
+def _write_targets_tsv(path, rows, fieldnames=None):
+    if fieldnames is None:
+        fieldnames = list(rows[0].keys())
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def test_load_targets_file_basic(tmp_path):
+    targets_path = tmp_path / "targets.tsv"
+    _write_targets_tsv(
+        targets_path,
+        [
+            {"target_name": "geneA", "target_sequence": "ACGT", "offset": "0"},
+            {"target_name": "geneB", "target_sequence": "TTTT", "offset": "5"},
+        ],
+    )
+    result = mv._load_targets_file(str(targets_path), "target_name")
+    assert set(result) == {"geneA", "geneB"}
+    assert result["geneA"]["target_sequence"] == "ACGT"
+    assert result["geneB"]["offset"] == "5"
+
+
+def test_load_targets_file_missing_name_col(tmp_path):
+    targets_path = tmp_path / "targets.tsv"
+    _write_targets_tsv(targets_path, [{"seq": "ACGT"}])
+    with pytest.raises(ValueError, match="target_name"):
+        mv._load_targets_file(str(targets_path), "target_name")
+
+
+def test_map_variants_with_targets_file_populates_sequence(tmp_path, monkeypatch):
+    """target_sequence is filled from the targets file when absent from the input."""
+    targets_path = tmp_path / "targets.tsv"
+    _write_targets_tsv(
+        targets_path,
+        [{"target_name": "geneA", "target_sequence": "SEQ_A"}],
+    )
+
+    input_path = tmp_path / "in.tsv"
+    with open(input_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["variant_urn", "target_name", "raw_hgvs_nt", "raw_hgvs_pro"],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        writer.writerow({"variant_urn": "v0", "target_name": "geneA", "raw_hgvs_nt": "", "raw_hgvs_pro": "p.Ala1Val"})
+
+    output_path = tmp_path / "out.tsv"
+
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+        assert target_seq == "SEQ_A", "target_sequence was not merged from targets file"
+        return [(orig_idx, f"NC_000001.11:g.{orig_idx}A>G", None) for orig_idx, *_ in row_entries], "NM_000001.1"
+
+    async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
+        return {h: {"hgvs": h, "id": "CA1"} for h in hgvs_strings}
+
+    monkeypatch.setattr(mv, "_try_import_dcd_mapping", lambda: object())
+    monkeypatch.setattr(mv, "_run_dcd_mapping_pipeline", fake_pipeline)
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs_batch", fake_clingen_batch)
+    monkeypatch.setattr(mv, "_extract_hgvs_from_clingen", lambda data, tx: (data["hgvs"], None, None))
+    monkeypatch.setattr(mv, "_extract_clingen_allele_id", lambda data: data.get("id"))
+    monkeypatch.setattr(mv, "_clingen_allele_type", lambda data: "CA")
+
+    mv.map_variants(
+        str(input_path),
+        str(output_path),
+        targets_file=str(targets_path),
+        target_name_col="target_name",
+    )
+
+    out_rows = _read_tsv(output_path)
+    assert len(out_rows) == 1
+    assert out_rows[0]["variant_urn"] == "v0"
+    # target_sequence from targets file should appear in output
+    assert out_rows[0]["target_sequence"] == "SEQ_A"
+
+
+def test_map_variants_with_targets_file_extra_cols_in_output(tmp_path, monkeypatch):
+    """Extra columns from the targets file appear in the output."""
+    targets_path = tmp_path / "targets.tsv"
+    _write_targets_tsv(
+        targets_path,
+        [{"target_name": "geneA", "target_sequence": "SEQ_A", "uniprot_id": "P12345"}],
+    )
+
+    input_path = tmp_path / "in.tsv"
+    with open(input_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["variant_urn", "target_name", "raw_hgvs_nt", "raw_hgvs_pro"],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        writer.writerow({"variant_urn": "v0", "target_name": "geneA", "raw_hgvs_nt": "", "raw_hgvs_pro": "p.Ala1Val"})
+
+    output_path = tmp_path / "out.tsv"
+
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+        return [(orig_idx, f"NC_000001.11:g.{orig_idx}A>G", None) for orig_idx, *_ in row_entries], "NM_000001.1"
+
+    async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
+        return {h: {"hgvs": h, "id": "CA1"} for h in hgvs_strings}
+
+    monkeypatch.setattr(mv, "_try_import_dcd_mapping", lambda: object())
+    monkeypatch.setattr(mv, "_run_dcd_mapping_pipeline", fake_pipeline)
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs_batch", fake_clingen_batch)
+    monkeypatch.setattr(mv, "_extract_hgvs_from_clingen", lambda data, tx: (data["hgvs"], None, None))
+    monkeypatch.setattr(mv, "_extract_clingen_allele_id", lambda data: data.get("id"))
+    monkeypatch.setattr(mv, "_clingen_allele_type", lambda data: "CA")
+
+    mv.map_variants(
+        str(input_path),
+        str(output_path),
+        targets_file=str(targets_path),
+        target_name_col="target_name",
+    )
+
+    out_rows = _read_tsv(output_path)
+    assert out_rows[0]["uniprot_id"] == "P12345"
+
+
+def test_map_variants_targets_file_unknown_name_logs_warning(tmp_path, monkeypatch, caplog):
+    """A row with an unrecognised target_name logs a warning and gets a blank sequence."""
+    import logging
+
+    targets_path = tmp_path / "targets.tsv"
+    _write_targets_tsv(targets_path, [{"target_name": "geneA", "target_sequence": "SEQ_A"}])
+
+    input_path = tmp_path / "in.tsv"
+    with open(input_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["variant_urn", "target_name", "raw_hgvs_nt", "raw_hgvs_pro"],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"variant_urn": "v0", "target_name": "UNKNOWN", "raw_hgvs_nt": "", "raw_hgvs_pro": "p.Ala1Val"}
+        )
+
+    output_path = tmp_path / "out.tsv"
+
+    with caplog.at_level(logging.WARNING, logger="src.map_variants"):
+        mv.map_variants(
+            str(input_path),
+            str(output_path),
+            targets_file=str(targets_path),
+            target_name_col="target_name",
+        )
+
+    assert any("UNKNOWN" in record.message for record in caplog.records)
+
+
 @pytest.mark.parametrize(
     "raw_nt,raw_pro,expected",
     [
