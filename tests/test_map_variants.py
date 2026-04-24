@@ -304,6 +304,87 @@ def test_detect_case_variants(raw_nt, raw_pro, expected):
     assert mv._detect_case(raw_nt, raw_pro) == expected
 
 
+# ---------------------------------------------------------------------------
+# normalize_protein_hgvs tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "input_hgvs,expected",
+    [
+        # Substitution
+        ("p.A300T", "p.Ala300Thr"),
+        ("p.K57N", "p.Lys57Asn"),
+        ("p.M1V", "p.Met1Val"),
+        # Synonymous (= → ref AA repeated)
+        ("p.A300=", "p.Ala300Ala"),
+        ("p.K57=", "p.Lys57Lys"),
+        # Stop gain (* → Ter)
+        ("p.A300*", "p.Ala300Ter"),
+        ("p.Q192*", "p.Gln192Ter"),
+        # Deletion via dash
+        ("p.A300-", "p.Ala300del"),
+        # Deletion via keyword – ref AA still converted
+        ("p.A300del", "p.Ala300del"),
+        # Frameshift – suffix kept verbatim
+        ("p.A300fs", "p.Ala300fs"),
+        ("p.A300fs*7", "p.Ala300fs*7"),
+        # Insertion keyword
+        ("p.A300ins", "p.Ala300ins"),
+        # Duplication keyword
+        ("p.A300dup", "p.Ala300dup"),
+        # Already 3-letter – returned unchanged
+        ("p.Ala300Thr", "p.Ala300Thr"),
+        ("p.Lys57Asn", "p.Lys57Asn"),
+        ("p.Ala300del", "p.Ala300del"),
+        # Prefixed with accession
+        ("NP_000001.1:p.A300T", "NP_000001.1:p.Ala300Thr"),
+        # Blank / sentinel – returned as-is
+        ("", ""),
+        ("_wt", "_wt"),
+        # Non-matching pattern – returned as-is
+        ("c.300A>T", "c.300A>T"),
+    ],
+)
+def test_normalize_protein_hgvs(input_hgvs, expected):
+    assert mv.normalize_protein_hgvs(input_hgvs) == expected
+
+
+def test_map_variants_normalizes_raw_hgvs_pro_in_output(tmp_path, monkeypatch):
+    """1-letter p. strings are normalized to 3-letter in the output row."""
+    input_path = tmp_path / "in.tsv"
+    output_path = tmp_path / "out.tsv"
+
+    with open(input_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["variant_urn", "raw_hgvs_nt", "raw_hgvs_pro", "target_sequence"],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"variant_urn": "v0", "raw_hgvs_nt": "", "raw_hgvs_pro": "p.A300T", "target_sequence": "SEQ_A"}
+        )
+
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+        return [(orig_idx, f"NC_000001.11:g.{orig_idx}A>G", None) for orig_idx, *_ in row_entries], "NM_1"
+
+    async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
+        return {h: {"hgvs": h, "id": "CA1"} for h in hgvs_strings}
+
+    monkeypatch.setattr(mv, "_try_import_dcd_mapping", lambda: object())
+    monkeypatch.setattr(mv, "_run_dcd_mapping_pipeline", fake_pipeline)
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs_batch", fake_clingen_batch)
+    monkeypatch.setattr(mv, "_extract_hgvs_from_clingen", lambda data, tx: (data["hgvs"], None, "p.Ala300Thr"))
+    monkeypatch.setattr(mv, "_extract_clingen_allele_id", lambda data: data.get("id"))
+    monkeypatch.setattr(mv, "_clingen_allele_type", lambda data: "CA")
+
+    mv.map_variants(str(input_path), str(output_path))
+
+    out_rows = _read_tsv(output_path)
+    assert out_rows[0]["raw_hgvs_pro"] == "p.Ala300Thr"
+
+
 def test_map_variants_routes_class1_class2_class3(tmp_path, monkeypatch):
     input_path = tmp_path / "in.tsv"
     output_path = tmp_path / "out.tsv"

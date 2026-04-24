@@ -71,6 +71,7 @@ Library usage::
 """
 
 import asyncio
+import re
 import csv
 import logging
 import os
@@ -149,6 +150,71 @@ def _format_exc(exc: Exception) -> str:
     if exc.__context__ is not None and exc.__context__ is not exc.__cause__:
         parts.append(f"context={_one(exc.__context__)}")
     return " ; ".join(parts)
+
+
+# Sentinel values that should be treated as "no data" for HGVS columns.
+# ---------------------------------------------------------------------------
+# Protein HGVS 1-letter → 3-letter normalization
+# ---------------------------------------------------------------------------
+
+_AA1_TO_AA3: dict[str, str] = {
+    "A": "Ala", "C": "Cys", "D": "Asp", "E": "Glu", "F": "Phe",
+    "G": "Gly", "H": "His", "I": "Ile", "K": "Lys", "L": "Leu",
+    "M": "Met", "N": "Asn", "P": "Pro", "Q": "Gln", "R": "Arg",
+    "S": "Ser", "T": "Thr", "V": "Val", "W": "Trp", "Y": "Tyr",
+}
+
+# Matches a 1-letter-coded HGVS p. expression:
+#   p.{REF1}{POS}{ALT_TOKEN}{SUFFIX}
+# Multi-character keywords (del, ins, dup, etc.) are tried before single-char
+# so they are not split in half. The ref group is a single uppercase letter
+# immediately followed by one or more digits; if the first letter is followed
+# by lowercase letters (e.g. "Ala") the regex will not match, leaving already-
+# normalized strings untouched.
+_HGVS_P_1LETTER_RE = re.compile(
+    r"^(?P<prefix>.*?p\.)(?P<ref>[A-Z])(?P<pos>\d+)"
+    r"(?P<alt>del|ins|dup|ext|fs|[A-Z*=\-])"
+    r"(?P<suffix>.*)$"
+)
+
+
+def normalize_protein_hgvs(hgvs: str) -> str:
+    """Convert a protein HGVS string from 1-letter to 3-letter amino acid codes.
+
+    Handles the following conversions:
+
+    * Substitution: ``p.A300T`` → ``p.Ala300Thr``
+    * Synonymous:   ``p.A300=`` → ``p.Ala300Ala``  (ref AA repeated)
+    * Stop gain:    ``p.A300*`` → ``p.Ala300Ter``
+    * Deletion:     ``p.A300-`` or ``p.A300del`` → ``p.Ala300del``
+    * Frameshift:   ``p.A300fs`` → ``p.Ala300fs``  (suffix kept verbatim)
+    * Insertion / duplication: keyword token kept verbatim; ref AA converted.
+
+    Strings already using 3-letter codes (e.g. ``p.Ala300Thr``) are returned
+    unchanged.  Any string that does not match the expected pattern is also
+    returned unchanged.
+    """
+    if not hgvs:
+        return hgvs
+    m = _HGVS_P_1LETTER_RE.match(hgvs)
+    if m is None:
+        return hgvs
+    ref1 = m.group("ref")
+    ref3 = _AA1_TO_AA3.get(ref1)
+    if ref3 is None:
+        return hgvs
+    alt = m.group("alt")
+    if alt == "=":
+        alt_out = ref3          # synonymous – repeat the reference AA
+    elif alt == "*":
+        alt_out = "Ter"
+    elif alt == "-":
+        alt_out = "del"
+    elif len(alt) == 1 and alt.isupper():
+        alt_out = _AA1_TO_AA3.get(alt, alt)
+    else:
+        alt_out = alt           # del, ins, dup, fs, ext – keep as-is
+    return f"{m.group('prefix')}{ref3}{m.group('pos')}{alt_out}{m.group('suffix')}"
 
 
 # Sentinel values that should be treated as "no data" for HGVS columns.
@@ -1354,6 +1420,11 @@ def map_variants(
 
             raw_nt = row.get(raw_hgvs_nt_col) or ""
             raw_pro = row.get(raw_hgvs_pro_col) or ""
+            if raw_pro and not _is_blank(raw_pro):
+                normalized = normalize_protein_hgvs(raw_pro)
+                if normalized != raw_pro:
+                    raw_pro = normalized
+                    row[raw_hgvs_pro_col] = normalized
 
             if existing_results_by_key:
                 merge_key = _build_merge_key(row, merge_key_columns)
