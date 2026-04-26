@@ -7,7 +7,7 @@ RUN apt-get clean && apt-get update && apt-get install -y \
 	build-essential \
 	curl \
 	git \
-	openjdk-17-jre-headless \
+	default-jre-headless \
 	libbz2-dev \
 	libcurl4-openssl-dev \
 	libgsl0-dev \
