@@ -14,6 +14,7 @@ It also adds transcript-derived boolean columns:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import csv
 import logging
 import os
@@ -52,7 +53,7 @@ class _HgvsRefResolver:
 
 
 def _get_hgvs_ref_resolver() -> Optional[_HgvsRefResolver]:
-    global _HGVS_REF_RESOLVER_UNAVAILABLE_LOGGED
+    global _HGVS_RESOLVER_UNAVAILABLE_LOGGED
     global _HGVS_REF_RESOLVER
 
     if _HGVS_REF_RESOLVER is not None:
@@ -279,6 +280,37 @@ def _set_or_append_fieldnames(fieldnames: list[str], col: str) -> None:
         fieldnames.append(col)
 
 
+def _annotate_row(
+    row_idx: int,
+    row: dict[str, str],
+    *,
+    mapped_hgvs_g_col: str,
+    mapped_hgvs_c_col: str,
+    mapped_hgvs_p_col: str,
+    touches_intronic_region_col: str,
+    spans_intron_col: str,
+    resolve_missing_ref_alleles: bool,
+) -> tuple[int, dict[str, str]]:
+    """Annotate one row with parsed position/allele fields."""
+    for base_col in (mapped_hgvs_g_col, mapped_hgvs_c_col, mapped_hgvs_p_col):
+        start, stop, ref, alt, _, _ = _parse_hgvs(
+            row.get(base_col),
+            resolve_missing_ref_alleles=resolve_missing_ref_alleles,
+        )
+        row[f"{base_col}_start"] = "" if start is None else start
+        row[f"{base_col}_stop"] = "" if stop is None else stop
+        row[f"{base_col}_ref"] = "" if ref is None else ref
+        row[f"{base_col}_alt"] = "" if alt is None else alt
+
+    _, _, _, _, touches_intronic_region, spans_intron = _parse_hgvs(
+        row.get(mapped_hgvs_c_col),
+        resolve_missing_ref_alleles=resolve_missing_ref_alleles,
+    )
+    row[touches_intronic_region_col] = "true" if touches_intronic_region else "false"
+    row[spans_intron_col] = "true" if spans_intron else "false"
+    return row_idx, row
+
+
 def annotate_variants(
     input_file: str,
     output_file: str,
@@ -289,50 +321,85 @@ def annotate_variants(
     touches_intronic_region_col: str = "touches_intronic_region",
     spans_intron_col: str = "spans_intron",
     resolve_missing_ref_alleles: bool = False,
+    max_workers: int = 8,
 ) -> None:
+    if max_workers < 1:
+        raise ValueError("max_workers must be >= 1")
+
     in_sep = _detect_separator(input_file)
     out_sep = _detect_separator(output_file)
 
-    with open(input_file, newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh, delimiter=in_sep)
+    with open(input_file, newline="", encoding="utf-8") as in_fh, open(
+        output_file, "w", newline="", encoding="utf-8"
+    ) as out_fh:
+        reader = csv.DictReader(in_fh, delimiter=in_sep)
         if reader.fieldnames is None:
             raise ValueError(f"Input file {input_file!r} appears to be empty.")
         fieldnames = list(reader.fieldnames)
-        rows = list(reader)
 
-    for base_col in (mapped_hgvs_g_col, mapped_hgvs_c_col, mapped_hgvs_p_col):
-        _set_or_append_fieldnames(fieldnames, f"{base_col}_start")
-        _set_or_append_fieldnames(fieldnames, f"{base_col}_stop")
-        _set_or_append_fieldnames(fieldnames, f"{base_col}_ref")
-        _set_or_append_fieldnames(fieldnames, f"{base_col}_alt")
-
-    _set_or_append_fieldnames(fieldnames, touches_intronic_region_col)
-    _set_or_append_fieldnames(fieldnames, spans_intron_col)
-
-    for row in rows:
         for base_col in (mapped_hgvs_g_col, mapped_hgvs_c_col, mapped_hgvs_p_col):
-            start, stop, ref, alt, _, _ = _parse_hgvs(
-                row.get(base_col),
-                resolve_missing_ref_alleles=resolve_missing_ref_alleles,
-            )
-            row[f"{base_col}_start"] = "" if start is None else start
-            row[f"{base_col}_stop"] = "" if stop is None else stop
-            row[f"{base_col}_ref"] = "" if ref is None else ref
-            row[f"{base_col}_alt"] = "" if alt is None else alt
+            _set_or_append_fieldnames(fieldnames, f"{base_col}_start")
+            _set_or_append_fieldnames(fieldnames, f"{base_col}_stop")
+            _set_or_append_fieldnames(fieldnames, f"{base_col}_ref")
+            _set_or_append_fieldnames(fieldnames, f"{base_col}_alt")
 
-        _, _, _, _, touches_intronic_region, spans_intron = _parse_hgvs(
-            row.get(mapped_hgvs_c_col),
-            resolve_missing_ref_alleles=resolve_missing_ref_alleles,
+        _set_or_append_fieldnames(fieldnames, touches_intronic_region_col)
+        _set_or_append_fieldnames(fieldnames, spans_intron_col)
+
+        writer = csv.DictWriter(
+            out_fh,
+            fieldnames=fieldnames,
+            delimiter=out_sep,
+            extrasaction="ignore",
         )
-        row[touches_intronic_region_col] = "true" if touches_intronic_region else "false"
-        row[spans_intron_col] = "true" if spans_intron else "false"
-
-    with open(output_file, "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter=out_sep, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(rows)
+        out_fh.flush()
 
-    logger.info("Wrote %d rows to %s", len(rows), output_file)
+        pending_by_index: dict[int, dict[str, str]] = {}
+        next_to_write = 0
+        written = 0
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            max_in_flight = max_workers * 4
+            row_iter = enumerate(reader)
+            in_flight: dict = {}
+
+            def _submit_until_full() -> None:
+                while len(in_flight) < max_in_flight:
+                    try:
+                        idx, row = next(row_iter)
+                    except StopIteration:
+                        break
+                    fut = executor.submit(
+                        _annotate_row,
+                        idx,
+                        row,
+                        mapped_hgvs_g_col=mapped_hgvs_g_col,
+                        mapped_hgvs_c_col=mapped_hgvs_c_col,
+                        mapped_hgvs_p_col=mapped_hgvs_p_col,
+                        touches_intronic_region_col=touches_intronic_region_col,
+                        spans_intron_col=spans_intron_col,
+                        resolve_missing_ref_alleles=resolve_missing_ref_alleles,
+                    )
+                    in_flight[fut] = idx
+
+            _submit_until_full()
+
+            while in_flight:
+                done, _ = wait(tuple(in_flight.keys()), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    in_flight.pop(fut, None)
+                    row_idx, row_out = fut.result()
+                    pending_by_index[row_idx] = row_out
+
+                while next_to_write in pending_by_index:
+                    writer.writerow(pending_by_index.pop(next_to_write))
+                    out_fh.flush()
+                    written += 1
+                    next_to_write += 1
+
+                _submit_until_full()
+    logger.info("Wrote %d rows to %s", written, output_file)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -370,6 +437,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Use HGVS normalization to fill missing ref allele for accession-backed del/delins-like variants.",
     )
+    p.add_argument(
+        "--max-workers",
+        type=int,
+        default=8,
+        help="Concurrent worker threads for row annotation.",
+    )
     return p
 
 
@@ -391,6 +464,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         touches_intronic_region_col=args.touches_intronic_region_col,
         spans_intron_col=args.spans_intron_col,
         resolve_missing_ref_alleles=args.resolve_missing_ref_alleles,
+        max_workers=args.max_workers,
     )
 
 
