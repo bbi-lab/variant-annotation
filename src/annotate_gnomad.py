@@ -311,7 +311,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     logger.info("Loading gnomAD records for %d unique CAIDs", len(caids))
     records = load_gnomad_records_for_caids(local_ht, caids, cache_dir)
 
-    prefix = f"{args.gnomad_namespace}.{args.gnomad_version}"
+    prefix = f"{args.gnomad_namespace}.{args.gnomad_version.replace('.', '_')}"
     ann_cols = [
         f"{prefix}.minor_allele_frequency",
         f"{prefix}.allele_frequency",
