@@ -194,9 +194,9 @@ Input variants
 [5] annotate_clinvar (optional) ──→ ClinVar clinical significance
     ↓
 [6] annotate_gnomad (optional) ──→ gnomAD allele frequencies
-  ↓
+    ↓
 [7] annotate_spliceai (optional) ──→ SpliceAI delta scores
-  ↓
+    ↓
 [8] flatten_dna_variants (optional) ──→ flattened DNA-only variants
     ↓
 Output: one row per DNA variant (or fully annotated variants)
