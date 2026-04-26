@@ -432,15 +432,25 @@ def _clingen_allele_type(data: dict) -> str:
 
 
 def _extract_clingen_allele_id(data: dict) -> Optional[str]:
-    """Extract ClinGen allele identifier (for example ``CA123456``) from response."""
+    """Extract ClinGen allele identifier (for example ``CA123456``) from response.
+
+    Returns None for placeholder values such as ``_:PA...`` or ``_:CA...`` that
+    ClinGen emits when no real allele record exists.
+    """
+    def _is_real_id(value: str) -> bool:
+        # Reject blank-node-style identifiers like "_:PA..." or "_:CA..."
+        return bool(value) and not value.startswith("_:")
+
     at_id: str = data.get("@id", "") or ""
     if at_id:
         fragment = at_id.rstrip("/").rsplit("/", 1)[-1]
-        return fragment or None
+        return fragment if _is_real_id(fragment) else None
 
     fallback = data.get("id")
-    if isinstance(fallback, str) and fallback.strip():
-        return fallback.strip()
+    if isinstance(fallback, str):
+        stripped = fallback.strip()
+        if _is_real_id(stripped):
+            return stripped
     return None
 
 
