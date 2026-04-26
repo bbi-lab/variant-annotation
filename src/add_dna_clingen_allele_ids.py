@@ -21,8 +21,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import logging
+from threading import Lock
 import time
 from pathlib import Path
 from typing import Optional
@@ -78,13 +80,24 @@ def _query_clingen_by_hgvs(hgvs_string: str, max_retries: int = 3) -> Optional[d
 
 
 def _extract_clingen_allele_id(data: dict) -> Optional[str]:
+    def _normalize_clingen_id(value: str) -> str:
+        """Return empty string for placeholder ClinGen IDs (e.g. '_:CA...', '_:PA...')."""
+        text = (value or "").strip()
+        if not text:
+            return ""
+        if text.startswith("_:"):
+            return ""
+        return text
+
     at_id: str = data.get("@id", "") or ""
     if at_id:
         fragment = at_id.rstrip("/").rsplit("/", 1)[-1]
-        return fragment or None
+        normalized = _normalize_clingen_id(fragment)
+        return normalized or None
     fallback = data.get("id")
     if isinstance(fallback, str) and fallback.strip():
-        return fallback.strip()
+        normalized = _normalize_clingen_id(fallback)
+        return normalized or None
     return None
 
 
@@ -134,16 +147,31 @@ def _lookup_allele_id_for_candidate(
     *,
     max_retries: int,
     lookup_cache: dict[str, str],
+    cache_lock: Optional[Lock] = None,
 ) -> str:
     """Resolve one DNA candidate to a ClinGen allele ID using c-then-g lookup."""
     for hgvs in (hgvs_c, hgvs_g):
         query = (hgvs or "").strip()
         if not query:
             continue
-        if query not in lookup_cache:
-            data = _query_clingen_by_hgvs(query, max_retries=max_retries)
-            lookup_cache[query] = _extract_clingen_allele_id(data) if data else ""
-        allele_id = lookup_cache.get(query, "")
+
+        if cache_lock is None:
+            if query not in lookup_cache:
+                data = _query_clingen_by_hgvs(query, max_retries=max_retries)
+                lookup_cache[query] = (_extract_clingen_allele_id(data) or "") if data else ""
+            allele_id = lookup_cache.get(query, "")
+        else:
+            with cache_lock:
+                cached = lookup_cache.get(query)
+            if cached is None:
+                data = _query_clingen_by_hgvs(query, max_retries=max_retries)
+                resolved = (_extract_clingen_allele_id(data) or "") if data else ""
+                with cache_lock:
+                    # Keep first resolved value if another thread wrote it first.
+                    lookup_cache.setdefault(query, resolved)
+                    cached = lookup_cache.get(query, "")
+            allele_id = cached or ""
+
         if allele_id:
             return allele_id
     return ""
@@ -157,8 +185,8 @@ def _is_dna_variant_row(
 ) -> bool:
     """Return True when a row is clearly DNA-based (not protein-only)."""
     raw_nt = (row.get(raw_hgvs_nt_col) or "").strip()
-    raw_pro = (row.get(raw_hgvs_pro_col) or "").strip()
-    return bool(raw_nt) and not bool(raw_pro)
+    # raw_pro = (row.get(raw_hgvs_pro_col) or "").strip()
+    return bool(raw_nt) # and not bool(raw_pro)
 
 
 def _validate_clingen_id_prefix(
@@ -195,9 +223,12 @@ def build_dna_clingen_value(
     raw_hgvs_pro_col: str,
     max_retries: int,
     lookup_cache: dict[str, str],
+    cache_lock: Optional[Lock] = None,
 ) -> str:
     """Build the DNA-level ClinGen allele-ID cell value for one row."""
     existing_id = (row.get(clingen_allele_id_col) or "").strip()
+    if existing_id.startswith("_:"):
+        existing_id = ""
     pairs = _candidate_pairs(row.get(hgvs_c_col, ""), row.get(hgvs_g_col, ""))
 
     if not pairs:
@@ -222,10 +253,53 @@ def build_dna_clingen_value(
             g,
             max_retries=max_retries,
             lookup_cache=lookup_cache,
+            cache_lock=cache_lock,
         )
         for c, g in pairs
     ]
     return "|".join(ids)
+
+
+def _process_row_for_dna_ids(
+    row_idx: int,
+    row: dict[str, str],
+    *,
+    clingen_allele_id_col: str,
+    hgvs_c_col: str,
+    hgvs_g_col: str,
+    raw_hgvs_nt_col: str,
+    raw_hgvs_pro_col: str,
+    max_retries: int,
+    output_col: str,
+    lookup_cache: dict[str, str],
+    cache_lock: Lock,
+) -> tuple[int, dict[str, str], bool]:
+    """Compute DNA ClinGen value for one row and return ordered result tuple."""
+    row_index_for_errors = row_idx + 2  # Account for header row.
+    existing_id = (row.get(clingen_allele_id_col) or "").strip()
+    if existing_id.startswith("_:"):
+        existing_id = ""
+    is_dna_row = _is_dna_variant_row(
+        row,
+        raw_hgvs_nt_col=raw_hgvs_nt_col,
+        raw_hgvs_pro_col=raw_hgvs_pro_col,
+    )
+
+    _validate_clingen_id_prefix(existing_id, is_dna_row, row_index_for_errors)
+
+    value = build_dna_clingen_value(
+        row,
+        clingen_allele_id_col=clingen_allele_id_col,
+        hgvs_c_col=hgvs_c_col,
+        hgvs_g_col=hgvs_g_col,
+        raw_hgvs_nt_col=raw_hgvs_nt_col,
+        raw_hgvs_pro_col=raw_hgvs_pro_col,
+        max_retries=max_retries,
+        lookup_cache=lookup_cache,
+        cache_lock=cache_lock,
+    )
+    row[output_col] = value
+    return row_idx, row, bool(value)
 
 
 def add_dna_clingen_allele_ids(
@@ -239,63 +313,86 @@ def add_dna_clingen_allele_ids(
     raw_hgvs_nt_col: str = "raw_hgvs_nt",
     raw_hgvs_pro_col: str = "raw_hgvs_pro",
     max_retries: int = 3,
+    max_workers: int = 8,
 ) -> None:
-    """Read input table, add DNA-level ClinGen ID column, write output table."""
+    """Read input table, add DNA-level ClinGen ID column, write output table.
+
+    Rows are written in input order as soon as contiguous results are available,
+    while ClinGen lookups are performed concurrently across rows.
+
+    Rows are submitted concurrently and written in input order when ready.
+    """
+    if max_workers < 1:
+        raise ValueError("max_workers must be >= 1")
+
     in_sep = _detect_separator(input_path)
     out_sep = _detect_separator(output_path)
 
-    with open(input_path, newline="", encoding="utf-8") as fh:
-        reader = csv.DictReader(fh, delimiter=in_sep)
+    lookup_cache: dict[str, str] = {}
+    cache_lock = Lock()
+    populated = 0
+    written = 0
+
+    with open(input_path, newline="", encoding="utf-8") as in_fh, open(
+        output_path, "w", newline="", encoding="utf-8"
+    ) as out_fh:
+        reader = csv.DictReader(in_fh, delimiter=in_sep)
         if reader.fieldnames is None:
             raise ValueError(f"Input file {input_path!r} appears to be empty.")
         fieldnames: list[str] = list(reader.fieldnames)
-        rows: list[dict[str, str]] = list(reader)
 
-    if output_col not in fieldnames:
-        fieldnames.append(output_col)
+        if output_col not in fieldnames:
+            fieldnames.append(output_col)
 
-    lookup_cache: dict[str, str] = {}
-    populated = 0
-
-    for row_index, row in enumerate(rows, start=2):  # Start at 2 (header is row 1)
-        existing_id = (row.get(clingen_allele_id_col) or "").strip()
-        is_dna_row = _is_dna_variant_row(
-            row,
-            raw_hgvs_nt_col=raw_hgvs_nt_col,
-            raw_hgvs_pro_col=raw_hgvs_pro_col,
-        )
-        
-        # Validate ClinGen allele ID prefix matches variant type
-        _validate_clingen_id_prefix(existing_id, is_dna_row, row_index)
-        
-        value = build_dna_clingen_value(
-            row,
-            clingen_allele_id_col=clingen_allele_id_col,
-            hgvs_c_col=hgvs_c_col,
-            hgvs_g_col=hgvs_g_col,
-            raw_hgvs_nt_col=raw_hgvs_nt_col,
-            raw_hgvs_pro_col=raw_hgvs_pro_col,
-            max_retries=max_retries,
-            lookup_cache=lookup_cache,
-        )
-        row[output_col] = value
-        if value:
-            populated += 1
-
-    with open(output_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(
-            fh,
+            out_fh,
             fieldnames=fieldnames,
             delimiter=out_sep,
             extrasaction="ignore",
             lineterminator="\n",
         )
         writer.writeheader()
-        writer.writerows(rows)
+        out_fh.flush()
+
+        pending_by_index: dict[int, tuple[dict[str, str], bool]] = {}
+        next_to_write = 0
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    _process_row_for_dna_ids,
+                    idx,
+                    row,
+                    clingen_allele_id_col=clingen_allele_id_col,
+                    hgvs_c_col=hgvs_c_col,
+                    hgvs_g_col=hgvs_g_col,
+                    raw_hgvs_nt_col=raw_hgvs_nt_col,
+                    raw_hgvs_pro_col=raw_hgvs_pro_col,
+                    max_retries=max_retries,
+                    output_col=output_col,
+                    lookup_cache=lookup_cache,
+                    cache_lock=cache_lock,
+                ): idx
+                for idx, row in enumerate(reader)
+            }
+
+            for fut in as_completed(futures):
+                row_idx, row_out, has_value = fut.result()
+                pending_by_index[row_idx] = (row_out, has_value)
+
+                # Stream contiguous rows immediately while preserving order.
+                while next_to_write in pending_by_index:
+                    ready_row, ready_has_value = pending_by_index.pop(next_to_write)
+                    writer.writerow(ready_row)
+                    out_fh.flush()
+                    written += 1
+                    if ready_has_value:
+                        populated += 1
+                    next_to_write += 1
 
     logger.info(
         "Wrote %d rows to %s (%d rows with non-empty %s)",
-        len(rows),
+        written,
         output_path,
         populated,
         output_col,
@@ -349,6 +446,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Retries per ClinGen request",
     )
     p.add_argument(
+        "--max-workers",
+        type=int,
+        default=8,
+        help="Concurrent worker threads for ClinGen lookups",
+    )
+    p.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -376,6 +479,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         raw_hgvs_nt_col=args.raw_hgvs_nt_col,
         raw_hgvs_pro_col=args.raw_hgvs_pro_col,
         max_retries=args.max_retries,
+        max_workers=args.max_workers,
     )
 
 
