@@ -72,7 +72,7 @@ Before first startup, download the UTA database dump (~500 MB):
 src/scripts/fetch_uta_dump.sh
 ```
 
-This step is required for transcript lookups in `reverse_translate_protein_variants` and `add_variant_position_alleles`. It downloads the dump to a volume-mounted location in the Docker container.
+This step is required for transcript lookups in `reverse_translate_protein_variants` and `add_vcf_identifiers`. It downloads the dump to a volume-mounted location in the Docker container.
 
 ### 3. Build and start services
 
@@ -189,7 +189,7 @@ Input variants
     ↓
 [3] add_dna_clingen_allele_ids ──→ DNA-level ClinGen allele IDs
     ↓
-[4] add_variant_position_alleles (optional) ──→ parsed positions/alleles
+[4] add_vcf_identifiers (optional) ──→ parsed positions/alleles
     ↓
 [5] annotate_clinvar (optional) ──→ ClinVar clinical significance
     ↓
@@ -273,7 +273,7 @@ src/scripts/run_add_dna_clingen_allele_ids.sh output_rt.tsv output_clingen.tsv
 
 **Command:**
 ```bash
-src/scripts/run_add_variant_position_alleles.sh output_clingen.tsv output_parsed.tsv
+src/scripts/run_add_vcf_identifiers.sh output_clingen.tsv output_parsed.tsv
 ```
 
 **Notes:**
@@ -431,7 +431,7 @@ src/scripts/run_reverse_translate_protein_variants.sh variants_mapped.tsv varian
 src/scripts/run_add_dna_clingen_allele_ids.sh variants_rt.tsv variants_clingen.tsv
 
 # Add parsed position/allele columns (optional)
-src/scripts/run_add_variant_position_alleles.sh variants_clingen.tsv variants_parsed.tsv
+src/scripts/run_add_vcf_identifiers.sh variants_clingen.tsv variants_parsed.tsv
 
 # Annotate with ClinVar (optional)
 src/scripts/run_annotate_clinvar.sh variants_parsed.tsv variants_clinvar.tsv
@@ -521,8 +521,7 @@ This ensures caches survive container restarts and are shared across runs.
                    │ YES             │ NO
                    ↓                 │
         ┌────────────────────────┐   │
-        │ add_variant_position   │   │
-        │ _alleles               │   │
+        │ add_vcf_identifiers    │   │
         └────────────────────────┘   │
                    │                 │
                    └─────────────┬───┘
@@ -670,7 +669,7 @@ For more details on chunking options, see the [BLAT Error 137 Retry Strategy](#b
 - This is normal; empty slots (e.g., `CA1||CA3`) indicate candidates without ClinGen matches
 - Check earlier reverse-translation step for the candidate count per row
 
-### Step 4: add_variant_position_alleles Issues
+### Step 4: add_vcf_identifiers Issues
 
 **Problem: Parsing errors or missing ref alleles**
 - UTA database may not be running; start it: `docker compose up uta`
@@ -868,7 +867,7 @@ TP53	CA123456|CA123457||	Pathogenic	0.00234	0.00234	1547
 |--------|------|-------------|
 | `dna_clingen_allele_id` | string | Pipe-delimited ClinGen Allele IDs (e.g., `CA123456\|\|CA123457`); empty slots for unresolved candidates |
 
-#### Step 4: add_variant_position_alleles
+#### Step 4: add_vcf_identifiers
 
 | Column | Type | Description |
 |--------|------|-------------|

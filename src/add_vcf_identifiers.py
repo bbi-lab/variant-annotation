@@ -1,10 +1,15 @@
-"""Add parsed position/allele columns for mapped HGVS fields.
+"""Add VCF-format columns (chromosome, position, ref, alt) for mapped HGVS fields.
 
 Given mapped HGVS columns (genomic/transcript/protein), this script appends:
+- <col>_chromosome: Chromosome number (1-22), X, Y, or M (mitochondria)
 - <col>_start
 - <col>_stop
 - <col>_ref
 - <col>_alt
+
+For protein HGVS, ref/alt use one-character amino acid codes (e.g., A, R, C, etc.;
+* for stop codon; - for deletion). For synonymous variants (ref == alt), the
+amino acid is repeated.
 
 It also adds transcript-derived boolean columns:
 - touches_intronic_region: transcript HGVS contains intronic offset coordinates
@@ -27,6 +32,26 @@ logger = logging.getLogger(__name__)
 
 _HGVS_RESOLVER_UNAVAILABLE_LOGGED = False
 _HGVS_REF_RESOLVER: Optional["_HgvsRefResolver"] = None
+
+# Three-letter to one-letter amino acid code mapping
+_AA_3TO1 = {
+    "Ala": "A", "Arg": "R", "Asn": "N", "Asp": "D", "Cys": "C",
+    "Gln": "Q", "Glu": "E", "Gly": "G", "His": "H", "Ile": "I",
+    "Leu": "L", "Lys": "K", "Met": "M", "Phe": "F", "Pro": "P",
+    "Ser": "S", "Thr": "T", "Trp": "W", "Tyr": "Y", "Val": "V",
+    "Sec": "U", "Pyl": "O",  # Selenocysteine and Pyrrolysine
+}
+
+# Map accession prefixes to chromosomes
+_ACCESSION_TO_CHROMOSOME = {
+    "NC_000001": "1", "NC_000002": "2", "NC_000003": "3", "NC_000004": "4",
+    "NC_000005": "5", "NC_000006": "6", "NC_000007": "7", "NC_000008": "8",
+    "NC_000009": "9", "NC_000010": "10", "NC_000011": "11", "NC_000012": "12",
+    "NC_000013": "13", "NC_000014": "14", "NC_000015": "15", "NC_000016": "16",
+    "NC_000017": "17", "NC_000018": "18", "NC_000019": "19", "NC_000020": "20",
+    "NC_000021": "21", "NC_000022": "22", "NC_000023": "X", "NC_000024": "Y",
+    "NC_012920": "M",  # Mitochondrial genome
+}
 
 
 class _HgvsRefResolver:
@@ -141,6 +166,58 @@ def _spans_intron(start: Optional[str], stop: Optional[str]) -> bool:
     )
 
 
+def _aa_3to1(aa_3letter: str) -> str:
+    """Convert 3-letter amino acid code to 1-letter (case-insensitive)."""
+    aa_3letter = aa_3letter.strip()
+    if len(aa_3letter) == 1:
+        # Already 1-letter
+        if aa_3letter == "*":
+            return "*"
+        if aa_3letter == "-":
+            return "-"
+        return aa_3letter.upper()
+    
+    # Try to convert 3-letter to 1-letter
+    key = aa_3letter[0].upper() + aa_3letter[1:].lower()
+    if key in _AA_3TO1:
+        return _AA_3TO1[key]
+    
+    # Unknown amino acid, return as-is but uppercase
+    return aa_3letter.upper()
+
+
+def _normalize_protein_allele(allele: Optional[str], is_ref: bool, ref_aa: Optional[str]) -> Optional[str]:
+    """Convert protein allele to 1-letter codes.
+    
+    For synonymous variants (ref == alt), repeat the amino acid.
+    """
+    if allele is None or allele == "":
+        return "" if is_ref else None
+    
+    allele = allele.strip()
+    if not allele:
+        return ""
+    
+    # Handle special cases
+    if allele == "dup" or allele == "fs" or allele == "inv":
+        return allele
+    
+    # Handle range deletions like "Ala_Arg"
+    if "_" in allele:
+        parts = allele.split("_")
+        converted = [_aa_3to1(p) for p in parts]
+        result = "_".join(converted)
+        # If this is a deletion (no ref/alt in range form), use "-"
+        return result if not is_ref else result
+    
+    # Single amino acid
+    converted = _aa_3to1(allele)
+    
+    # For synonymous variants: if ref and alt are the same, repeat the amino acid
+    # This will only apply to single-position variants where ref_aa == converted
+    return converted
+
+
 def _parse_nucleotide_hgvs(hgvs_body: str) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     text = hgvs_body.strip()
 
@@ -187,15 +264,20 @@ def _parse_protein_hgvs(hgvs_body: str) -> tuple[Optional[str], Optional[str], O
         start = m_range.group("pos1")
         stop = m_range.group("pos2")
         edit = m_range.group("edit")
+        aa1_1letter = _aa_3to1(m_range.group("aa1"))
+        aa2_1letter = _aa_3to1(m_range.group("aa2"))
+        ref_range = f"{aa1_1letter}_{aa2_1letter}"
+        
         if edit.startswith("delins"):
-            return start, stop, f"{m_range.group('aa1')}_{m_range.group('aa2')}", edit[len("delins") :]
+            alt_part = edit[len("delins"):]
+            alt_1letter = _normalize_protein_allele(alt_part, False, None) or alt_part
+            return start, stop, ref_range, alt_1letter
         if edit.startswith("del"):
-            return start, stop, f"{m_range.group('aa1')}_{m_range.group('aa2')}", ""
+            return start, stop, ref_range, "-"
         if edit.startswith("dup"):
-            ref = f"{m_range.group('aa1')}_{m_range.group('aa2')}"
-            return start, stop, ref, "dup"
+            return start, stop, ref_range, ref_range + ref_range
         if edit == "=":
-            return start, stop, "", ""
+            return start, stop, ref_range, ref_range
         return start, stop, None, None
 
     m_single = re.match(r"^(?P<ref>[A-Za-z*]{1,3})(?P<pos>\d+)(?P<edit>.*)$", text)
@@ -204,55 +286,95 @@ def _parse_protein_hgvs(hgvs_body: str) -> tuple[Optional[str], Optional[str], O
 
     start = m_single.group("pos")
     stop = start
-    ref = m_single.group("ref")
+    ref_3letter = m_single.group("ref")
+    ref_1letter = _aa_3to1(ref_3letter)
     edit = m_single.group("edit")
 
     if not edit:
-        return start, stop, ref, None
+        return start, stop, ref_1letter, None
     if edit == "=":
-        return start, stop, ref, ref
+        return start, stop, ref_1letter, ref_1letter
     if edit.startswith("delins"):
-        return start, stop, ref, edit[len("delins") :]
+        alt_part = edit[len("delins"):]
+        alt_1letter = _normalize_protein_allele(alt_part, False, ref_1letter) or alt_part
+        return start, stop, ref_1letter, alt_1letter
     if edit.startswith("del"):
-        return start, stop, ref, ""
+        return start, stop, ref_1letter, "-"
     if edit.startswith("dup"):
-        return start, stop, ref, ref + ref
+        return start, stop, ref_1letter, ref_1letter + ref_1letter
     if edit.startswith("ins"):
-        return start, stop, "", edit[len("ins") :]
+        alt_part = edit[len("ins"):]
+        alt_1letter = _normalize_protein_allele(alt_part, False, None) or alt_part
+        return start, stop, "", alt_1letter
     if edit.startswith("fs"):
-        return start, stop, ref, "fs"
+        return start, stop, ref_1letter, "fs"
 
     # Substitution form like p.Pro656Leu -> edit is "Leu"
     if re.match(r"^[A-Za-z*]{1,3}$", edit):
-        return start, stop, ref, edit
+        alt_3letter = edit
+        alt_1letter = _aa_3to1(alt_3letter)
+        # For synonymous variants, repeat the amino acid
+        if ref_1letter == alt_1letter:
+            return start, stop, ref_1letter, ref_1letter
+        return start, stop, ref_1letter, alt_1letter
 
-    return start, stop, ref, None
+    return start, stop, ref_1letter, None
+
+
+def _extract_chromosome_from_hgvs(hgvs_value: Optional[str]) -> Optional[str]:
+    """Extract chromosome number from HGVS accession code.
+    
+    Examples:
+    - "NC_000001.11:g..." -> "1"
+    - "NC_000023.11:g..." -> "X"
+    - "NC_012920.1:m..." -> "M"
+    """
+    if _is_blank(hgvs_value):
+        return None
+    
+    text = (hgvs_value or "").strip()
+    if ":" not in text:
+        return None
+    
+    accession, _ = text.split(":", 1)
+    accession = accession.strip()
+    
+    # Try to match known RefSeq prefixes
+    for prefix, chromosome in _ACCESSION_TO_CHROMOSOME.items():
+        if accession.startswith(prefix):
+            return chromosome
+    
+    return None
 
 
 def _parse_hgvs(
     hgvs_value: Optional[str],
     *,
     resolve_missing_ref_alleles: bool = False,
-) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], bool, bool]:
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], bool, bool, Optional[str]]:
+    """Parse HGVS and return (start, stop, ref, alt, touches_intronic, spans_intron, chromosome)."""
     if _is_blank(hgvs_value):
-        return None, None, None, None, False, False
+        return None, None, None, None, False, False, None
 
     text = (hgvs_value or "").strip()
     if ":" not in text:
-        return None, None, None, None, False, False
+        return None, None, None, None, False, False, None
 
     _, body = text.split(":", 1)
     body = body.strip()
 
     if len(body) < 2 or body[1] != ".":
-        return None, None, None, None, False, False
+        return None, None, None, None, False, False, None
 
     coord_type = body[0].lower()
     posedit = body[2:]
+    
+    # Extract chromosome
+    chromosome = _extract_chromosome_from_hgvs(hgvs_value)
 
     if coord_type == "p":
         start, stop, ref, alt = _parse_protein_hgvs(posedit)
-        return start, stop, ref, alt, False, False
+        return start, stop, ref, alt, False, False, chromosome
 
     start, stop, ref, alt = _parse_nucleotide_hgvs(posedit)
 
@@ -272,7 +394,7 @@ def _parse_hgvs(
         touches_intronic_region = _is_intronic_component(start) or _is_intronic_component(stop)
         spans_intron = _spans_intron(start, stop)
 
-    return start, stop, ref, alt, touches_intronic_region, spans_intron
+    return start, stop, ref, alt, touches_intronic_region, spans_intron, chromosome
 
 
 def _set_or_append_fieldnames(fieldnames: list[str], col: str) -> None:
@@ -291,18 +413,19 @@ def _annotate_row(
     spans_intron_col: str,
     resolve_missing_ref_alleles: bool,
 ) -> tuple[int, dict[str, str]]:
-    """Annotate one row with parsed position/allele fields."""
+    """Annotate one row with parsed position/allele/chromosome fields."""
     for base_col in (mapped_hgvs_g_col, mapped_hgvs_c_col, mapped_hgvs_p_col):
-        start, stop, ref, alt, _, _ = _parse_hgvs(
+        start, stop, ref, alt, _, _, chromosome = _parse_hgvs(
             row.get(base_col),
             resolve_missing_ref_alleles=resolve_missing_ref_alleles,
         )
+        row[f"{base_col}_chromosome"] = "" if chromosome is None else chromosome
         row[f"{base_col}_start"] = "" if start is None else start
         row[f"{base_col}_stop"] = "" if stop is None else stop
         row[f"{base_col}_ref"] = "" if ref is None else ref
         row[f"{base_col}_alt"] = "" if alt is None else alt
 
-    _, _, _, _, touches_intronic_region, spans_intron = _parse_hgvs(
+    _, _, _, _, touches_intronic_region, spans_intron, _ = _parse_hgvs(
         row.get(mapped_hgvs_c_col),
         resolve_missing_ref_alleles=resolve_missing_ref_alleles,
     )
@@ -338,6 +461,7 @@ def annotate_variants(
         fieldnames = list(reader.fieldnames)
 
         for base_col in (mapped_hgvs_g_col, mapped_hgvs_c_col, mapped_hgvs_p_col):
+            _set_or_append_fieldnames(fieldnames, f"{base_col}_chromosome")
             _set_or_append_fieldnames(fieldnames, f"{base_col}_start")
             _set_or_append_fieldnames(fieldnames, f"{base_col}_stop")
             _set_or_append_fieldnames(fieldnames, f"{base_col}_ref")
@@ -404,7 +528,7 @@ def annotate_variants(
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Add parsed start/stop/ref/alt fields for mapped HGVS columns.",
+        description="Add VCF-format columns (chromosome, position, ref, alt) for mapped HGVS variants.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("input", help="Input CSV/TSV file path.")

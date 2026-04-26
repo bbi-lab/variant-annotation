@@ -3,11 +3,11 @@ set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
   cat <<'EOF'
-Usage: src/scripts/run_add_variant_position_alleles.sh <input-file> <output-file> [script options...]
+Usage: src/scripts/run_add_vcf_identifiers.sh <input-file> <output-file> [script options...]
 
 Examples:
-  src/scripts/run_add_variant_position_alleles.sh input.tsv output.tsv
-  src/scripts/run_add_variant_position_alleles.sh input.tsv output.tsv --touches-intronic-region-column transcript_touches_intronic_region
+  src/scripts/run_add_vcf_identifiers.sh input.tsv output.tsv
+  src/scripts/run_add_vcf_identifiers.sh input.tsv output.tsv --mapped-hgvs-g genomic_hgvs --mapped-hgvs-c transcript_hgvs --mapped-hgvs-p protein_hgvs
 
 Notes:
   - Paths are interpreted relative to /work in the container.
@@ -92,4 +92,4 @@ done
 exec docker compose --profile tools run \
   ${compose_build_flag:+$compose_build_flag} ${compose_no_cache_flag:+$compose_no_cache_flag} --rm --no-deps \
   --entrypoint python map-variants \
-  -m src.add_variant_position_alleles "$input_in_container" "$output_in_container" "${mapped_args[@]}"
+  -m src.add_vcf_identifiers "$input_in_container" "$output_in_container" "${mapped_args[@]}"

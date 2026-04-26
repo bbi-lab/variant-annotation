@@ -32,7 +32,7 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 import psycopg2  # type: ignore[import-untyped]
-from src.add_variant_position_alleles import _parse_hgvs
+from src.add_vcf_identifiers import _parse_hgvs
 
 load_dotenv()
 
