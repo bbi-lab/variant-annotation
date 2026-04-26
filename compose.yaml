@@ -101,6 +101,19 @@ services:
       - .:/usr/src/app
       - ${VARIANT_DATA_DIR:-./data}:/work
 
+  utilities:
+    build: .
+    platform: linux/amd64
+    profiles:
+      - tools
+    env_file:
+      - settings/.env
+    entrypoint: ["python", "-m", "src.utilities"]
+    command: ["--help"]
+    volumes:
+      - .:/usr/src/app
+      - ${VARIANT_DATA_DIR:-./data}:/work
+
   cdot:
     build:
       context: https://github.com/VariantEffect/cdot_rest.git
