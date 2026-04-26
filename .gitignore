@@ -220,5 +220,7 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Project-specific
-data/uta/uta_20241220.pgd.gz
+/data/*
+/data/uta/uta_20241220.pgd.gz
+!/data/.gitkeep
 *.tsv
