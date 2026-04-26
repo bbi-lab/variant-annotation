@@ -1625,12 +1625,18 @@ def map_variants(
                         for orig_idx, row, hgvs_assay in hgvs_queries:
                             data = clingen_results.get(hgvs_assay)
                             if data is None:
+                                # Preserve the assay-level HGVS even when ClinGen has no record.
+                                # Protein assays (p. strings) go to hgvs_p; genomic/transcript
+                                # assays go to hgvs_g so the mapping work is not discarded.
+                                _assay_is_protein = (
+                                    hgvs_assay.startswith("p.") or ":p." in hgvs_assay
+                                )
                                 _record_result(
                                     orig_idx,
                                     row,
                                     None,
-                                    None,
-                                    None,
+                                    None if _assay_is_protein else hgvs_assay,
+                                    hgvs_assay if _assay_is_protein else None,
                                     f"ClinGen returned no data for {hgvs_assay!r}",
                                     group_id=group_name,
                                 )

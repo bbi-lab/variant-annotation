@@ -385,6 +385,101 @@ def test_map_variants_normalizes_raw_hgvs_pro_in_output(tmp_path, monkeypatch):
     assert out_rows[0]["raw_hgvs_pro"] == "p.Ala300Thr"
 
 
+# ---------------------------------------------------------------------------
+# _extract_clingen_allele_id tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "data,expected",
+    [
+        # Normal CA / PA IDs
+        ({"@id": "https://reg.genome.network/allele/CA123456"}, "CA123456"),
+        ({"@id": "https://reg.genome.network/allele/PA987654"}, "PA987654"),
+        # Blank-node placeholders must be rejected
+        ({"@id": "_:PA3262009431"}, None),
+        ({"@id": "_:CA0000001"}, None),
+        # Fallback via "id" field
+        ({"id": "CA123456"}, "CA123456"),
+        ({"id": "_:PA123"}, None),
+        # Empty / missing
+        ({"@id": ""}, None),
+        ({}, None),
+    ],
+)
+def test_extract_clingen_allele_id(data, expected):
+    assert mv._extract_clingen_allele_id(data) == expected
+
+
+def test_map_variants_clingen_no_data_preserves_protein_hgvs(tmp_path, monkeypatch):
+    """When ClinGen returns no data, the dcd_mapping p. result is kept in mapped_hgvs_p."""
+    input_path = tmp_path / "in.tsv"
+    output_path = tmp_path / "out.tsv"
+
+    with open(input_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["variant_urn", "raw_hgvs_nt", "raw_hgvs_pro", "target_sequence"],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"variant_urn": "v0", "raw_hgvs_nt": "", "raw_hgvs_pro": "p.Q2Ter", "target_sequence": "SEQ_A"}
+        )
+
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+        return [(orig_idx, "NP_005624.2:p.Gln2Ter", None) for orig_idx, *_ in row_entries], "NM_005633.4"
+
+    async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
+        # Simulate ClinGen returning no data
+        return {h: None for h in hgvs_strings}
+
+    monkeypatch.setattr(mv, "_try_import_dcd_mapping", lambda: object())
+    monkeypatch.setattr(mv, "_run_dcd_mapping_pipeline", fake_pipeline)
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs_batch", fake_clingen_batch)
+
+    mv.map_variants(str(input_path), str(output_path))
+
+    out_rows = _read_tsv(output_path)
+    assert out_rows[0]["mapped_hgvs_p"] == "NP_005624.2:p.Gln2Ter"
+    assert "ClinGen returned no data" in out_rows[0]["mapping_error"]
+
+
+def test_map_variants_clingen_no_data_preserves_genomic_hgvs(tmp_path, monkeypatch):
+    """When ClinGen returns no data, the dcd_mapping genomic result is kept in mapped_hgvs_g."""
+    input_path = tmp_path / "in.tsv"
+    output_path = tmp_path / "out.tsv"
+
+    with open(input_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["variant_urn", "raw_hgvs_nt", "raw_hgvs_pro", "target_sequence"],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"variant_urn": "v0", "raw_hgvs_nt": "", "raw_hgvs_pro": "p.Q2Ter", "target_sequence": "SEQ_A"}
+        )
+
+    genomic = "NC_000002.12:g.12345A>T"
+
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+        return [(orig_idx, genomic, None) for orig_idx, *_ in row_entries], "NM_005633.4"
+
+    async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
+        return {h: None for h in hgvs_strings}
+
+    monkeypatch.setattr(mv, "_try_import_dcd_mapping", lambda: object())
+    monkeypatch.setattr(mv, "_run_dcd_mapping_pipeline", fake_pipeline)
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs_batch", fake_clingen_batch)
+
+    mv.map_variants(str(input_path), str(output_path))
+
+    out_rows = _read_tsv(output_path)
+    assert out_rows[0]["mapped_hgvs_g"] == genomic
+    assert "ClinGen returned no data" in out_rows[0]["mapping_error"]
+
+
 def test_map_variants_routes_class1_class2_class3(tmp_path, monkeypatch):
     input_path = tmp_path / "in.tsv"
     output_path = tmp_path / "out.tsv"
