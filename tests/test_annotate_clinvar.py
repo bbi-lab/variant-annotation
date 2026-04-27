@@ -5,11 +5,13 @@ from __future__ import annotations
 import csv
 import gzip
 import io
+import time
 import textwrap
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import src.annotate_clinvar as mod
 
 from src.annotate_clinvar import (
     annotate_row,
@@ -377,3 +379,77 @@ class TestAnnotateRow:
                 dna_clingen_allele_id_col="my_dna_col",
             )
         assert out["clinvar.202601.clinical_significance"] == "Pathogenic"
+
+
+def test_main_preserves_row_order_with_concurrency(tmp_path, monkeypatch):
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+
+    with in_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["variant_urn", "dna_clingen_allele_id"],
+            delimiter="\t",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerow({"variant_urn": "v1", "dna_clingen_allele_id": "CA1"})
+        writer.writerow({"variant_urn": "v2", "dna_clingen_allele_id": "CA2"})
+        writer.writerow({"variant_urn": "v3", "dna_clingen_allele_id": "CA3"})
+
+    monkeypatch.setattr(mod, "fetch_clinvar_tsv", lambda y, m, c: Path("unused"))
+    monkeypatch.setattr(mod, "load_clinvar_tsv", lambda p: {})
+
+    def fake_annotate_row(row, clinvar_data, clingen_cache, col_prefix, dna_clingen_allele_id_col="dna_clingen_allele_id"):
+        urn = row.get("variant_urn")
+        if urn == "v1":
+            time.sleep(0.08)
+        else:
+            time.sleep(0.02)
+        return {
+            f"{col_prefix}.clinical_significance": urn or "",
+            f"{col_prefix}.review_status": "",
+            f"{col_prefix}.stars": "",
+            f"{col_prefix}.last_review_date": "",
+        }
+
+    monkeypatch.setattr(mod, "annotate_row", fake_annotate_row)
+
+    mod.main([
+        str(in_path),
+        str(out_path),
+        "--max-workers",
+        "3",
+        "--clinvar-version",
+        "202601",
+    ])
+
+    with out_path.open("r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh, delimiter="\t"))
+
+    assert [r["variant_urn"] for r in rows] == ["v1", "v2", "v3"]
+    assert [r["clinvar.202601.clinical_significance"] for r in rows] == ["v1", "v2", "v3"]
+
+
+def test_main_invalid_max_workers_exits(tmp_path):
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+
+    with in_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["variant_urn", "dna_clingen_allele_id"],
+            delimiter="\t",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+
+    with pytest.raises(SystemExit) as excinfo:
+        mod.main([
+            str(in_path),
+            str(out_path),
+            "--max-workers",
+            "0",
+        ])
+
+    assert int(excinfo.value.code) == 1

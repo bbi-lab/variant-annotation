@@ -45,6 +45,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import csv
 import gzip
 import io
@@ -277,6 +278,25 @@ def annotate_row(
     }
 
 
+def _annotate_row_task(
+    row_idx: int,
+    row: dict[str, str],
+    *,
+    clinvar_data: dict[str, dict[str, str]],
+    clingen_cache: dict[str, str],
+    col_prefix: str,
+    dna_clingen_allele_id_col: str,
+) -> tuple[int, dict[str, str], dict[str, str]]:
+    annotations = annotate_row(
+        row,
+        clinvar_data,
+        clingen_cache,
+        col_prefix,
+        dna_clingen_allele_id_col=dna_clingen_allele_id_col,
+    )
+    return row_idx, row, annotations
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -340,6 +360,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity (default: INFO).",
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=8,
+        help="Concurrent worker threads for row annotation.",
+    )
     return parser.parse_args(argv)
 
 
@@ -350,6 +376,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    if args.max_workers < 1:
+        logger.error("--max-workers must be >= 1, got: %d", args.max_workers)
+        sys.exit(1)
 
     # Validate and parse the --clinvar-version argument
     version_str = args.clinvar_version.strip()
@@ -409,21 +439,53 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         processed = 0
         annotated = 0
-        for row in reader:
-            annotations = annotate_row(
-                row,
-                clinvar_data,
-                clingen_cache,
-                col_prefix,
-                dna_clingen_allele_id_col=args.dna_clingen_allele_id_col,
-            )
-            row.update(annotations)
-            writer.writerow(row)
-            processed += 1
-            if annotations[f"{col_prefix}.clinical_significance"]:
-                annotated += 1
-            if processed % 500 == 0:
-                logger.info("Processed %d rows (%d annotated) …", processed, annotated)
+        pending_by_index: dict[int, tuple[dict[str, str], dict[str, str]]] = {}
+        next_to_write = 0
+
+        with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+            max_in_flight = args.max_workers * 4
+            row_iter = enumerate(reader)
+            in_flight: dict = {}
+
+            def _submit_until_full() -> None:
+                while len(in_flight) < max_in_flight:
+                    try:
+                        idx, row = next(row_iter)
+                    except StopIteration:
+                        break
+                    fut = executor.submit(
+                        _annotate_row_task,
+                        idx,
+                        row,
+                        clinvar_data=clinvar_data,
+                        clingen_cache=clingen_cache,
+                        col_prefix=col_prefix,
+                        dna_clingen_allele_id_col=args.dna_clingen_allele_id_col,
+                    )
+                    in_flight[fut] = idx
+
+            _submit_until_full()
+
+            while in_flight:
+                done, _ = wait(tuple(in_flight.keys()), return_when=FIRST_COMPLETED)
+                for fut in done:
+                    in_flight.pop(fut, None)
+                    row_idx, row_out, annotations = fut.result()
+                    pending_by_index[row_idx] = (row_out, annotations)
+
+                while next_to_write in pending_by_index:
+                    row_out, annotations = pending_by_index.pop(next_to_write)
+                    row_out.update(annotations)
+                    writer.writerow(row_out)
+                    out_fh.flush()
+                    processed += 1
+                    if annotations[f"{col_prefix}.clinical_significance"]:
+                        annotated += 1
+                    if processed % 500 == 0:
+                        logger.info("Processed %d rows (%d annotated) …", processed, annotated)
+                    next_to_write += 1
+
+                _submit_until_full()
 
     logger.info(
         "Done. %d rows processed, %d annotated with ClinVar data → %s",

@@ -7,6 +7,7 @@ services:
     depends_on:
       - cdot
       - db
+      - redis
       - seqrepo
       - uta
     env_file:
@@ -43,6 +44,8 @@ services:
     platform: linux/amd64
     profiles:
       - tools
+    depends_on:
+      - redis
     env_file:
       - settings/.env
     environment:
