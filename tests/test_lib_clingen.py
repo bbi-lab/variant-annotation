@@ -177,3 +177,99 @@ def test_clear_clingen_cache_deletes_prefixed_keys(monkeypatch):
     assert dummy.get("clingen:test:hgvs:a") is None
     assert dummy.get("clingen:test:allele:CA1") is None
     assert dummy.get("otherprefix:key") == "x"
+
+
+class TestExtractGrch38Coordinates:
+    def _make_ga(self, ref_genome, chrom, start, end, ref, alt):
+        return {
+            "referenceGenome": ref_genome,
+            "chromosome": chrom,
+            "coordinates": [{"start": start, "end": end, "referenceAllele": ref, "allele": alt}],
+        }
+
+    def test_extracts_grch38_entry(self):
+        data = {
+            "genomicAlleles": [
+                self._make_ga("GRCh37", "1", 100, 101, "A", "G"),
+                self._make_ga("GRCh38", "1", 109250079, 109250080, "A", "G"),
+            ]
+        }
+        assert clingen._extract_grch38_coordinates(data) == ("chr1", 109250080, "A", "G")
+
+    def test_normalises_chrom_without_chr_prefix(self):
+        data = {
+            "genomicAlleles": [
+                self._make_ga("GRCh38", "X", 1000, 1001, "C", "T"),
+            ]
+        }
+        assert clingen._extract_grch38_coordinates(data) == ("chrX", 1001, "C", "T")
+
+    def test_preserves_existing_chr_prefix(self):
+        data = {
+            "genomicAlleles": [
+                self._make_ga("GRCh38", "chr13", 32316460, 32316461, "C", "T"),
+            ]
+        }
+        assert clingen._extract_grch38_coordinates(data) == ("chr13", 32316461, "C", "T")
+
+    def test_returns_none_when_no_grch38(self):
+        data = {
+            "genomicAlleles": [
+                self._make_ga("GRCh37", "1", 100, 101, "A", "G"),
+            ]
+        }
+        assert clingen._extract_grch38_coordinates(data) is None
+
+    def test_returns_none_for_empty_genomic_alleles(self):
+        assert clingen._extract_grch38_coordinates({}) is None
+        assert clingen._extract_grch38_coordinates({"genomicAlleles": []}) is None
+
+
+class TestResolveGrch38Coordinates:
+    def test_fetches_and_caches_result(self, monkeypatch):
+        dummy = _DummyRedis()
+        _reset_clingen_state(monkeypatch, dummy)
+
+        payload = {
+            "@id": "https://reg.genome.network/allele/CA123",
+            "genomicAlleles": [
+                {
+                    "referenceGenome": "GRCh38",
+                    "chromosome": "7",
+                    "coordinates": [{"start": 117548627, "end": 117548628, "referenceAllele": "G", "allele": "A"}],
+                }
+            ],
+        }
+        dummy.set("clingen:test:allele:CA123", json.dumps(payload))
+
+        calls = {"n": 0}
+
+        def fake_get(*args, **kwargs):
+            calls["n"] += 1
+            return None
+
+        monkeypatch.setattr(clingen.requests, "get", fake_get)
+
+        cache: dict = {}
+        result = clingen.resolve_grch38_coordinates("CA123", cache)
+
+        assert result == ("chr7", 117548628, "G", "A")
+        assert calls["n"] == 0  # served from Redis cache
+
+    def test_returns_none_when_caid_not_found(self, monkeypatch):
+        dummy = _DummyRedis()
+        _reset_clingen_state(monkeypatch, dummy)
+
+        def fake_get(url, *args, **kwargs):
+            return _Resp(404)
+
+        monkeypatch.setattr(clingen.requests, "get", fake_get)
+
+        cache: dict = {}
+        assert clingen.resolve_grch38_coordinates("CA_MISSING", cache) is None
+        assert "CA_MISSING" in cache  # cached as None
+
+    def test_processes_cache_hit(self):
+        cache: dict = {"CA_HIT": ("chr2", 12345, "A", "T")}
+        result = clingen.resolve_grch38_coordinates("CA_HIT", cache)
+        assert result == ("chr2", 12345, "A", "T")

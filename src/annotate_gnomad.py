@@ -38,6 +38,10 @@ GNOMAD_HT_URI_DEFAULT = os.environ.get(
     "GNOMAD_HT_URI",
     "gs://gcp-public-data--gnomad/release/4.1/ht/joint/gnomad.joint.v4.1.sites.ht",
 )
+HAIL_GCS_CONNECTOR_JAR_DEFAULT = (
+    "https://repo1.maven.org/maven2/com/google/cloud/bigdataoss/"
+    "gcs-connector/hadoop3-2.2.11/gcs-connector-hadoop3-2.2.11-shaded.jar"
+)
 
 
 @dataclass
@@ -63,6 +67,67 @@ def _import_hail():
 
 def _detect_separator(file_path: str) -> str:
     return "\t" if Path(file_path).suffix.lower() in (".tsv", ".txt") else ","
+
+
+def _is_gs_uri(uri: str) -> bool:
+    return (uri or "").strip().lower().startswith("gs://")
+
+
+def _hail_init_kwargs(tmp_dir: Path, source_uri: str) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "tmp_dir": str(tmp_dir),
+        "quiet": True,
+        "idempotent": True,
+    }
+    if not _is_gs_uri(source_uri):
+        return kwargs
+
+    spark_conf = {
+        "spark.hadoop.fs.gs.impl": "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystem",
+        "spark.hadoop.fs.AbstractFileSystem.gs.impl": "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFS",
+    }
+    gcs_auth_type = os.environ.get("HAIL_GCS_AUTH_TYPE", "UNAUTHENTICATED").strip()
+    if gcs_auth_type:
+        spark_conf["spark.hadoop.fs.gs.auth.type"] = gcs_auth_type
+        if gcs_auth_type.upper() == "UNAUTHENTICATED":
+            spark_conf["spark.hadoop.google.cloud.auth.service.account.enable"] = "false"
+            spark_conf["spark.hadoop.google.cloud.auth.null.enable"] = "true"
+            spark_conf["spark.hadoop.fs.gs.auth.null.enable"] = "true"
+
+    base_jars = os.environ.get("HAIL_SPARK_JARS", "").strip()
+    gcs_jar = os.environ.get("HAIL_GCS_CONNECTOR_JAR", HAIL_GCS_CONNECTOR_JAR_DEFAULT).strip()
+    jars = ",".join(part for part in [base_jars, gcs_jar] if part)
+    if jars:
+        spark_conf["spark.jars"] = jars
+
+    base_packages = os.environ.get("HAIL_SPARK_JARS_PACKAGES", "").strip()
+    gcs_packages = os.environ.get("HAIL_GCS_CONNECTOR_PACKAGES", "").strip()
+    packages = ",".join(part for part in [base_packages, gcs_packages] if part)
+    if packages:
+        spark_conf["spark.jars.packages"] = packages
+
+    kwargs["spark_conf"] = spark_conf
+    return kwargs
+
+
+def _raise_actionable_hail_error(source_uri: str, exc: Exception) -> None:
+    message = str(exc)
+    if _is_gs_uri(source_uri) and "UnsupportedFileSystemException" in message and "scheme \"gs\"" in message:
+        raise RuntimeError(
+            "Hail cannot read gs:// paths because the Google Cloud Storage connector is unavailable "
+            "in Spark/Hadoop. This script now configures a GCS connector automatically. "
+            "Rebuild the annotate-gnomad image and retry. If this still fails in your environment, "
+            "download the gnomAD Hail table locally and pass a local --gnomad-ht-uri path. "
+            f"Original error: {message}"
+        ) from exc
+    if _is_gs_uri(source_uri) and "No valid credential configuration discovered" in message:
+        raise RuntimeError(
+            "Hail reached the Google Cloud Storage connector, but no usable credential mode was configured. "
+            "For public gnomAD buckets this command defaults to unauthenticated access; if your environment "
+            "overrides auth settings, set HAIL_GCS_AUTH_TYPE=UNAUTHENTICATED. "
+            f"Original error: {message}"
+        ) from exc
+    raise exc
 
 
 def _split_pipe(value: str) -> list[str]:
@@ -106,7 +171,12 @@ def ensure_local_gnomad_ht(
     source_ht_uri: str,
     overwrite: bool = False,
 ) -> Path:
-    """Create a local CAID-keyed gnomAD Hail table cache if missing."""
+    """Download and cache a local gnomAD Hail table.
+
+    The local table is keyed by ``caid`` when the source table contains that
+    field (case 1), or by a ``"chrN:pos:ref:alt"`` string (``gnomad_key``) when it
+    does not (cases 2 & 3).
+    """
     hl = _import_hail()
 
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -119,16 +189,26 @@ def ensure_local_gnomad_ht(
     hail_tmp.mkdir(parents=True, exist_ok=True)
 
     logger.info("Initializing Hail and loading source table: %s", source_ht_uri)
-    hl.init(tmp_dir=str(hail_tmp), quiet=True, idempotent=True)
+    hl.init(**_hail_init_kwargs(hail_tmp, source_ht_uri))
     try:
-        source_ht = hl.read_table(source_ht_uri)
+        try:
+            source_ht = hl.read_table(source_ht_uri)
+        except Exception as exc:
+            _raise_actionable_hail_error(source_ht_uri, exc)
 
-        caid_expr = _choose_expr(source_ht, [["caid"]])
-        if caid_expr is None:
-            raise RuntimeError("Could not find 'caid' field in source gnomAD Hail table")
+        # Resolve allele counts: try joint.freq array first, then top-level freq array.
+        if _has_path(source_ht.row.dtype, ["joint", "freq"]):
+            freq_first = source_ht.joint.freq[0]
+            ac_expr: Any = freq_first.AC
+            an_expr: Any = freq_first.AN
+        elif _has_path(source_ht.row.dtype, ["freq"]):
+            freq_first = source_ht.freq[0]
+            ac_expr = freq_first.AC
+            an_expr = freq_first.AN
+        else:
+            ac_expr = _choose_expr(source_ht, [["joint", "AC"], ["AC"]])
+            an_expr = _choose_expr(source_ht, [["joint", "AN"], ["AN"]])
 
-        ac_expr = _choose_expr(source_ht, [["joint", "freq", "all", "ac"], ["freq", "all", "ac"]])
-        an_expr = _choose_expr(source_ht, [["joint", "freq", "all", "an"], ["freq", "all", "an"]])
         if ac_expr is None or an_expr is None:
             raise RuntimeError("Could not find allele count/number fields in source gnomAD Hail table")
 
@@ -141,8 +221,7 @@ def ensure_local_gnomad_ht(
             [["joint", "fafmax", "faf95_max"], ["fafmax", "faf95_max"]],
         )
 
-        prepared = source_ht.select(
-            caid=hl.str(caid_expr),
+        common_select: dict[str, Any] = dict(
             allele_count=hl.int64(ac_expr),
             allele_number=hl.int64(an_expr),
             faf95_max_ancestry=hl.if_else(
@@ -155,7 +234,34 @@ def ensure_local_gnomad_ht(
             else hl.missing(hl.tfloat64),
         )
 
-        prepared = prepared.key_by(prepared.caid)
+        caid_expr = _choose_expr(source_ht, [["caid"], ["CAID"]])
+        if caid_expr is not None:
+            # Case 1: source table has a caid field — build a caid-keyed local cache.
+            logger.info(
+                "Source gnomAD table has a 'caid' field; building caid-keyed local cache (case 1)"
+            )
+            prepared = source_ht.select(caid=hl.str(caid_expr), **common_select)
+            prepared = prepared.key_by(prepared.caid)
+        else:
+            # Cases 2 & 3: source table is keyed by locus + alleles — build a
+            # coordinate-keyed ("chrN:pos:ref:alt") local cache.
+            logger.debug("Source gnomAD row fields when 'caid' was not found: %s", ", ".join(source_ht.row.dtype.keys()))
+            logger.info(
+                "Source gnomAD table has no 'caid' field; "
+                "building coordinate-keyed local cache (gnomad_key) for cases 2 & 3"
+            )
+            gnomad_key_expr = (
+                source_ht.locus.contig
+                + ":"
+                + hl.str(source_ht.locus.position)
+                + ":"
+                + source_ht.alleles[0]
+                + ":"
+                + source_ht.alleles[1]
+            )
+            prepared = source_ht.select(gnomad_key=gnomad_key_expr, **common_select)
+            prepared = prepared.key_by(prepared.gnomad_key)
+
         logger.info("Writing local gnomAD cache table: %s", ht_path)
         prepared.write(str(ht_path), overwrite=True)
     finally:
@@ -164,8 +270,61 @@ def ensure_local_gnomad_ht(
     return ht_path
 
 
-def load_gnomad_records_for_caids(local_ht_path: Path, caids: set[str], cache_dir: Path) -> dict[str, GnomadRecord]:
-    """Load gnomAD records for requested CAIDs from local Hail table."""
+def _build_caid_to_gnomad_key(
+    rows: list[dict[str, str]],
+    *,
+    dna_col: str,
+    chrom_col: str,
+    pos_col: str,
+    ref_col: str,
+    alt_col: str,
+) -> dict[str, str]:
+    """Build a CAID → ``"chrN:pos:ref:alt"`` mapping from pre-computed coordinate columns.
+
+    All four coordinate columns must hold pipe-delimited values whose order
+    matches the pipe-delimited CAID candidates in *dna_col* (the cardinality
+    contract maintained by ``add_vcf_identifiers``).
+    """
+    mapping: dict[str, str] = {}
+    for row in rows:
+        caids = _split_pipe(row.get(dna_col, ""))
+        chroms = _split_pipe(row.get(chrom_col, ""))
+        positions = _split_pipe(row.get(pos_col, ""))
+        refs = _split_pipe(row.get(ref_col, ""))
+        alts = _split_pipe(row.get(alt_col, ""))
+        for i, caid in enumerate(caids):
+            chrom = chroms[i] if i < len(chroms) else ""
+            pos = positions[i] if i < len(positions) else ""
+            ref = refs[i] if i < len(refs) else ""
+            alt = alts[i] if i < len(alts) else ""
+            if not (chrom and pos and ref and alt):
+                continue
+            chrom_norm = chrom if chrom.startswith("chr") else f"chr{chrom}"
+            mapping[caid] = f"{chrom_norm}:{pos}:{ref}:{alt}"
+    return mapping
+
+
+def load_gnomad_records_for_caids(
+    local_ht_path: Path,
+    caids: set[str],
+    cache_dir: Path,
+    *,
+    caid_to_gnomad_key: Optional[dict[str, str]] = None,
+) -> dict[str, GnomadRecord]:
+    """Load gnomAD records for requested CAIDs from local Hail table.
+
+    Three resolution strategies are tried in order:
+
+    **Case 1** — the local cache is keyed by ``caid`` (source table had a caid
+    field).  Rows are filtered directly.
+
+    **Case 2** — ``caid_to_gnomad_key`` mapping is provided (pre-computed
+    coordinate columns from the input file).  CAIDs are translated to
+    ``"chrN:pos:ref:alt"`` keys and rows are filtered by those keys.
+
+    **Case 3** — fall back to ClinGen Allele Registry API lookups to resolve
+    CAID → GRCh38 coordinates → gnomad_key.
+    """
     if not caids:
         return {}
 
@@ -173,18 +332,76 @@ def load_gnomad_records_for_caids(local_ht_path: Path, caids: set[str], cache_di
     hail_tmp = cache_dir / "hail-tmp"
     hail_tmp.mkdir(parents=True, exist_ok=True)
 
-    hl.init(tmp_dir=str(hail_tmp), quiet=True, idempotent=True)
+    hl.init(**_hail_init_kwargs(hail_tmp, str(local_ht_path)))
     try:
         ht = hl.read_table(str(local_ht_path))
-        caid_literal = hl.literal(caids)
-        filtered = ht.filter(caid_literal.contains(ht.caid))
-        rows = filtered.collect()
+        # Detect the key field from the local cache schema.
+        try:
+            key_field = next(iter(ht.key.dtype.keys()), "gnomad_key")
+        except Exception:
+            key_field = "caid" if hasattr(ht, "caid") else "gnomad_key"
+
+        if key_field == "caid":
+            logger.info(
+                "gnomAD lookup strategy: caid-indexed local cache (case 1) — "
+                "filtering %d CAIDs directly",
+                len(caids),
+            )
+            caid_literal = hl.literal(caids)
+            key_expr = getattr(ht, key_field)
+            filtered = ht.filter(caid_literal.contains(key_expr))
+            rows = filtered.collect()
+        else:
+            # Resolve CAID → gnomad_key
+            if caid_to_gnomad_key is not None:
+                logger.info(
+                    "gnomAD lookup strategy: pre-computed coordinate columns (case 2) — "
+                    "resolved %d/%d CAIDs to gnomad_key",
+                    sum(1 for c in caids if c in caid_to_gnomad_key),
+                    len(caids),
+                )
+                resolved = {k: v for k, v in caid_to_gnomad_key.items() if k in caids}
+            else:
+                logger.info(
+                    "gnomAD lookup strategy: ClinGen Allele Registry API lookups (case 3) — "
+                    "resolving %d CAIDs to GRCh38 coordinates",
+                    len(caids),
+                )
+                from src.lib.clingen import resolve_grch38_coordinates  # local import to keep Hail optional
+
+                coord_cache: dict[str, Optional[tuple[str, int, str, str]]] = {}
+                resolved = {}
+                for caid in caids:
+                    coords = resolve_grch38_coordinates(caid, coord_cache)
+                    if coords is not None:
+                        chrom, pos, ref, alt = coords
+                        resolved[caid] = f"{chrom}:{pos}:{ref}:{alt}"
+                logger.info(
+                    "ClinGen resolved %d/%d CAIDs to GRCh38 coordinates",
+                    len(resolved),
+                    len(caids),
+                )
+
+            if not resolved:
+                return {}
+
+            gnomad_key_to_caid = {v: k for k, v in resolved.items()}
+            key_literal = hl.literal(set(resolved.values()))
+            key_expr = getattr(ht, key_field)
+            filtered = ht.filter(key_literal.contains(key_expr))
+            rows = filtered.collect()
     finally:
         hl.stop()
 
     out: dict[str, GnomadRecord] = {}
     for row in rows:
-        caid = str(row.caid)
+        if key_field == "caid":
+            caid = str(row.caid)
+        else:
+            row_key_value = getattr(row, key_field)
+            caid = gnomad_key_to_caid.get(str(row_key_value))
+            if caid is None:
+                continue
         ac = int(row.allele_count)
         an = int(row.allele_number)
         if an <= 0:
@@ -261,6 +478,32 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="dna_clingen_allele_id",
         help="Column containing DNA-level ClinGen allele IDs",
     )
+    # Coordinate columns (case 2): when the input file already has pre-mapped GRCh38
+    # coordinates, these are used instead of ClinGen API lookups.
+    p.add_argument(
+        "--coord-chromosome-col",
+        default="mapped_hgvs_g_chromosome",
+        help="Input column with chromosome (e.g. '1' or 'chr1') for case-2 lookups "
+             "(default: mapped_hgvs_g_chromosome)",
+    )
+    p.add_argument(
+        "--coord-pos-col",
+        default="mapped_hgvs_g_stop",
+        help="Input column with 1-based position for case-2 lookups "
+             "(default: mapped_hgvs_g_stop)",
+    )
+    p.add_argument(
+        "--coord-ref-col",
+        default="mapped_hgvs_g_ref",
+        help="Input column with reference allele for case-2 lookups "
+             "(default: mapped_hgvs_g_ref)",
+    )
+    p.add_argument(
+        "--coord-alt-col",
+        default="mapped_hgvs_g_alt",
+        help="Input column with alternate allele for case-2 lookups "
+             "(default: mapped_hgvs_g_alt)",
+    )
     p.add_argument("--delimiter", default="\t", help="Input/output delimiter (default TAB)")
     p.add_argument("--skip", type=int, default=0, help="Number of data rows to skip before annotation")
     p.add_argument("--limit", type=int, default=None, help="Maximum number of data rows to annotate")
@@ -323,8 +566,42 @@ def main(argv: Optional[list[str]] = None) -> None:
     for row in rows:
         caids.update(_split_pipe((row.get(args.dna_clingen_allele_id_col) or "").strip()))
 
+    coord_cols = [
+        args.coord_chromosome_col,
+        args.coord_pos_col,
+        args.coord_ref_col,
+        args.coord_alt_col,
+    ]
+    present_coord_cols = [col for col in coord_cols if col in fieldnames]
+    missing_coord_cols = [col for col in coord_cols if col not in fieldnames]
+    coord_cols_present = len(missing_coord_cols) == 0
+    if present_coord_cols and missing_coord_cols:
+        logger.warning(
+            "Only some coordinate columns were found in input. Found: %s. Missing: %s. "
+            "Case-2 coordinate lookup requires all four columns; falling back to case-1/3 lookup.",
+            ", ".join(present_coord_cols),
+            ", ".join(missing_coord_cols),
+        )
+    coord_mapping = (
+        _build_caid_to_gnomad_key(
+            rows,
+            dna_col=args.dna_clingen_allele_id_col,
+            chrom_col=args.coord_chromosome_col,
+            pos_col=args.coord_pos_col,
+            ref_col=args.coord_ref_col,
+            alt_col=args.coord_alt_col,
+        )
+        if coord_cols_present
+        else None
+    )
+
     logger.info("Loading gnomAD records for %d unique CAIDs", len(caids))
-    records = load_gnomad_records_for_caids(local_ht, caids, cache_dir)
+    records = load_gnomad_records_for_caids(
+        local_ht,
+        caids,
+        cache_dir,
+        caid_to_gnomad_key=coord_mapping,
+    )
 
     prefix = f"{args.gnomad_namespace}.{args.gnomad_version.replace('.', '_')}"
     ann_cols = [

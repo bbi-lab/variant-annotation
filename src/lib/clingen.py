@@ -366,6 +366,72 @@ def query_clingen_by_hgvs(
     return None
 
 
+def _extract_grch38_coordinates(data: dict) -> Optional[tuple[str, int, str, str]]:
+    """Extract GRCh38 genomic coordinates from a ClinGen allele response.
+
+    Returns a ``(chrom, pos, ref, alt)`` tuple where *chrom* is in ``"chrN"``
+    format and *pos* is 1-based, or ``None`` when GRCh38 data is unavailable.
+    Only the first coordinate record of the first GRCh38 genomicAllele entry is
+    used; multi-allelic or complex entries are not supported.
+    """
+    for ga in data.get("genomicAlleles", []):
+        if ga.get("referenceGenome") != "GRCh38":
+            continue
+        coords = ga.get("coordinates", [])
+        if not coords:
+            continue
+        coord = coords[0]
+        raw_chrom = ga.get("chromosome", "").strip()
+        pos = coord.get("end")  # ClinGen uses 0-based half-open; 'end' == 1-based position for SNVs/indels
+        ref = coord.get("referenceAllele", "").strip()
+        alt = coord.get("allele", "").strip()
+        if not raw_chrom or pos is None or not ref or not alt:
+            continue
+        chrom = raw_chrom if raw_chrom.startswith("chr") else f"chr{raw_chrom}"
+        return chrom, int(pos), ref, alt
+    return None
+
+
+def resolve_grch38_coordinates(
+    clingen_id: str,
+    cache: dict[str, Optional[tuple[str, int, str, str]]],
+    max_retries: int = CLINGEN_MAX_RETRIES,
+    retry_delay: float = CLINGEN_RETRY_DELAY,
+) -> Optional[tuple[str, int, str, str]]:
+    """Return GRCh38 ``(chrom, pos, ref, alt)`` for a ClinGen allele ID.
+
+    Returns ``None`` when the allele has no GRCh38 coordinates or the ID cannot
+    be resolved.  Results are cached in *cache* for the duration of the process.
+    ClinGen allele responses are also cached in Redis when enabled.
+    """
+    if clingen_id in cache:
+        return cache[clingen_id]
+
+    key = _allele_cache_key(clingen_id)
+    found, raw = _cache_get(key)
+    if found and raw is not None:
+        if raw == _CACHE_MISS_SENTINEL:
+            cache[clingen_id] = None
+            return None
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                result: Optional[tuple[str, int, str, str]] = _extract_grch38_coordinates(data)
+                cache[clingen_id] = result
+                return result
+        except Exception:
+            pass
+
+    data = _fetch_allele_response_by_id(
+        clingen_id,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
+    )
+    result: Optional[tuple[str, int, str, str]] = _extract_grch38_coordinates(data) if data is not None else None
+    cache[clingen_id] = result
+    return result
+
+
 def clear_clingen_cache(prefix: Optional[str] = None) -> int:
     """Delete all ClinGen cache keys for the given prefix. Returns deleted count."""
     client = _get_redis_client(force=True)
