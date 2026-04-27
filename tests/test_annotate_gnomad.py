@@ -1,3 +1,7 @@
+import csv
+
+import src.annotate_gnomad as mod
+
 from src.annotate_gnomad import GnomadRecord, annotate_row
 
 
@@ -59,3 +63,56 @@ def test_annotate_row_custom_dna_column():
     out = annotate_row(row, records, "gnomad.v4.1", "my_dna_ids")
 
     assert out["gnomad.v4.1.minor_allele_frequency"] == "0.1"
+
+
+def test_main_applies_skip_and_limit(tmp_path, monkeypatch):
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+
+    with in_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["variant_urn", "dna_clingen_allele_id"],
+            delimiter="\t",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerow({"variant_urn": "v1", "dna_clingen_allele_id": "CA1"})
+        writer.writerow({"variant_urn": "v2", "dna_clingen_allele_id": "CA2"})
+        writer.writerow({"variant_urn": "v3", "dna_clingen_allele_id": "CA3"})
+        writer.writerow({"variant_urn": "v4", "dna_clingen_allele_id": "CA4"})
+
+    monkeypatch.setattr(mod, "ensure_local_gnomad_ht", lambda *args, **kwargs: tmp_path / "dummy.ht")
+    monkeypatch.setattr(
+        mod,
+        "load_gnomad_records_for_caids",
+        lambda local_ht, caids, cache_dir: {
+            caid: GnomadRecord(
+                caid=caid,
+                allele_count=1,
+                allele_number=10,
+                allele_frequency=0.1,
+                minor_allele_frequency=0.1,
+                faf95_max=None,
+                faf95_max_ancestry="",
+            )
+            for caid in caids
+        },
+    )
+
+    mod.main([
+        str(in_path),
+        str(out_path),
+        "--gnomad-ht-uri",
+        "dummy-uri",
+        "--skip",
+        "1",
+        "--limit",
+        "2",
+    ])
+
+    with out_path.open("r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh, delimiter="\t"))
+
+    assert [r["variant_urn"] for r in rows] == ["v2", "v3"]
+    assert [r["gnomad.v4_1.minor_allele_frequency"] for r in rows] == ["0.1", "0.1"]

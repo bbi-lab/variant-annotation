@@ -453,3 +453,51 @@ def test_main_invalid_max_workers_exits(tmp_path):
         ])
 
     assert int(excinfo.value.code) == 1
+
+
+def test_main_applies_skip_and_limit(tmp_path, monkeypatch):
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+
+    with in_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["variant_urn", "dna_clingen_allele_id"],
+            delimiter="\t",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerow({"variant_urn": "v1", "dna_clingen_allele_id": "CA1"})
+        writer.writerow({"variant_urn": "v2", "dna_clingen_allele_id": "CA2"})
+        writer.writerow({"variant_urn": "v3", "dna_clingen_allele_id": "CA3"})
+        writer.writerow({"variant_urn": "v4", "dna_clingen_allele_id": "CA4"})
+
+    monkeypatch.setattr(mod, "fetch_clinvar_tsv", lambda y, m, c: Path("unused"))
+    monkeypatch.setattr(mod, "load_clinvar_tsv", lambda p: {})
+    monkeypatch.setattr(
+        mod,
+        "annotate_row",
+        lambda row, clinvar_data, clingen_cache, col_prefix, dna_clingen_allele_id_col="dna_clingen_allele_id": {
+            f"{col_prefix}.clinical_significance": row["variant_urn"],
+            f"{col_prefix}.review_status": "",
+            f"{col_prefix}.stars": "",
+            f"{col_prefix}.last_review_date": "",
+        },
+    )
+
+    mod.main([
+        str(in_path),
+        str(out_path),
+        "--clinvar-version",
+        "202601",
+        "--skip",
+        "1",
+        "--limit",
+        "2",
+    ])
+
+    with out_path.open("r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh, delimiter="\t"))
+
+    assert [r["variant_urn"] for r in rows] == ["v2", "v3"]
+    assert [r["clinvar.202601.clinical_significance"] for r in rows] == ["v2", "v3"]

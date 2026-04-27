@@ -49,6 +49,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import csv
 import gzip
 import io
+from itertools import islice
 import logging
 import os
 import sys
@@ -366,6 +367,18 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=8,
         help="Concurrent worker threads for row annotation.",
     )
+    parser.add_argument(
+        "--skip",
+        type=int,
+        default=0,
+        help="Number of data rows to skip before annotation.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum number of data rows to annotate.",
+    )
     return parser.parse_args(argv)
 
 
@@ -379,6 +392,12 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     if args.max_workers < 1:
         logger.error("--max-workers must be >= 1, got: %d", args.max_workers)
+        sys.exit(1)
+    if args.skip < 0:
+        logger.error("--skip must be >= 0, got: %d", args.skip)
+        sys.exit(1)
+    if args.limit is not None and args.limit < 1:
+        logger.error("--limit must be >= 1 when provided, got: %d", args.limit)
         sys.exit(1)
 
     # Validate and parse the --clinvar-version argument
@@ -444,7 +463,12 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
             max_in_flight = args.max_workers * 4
-            row_iter = enumerate(reader)
+            row_source = islice(
+                reader,
+                args.skip,
+                None if args.limit is None else args.skip + args.limit,
+            )
+            row_iter = enumerate(row_source)
             in_flight: dict = {}
 
             def _submit_until_full() -> None:

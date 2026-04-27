@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from itertools import islice
 import logging
 import os
 import re
@@ -585,6 +586,18 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Re-copy source precomputed VCFs into cache and rebuild .tbi indices",
     )
     p.add_argument(
+        "--skip",
+        type=int,
+        default=0,
+        help="Number of data rows to skip before annotation",
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum number of data rows to annotate",
+    )
+    p.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -639,6 +652,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if args.skip < 0:
+        raise ValueError(f"--skip must be >= 0, got: {args.skip}")
+    if args.limit is not None and args.limit < 1:
+        raise ValueError(f"--limit must be >= 1 when provided, got: {args.limit}")
 
     delim = "\t" if args.delimiter == "\\t" else args.delimiter
     nc_to_chrom = get_nc_to_chrom_map(args.annotation)
@@ -664,8 +681,14 @@ def main(argv: Optional[list[str]] = None) -> None:
         reader = csv.DictReader(in_fh, delimiter=delim)
         if reader.fieldnames is None:
             raise ValueError(f"Input file appears empty: {input_path}")
-        rows = list(reader)
         fieldnames = list(reader.fieldnames)
+        rows = list(
+            islice(
+                reader,
+                args.skip,
+                None if args.limit is None else args.skip + args.limit,
+            )
+        )
 
     unique_hgvs: set[str] = set()
     for row in rows:

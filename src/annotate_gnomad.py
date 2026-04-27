@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from itertools import islice
 import logging
 import os
 import sys
@@ -261,6 +262,8 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Column containing DNA-level ClinGen allele IDs",
     )
     p.add_argument("--delimiter", default="\t", help="Input/output delimiter (default TAB)")
+    p.add_argument("--skip", type=int, default=0, help="Number of data rows to skip before annotation")
+    p.add_argument("--limit", type=int, default=None, help="Maximum number of data rows to annotate")
     p.add_argument("--download-only", action="store_true", help="Only materialize local gnomAD cache; do not annotate")
     p.add_argument("--refresh-cache", action="store_true", help="Rebuild local gnomAD cache even if present")
     p.add_argument(
@@ -278,6 +281,12 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     if not args.gnomad_ht_uri:
         logger.error("--gnomad-ht-uri (or GNOMAD_HT_URI env var) is required")
+        sys.exit(1)
+    if args.skip < 0:
+        logger.error("--skip must be >= 0, got: %d", args.skip)
+        sys.exit(1)
+    if args.limit is not None and args.limit < 1:
+        logger.error("--limit must be >= 1 when provided, got: %d", args.limit)
         sys.exit(1)
 
     cache_dir = Path(args.cache_dir)
@@ -301,8 +310,14 @@ def main(argv: Optional[list[str]] = None) -> None:
         if reader.fieldnames is None:
             logger.error("Input file appears empty: %s", input_path)
             sys.exit(1)
-        rows = list(reader)
         fieldnames = list(reader.fieldnames)
+        rows = list(
+            islice(
+                reader,
+                args.skip,
+                None if args.limit is None else args.skip + args.limit,
+            )
+        )
 
     caids: set[str] = set()
     for row in rows:
