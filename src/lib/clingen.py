@@ -161,6 +161,65 @@ def _extract_clinvar_allele_id(data: dict) -> str:
     return str(allele_id) if allele_id is not None else ""
 
 
+def _extract_clinvar_variation_id(data: dict) -> str:
+    variation_id = (
+        data.get("externalRecords", {})
+        .get("ClinVarVariations", [{}])[0]
+        .get("variationId")
+    )
+    return str(variation_id) if variation_id is not None else ""
+
+
+def resolve_clinvar_ids(
+    clingen_id: str,
+    cache: dict[str, tuple[str, str]],
+    max_retries: int = CLINGEN_MAX_RETRIES,
+    retry_delay: float = CLINGEN_RETRY_DELAY,
+) -> tuple[str, str]:
+    """Return (ClinVar variation ID, ClinVar allele ID) for a ClinGen ID.
+
+    Returns ``("", "")`` when unavailable. Results are cached in *cache* for
+    the duration of the process. ClinGen allele responses are also cached in
+    Redis when enabled.
+    """
+    if clingen_id in cache:
+        return cache[clingen_id]
+
+    key = _allele_cache_key(clingen_id)
+    found, raw = _cache_get(key)
+    if found and raw is not None:
+        if raw == _CACHE_MISS_SENTINEL:
+            cache[clingen_id] = ("", "")
+            return cache[clingen_id]
+        try:
+            cached_data = json.loads(raw)
+            if isinstance(cached_data, dict):
+                resolved = (
+                    _extract_clinvar_variation_id(cached_data),
+                    _extract_clinvar_allele_id(cached_data),
+                )
+                cache[clingen_id] = resolved
+                return resolved
+        except Exception:
+            pass
+
+    data = _fetch_allele_response_by_id(
+        clingen_id,
+        max_retries=max_retries,
+        retry_delay=retry_delay,
+    )
+    if data is None:
+        cache[clingen_id] = ("", "")
+        return cache[clingen_id]
+
+    result = (
+        _extract_clinvar_variation_id(data),
+        _extract_clinvar_allele_id(data),
+    )
+    cache[clingen_id] = result
+    return result
+
+
 def _fetch_allele_response_by_id(
     clingen_id: str,
     *,
@@ -216,33 +275,15 @@ def resolve_clinvar_allele_id(
     if clingen_id in cache:
         return cache[clingen_id]
 
-    key = _allele_cache_key(clingen_id)
-    found, raw = _cache_get(key)
-    if found and raw is not None:
-        if raw == _CACHE_MISS_SENTINEL:
-            cache[clingen_id] = ""
-            return ""
-        try:
-            cached_data = json.loads(raw)
-            if isinstance(cached_data, dict):
-                resolved = _extract_clinvar_allele_id(cached_data)
-                cache[clingen_id] = resolved
-                return resolved
-        except Exception:
-            pass
-
-    data = _fetch_allele_response_by_id(
+    tuple_cache: dict[str, tuple[str, str]] = {}
+    result = resolve_clinvar_ids(
         clingen_id,
+        tuple_cache,
         max_retries=max_retries,
         retry_delay=retry_delay,
     )
-    if data is None:
-        cache[clingen_id] = ""
-        return ""
-
-    result = _extract_clinvar_allele_id(data)
-    cache[clingen_id] = result
-    return result
+    cache[clingen_id] = result[1]
+    return result[1]
 
 
 def query_clingen_by_hgvs(

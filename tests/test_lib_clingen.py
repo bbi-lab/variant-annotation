@@ -132,6 +132,37 @@ def test_resolve_clinvar_uses_cached_allele_response(monkeypatch):
     assert called["n"] == 0
 
 
+def test_resolve_clinvar_ids_returns_variation_and_allele(monkeypatch):
+    dummy = _DummyRedis()
+    _reset_clingen_state(monkeypatch, dummy)
+
+    dummy.set(
+        "clingen:test:allele:CA777",
+        json.dumps(
+            {
+                "externalRecords": {
+                    "ClinVarVariations": [{"variationId": 4321}],
+                    "ClinVarAlleles": [{"alleleId": 9876}],
+                }
+            }
+        ),
+    )
+
+    called = {"n": 0}
+
+    def fake_get(*args, **kwargs):
+        called["n"] += 1
+        return _Resp(500, {})
+
+    monkeypatch.setattr(clingen.requests, "get", fake_get)
+
+    cache = {}
+    out = clingen.resolve_clinvar_ids("CA777", cache)
+
+    assert out == ("4321", "9876")
+    assert called["n"] == 0
+
+
 def test_clear_clingen_cache_deletes_prefixed_keys(monkeypatch):
     dummy = _DummyRedis()
     _reset_clingen_state(monkeypatch, dummy)

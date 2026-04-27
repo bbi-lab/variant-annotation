@@ -12,11 +12,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import src.annotate_clinvar as mod
+from src.lib.clingen import resolve_clinvar_allele_id
 
 from src.annotate_clinvar import (
     annotate_row,
     load_clinvar_tsv,
-    resolve_clinvar_allele_id,
     stars_for_review_status,
 )
 
@@ -299,11 +299,11 @@ SAMPLE_CLINVAR_DATA = {
 
 
 class TestAnnotateRow:
-    def _patch_resolve(self, mapping: dict[str, str]):
-        """Context manager that patches resolve_clinvar_allele_id with *mapping*."""
+    def _patch_resolve(self, mapping: dict[str, tuple[str, str]]):
+        """Context manager that patches resolve_clinvar_ids with *mapping*."""
         return patch(
-            "src.annotate_clinvar.resolve_clinvar_allele_id",
-            side_effect=lambda cid, cache, **kw: mapping.get(cid, ""),
+            "src.annotate_clinvar.resolve_clinvar_ids",
+            side_effect=lambda cid, cache, **kw: mapping.get(cid, ("", "")),
         )
 
     def test_empty_clingen_id(self):
@@ -319,8 +319,10 @@ class TestAnnotateRow:
 
     def test_successful_annotation(self):
         row = {"dna_clingen_allele_id": "CA42"}
-        with self._patch_resolve({"CA42": "12345"}):
+        with self._patch_resolve({"CA42": ("456", "12345")}):
             out = annotate_row(row, SAMPLE_CLINVAR_DATA, {}, "clinvar.202601")
+        assert out["clinvar.202601.variation_id"] == "456"
+        assert out["clinvar.202601.allele_id"] == "12345"
         assert out["clinvar.202601.clinical_significance"] == "Pathogenic"
         assert out["clinvar.202601.review_status"] == "reviewed by expert panel"
         assert out["clinvar.202601.stars"] == "3"
@@ -328,49 +330,61 @@ class TestAnnotateRow:
 
     def test_clingen_id_not_in_clinvar_tsv(self):
         row = {"dna_clingen_allele_id": "CA_MISS"}
-        with self._patch_resolve({"CA_MISS": "00000"}):  # ID not in TSV
+        with self._patch_resolve({"CA_MISS": ("900", "00000")}):  # ID not in TSV
             out = annotate_row(row, SAMPLE_CLINVAR_DATA, {}, "clinvar.202601")
         assert out["clinvar.202601.clinical_significance"] == ""
+        assert out["clinvar.202601.variation_id"] == "900"
+        assert out["clinvar.202601.allele_id"] == "00000"
 
     def test_clingen_id_resolves_to_empty(self):
         row = {"dna_clingen_allele_id": "CA_NONE"}
-        with self._patch_resolve({"CA_NONE": ""}):
+        with self._patch_resolve({"CA_NONE": ("", "")}):
             out = annotate_row(row, SAMPLE_CLINVAR_DATA, {}, "clinvar.202601")
         assert out["clinvar.202601.clinical_significance"] == ""
+        assert out["clinvar.202601.variation_id"] == ""
+        assert out["clinvar.202601.allele_id"] == ""
 
     def test_pipe_delimited_all_candidates_annotated(self):
         row = {"dna_clingen_allele_id": "CA_A|CA_B"}
-        with self._patch_resolve({"CA_A": "12345", "CA_B": "99999"}):
+        with self._patch_resolve({"CA_A": ("401", "12345"), "CA_B": ("402", "99999")}):
             out = annotate_row(row, SAMPLE_CLINVAR_DATA, {}, "clinvar.202601")
+        assert out["clinvar.202601.variation_id"] == "401|402"
+        assert out["clinvar.202601.allele_id"] == "12345|99999"
         assert out["clinvar.202601.clinical_significance"] == "Pathogenic|Benign"
         assert out["clinvar.202601.stars"] == "3|2"
         assert out["clinvar.202601.last_review_date"] == "2023-06-01|2022-01-01"
 
     def test_pipe_delimited_first_candidate_misses_second_hits(self):
         row = {"dna_clingen_allele_id": "CA_NOHIT|CA_B"}
-        with self._patch_resolve({"CA_NOHIT": "", "CA_B": "99999"}):
+        with self._patch_resolve({"CA_NOHIT": ("", ""), "CA_B": ("402", "99999")}):
             out = annotate_row(row, SAMPLE_CLINVAR_DATA, {}, "clinvar.202601")
+        assert out["clinvar.202601.variation_id"] == "|402"
+        assert out["clinvar.202601.allele_id"] == "|99999"
         assert out["clinvar.202601.clinical_significance"] == "|Benign"
         assert out["clinvar.202601.stars"] == "|2"
 
     def test_pipe_delimited_empty_slot_preserved(self):
         # Empty slots in the pipe-delimited ID (like "CA1||CA3") produce empty entries
         row = {"dna_clingen_allele_id": "CA_A||CA_B"}
-        with self._patch_resolve({"CA_A": "12345", "CA_B": "99999"}):
+        with self._patch_resolve({"CA_A": ("401", "12345"), "CA_B": ("402", "99999")}):
             out = annotate_row(row, SAMPLE_CLINVAR_DATA, {}, "clinvar.202601")
+        assert out["clinvar.202601.variation_id"] == "401||402"
+        assert out["clinvar.202601.allele_id"] == "12345||99999"
         assert out["clinvar.202601.clinical_significance"] == "Pathogenic||Benign"
         assert out["clinvar.202601.stars"] == "3||2"
 
     def test_custom_namespace_and_version(self):
         row = {"dna_clingen_allele_id": "CA42"}
-        with self._patch_resolve({"CA42": "12345"}):
+        with self._patch_resolve({"CA42": ("456", "12345")}):
             out = annotate_row(row, SAMPLE_CLINVAR_DATA, {}, "cv.202501")
+        assert "cv.202501.variation_id" in out
+        assert out["cv.202501.variation_id"] == "456"
         assert "cv.202501.clinical_significance" in out
         assert out["cv.202501.clinical_significance"] == "Pathogenic"
 
     def test_custom_dna_column_name(self):
         row = {"my_dna_col": "CA42"}
-        with self._patch_resolve({"CA42": "12345"}):
+        with self._patch_resolve({"CA42": ("456", "12345")}):
             out = annotate_row(
                 row,
                 SAMPLE_CLINVAR_DATA,
@@ -378,6 +392,8 @@ class TestAnnotateRow:
                 "clinvar.202601",
                 dna_clingen_allele_id_col="my_dna_col",
             )
+        assert out["clinvar.202601.variation_id"] == "456"
+        assert out["clinvar.202601.allele_id"] == "12345"
         assert out["clinvar.202601.clinical_significance"] == "Pathogenic"
 
 
@@ -407,6 +423,8 @@ def test_main_preserves_row_order_with_concurrency(tmp_path, monkeypatch):
         else:
             time.sleep(0.02)
         return {
+            f"{col_prefix}.variation_id": urn or "",
+            f"{col_prefix}.allele_id": urn or "",
             f"{col_prefix}.clinical_significance": urn or "",
             f"{col_prefix}.review_status": "",
             f"{col_prefix}.stars": "",
@@ -478,6 +496,8 @@ def test_main_applies_skip_and_limit(tmp_path, monkeypatch):
         mod,
         "annotate_row",
         lambda row, clinvar_data, clingen_cache, col_prefix, dna_clingen_allele_id_col="dna_clingen_allele_id": {
+            f"{col_prefix}.variation_id": row["variant_urn"],
+            f"{col_prefix}.allele_id": row["variant_urn"],
             f"{col_prefix}.clinical_significance": row["variant_urn"],
             f"{col_prefix}.review_status": "",
             f"{col_prefix}.stars": "",
@@ -499,5 +519,18 @@ def test_main_applies_skip_and_limit(tmp_path, monkeypatch):
     with out_path.open("r", encoding="utf-8", newline="") as fh:
         rows = list(csv.DictReader(fh, delimiter="\t"))
 
+    header = out_path.read_text(encoding="utf-8").splitlines()[0].split("\t")
+    id_cols = ["clinvar.202601.variation_id", "clinvar.202601.allele_id"]
+    other_cols = [
+        "clinvar.202601.clinical_significance",
+        "clinvar.202601.review_status",
+        "clinvar.202601.stars",
+        "clinvar.202601.last_review_date",
+    ]
+    assert header.index(id_cols[0]) < header.index(other_cols[0])
+    assert header.index(id_cols[1]) < header.index(other_cols[0])
+
     assert [r["variant_urn"] for r in rows] == ["v2", "v3"]
+    assert [r["clinvar.202601.variation_id"] for r in rows] == ["v2", "v3"]
+    assert [r["clinvar.202601.allele_id"] for r in rows] == ["v2", "v3"]
     assert [r["clinvar.202601.clinical_significance"] for r in rows] == ["v2", "v3"]

@@ -4,9 +4,12 @@ For each row produced by ``map_variants.py`` (or ``reverse_translate_protein_var
 this script:
 
 1. Downloads and caches the ClinVar monthly variant-summary TSV from NCBI.
-2. Resolves each row's ClinGen Allele ID(s) to a ClinVar Allele ID via the ClinGen
-   Allele Registry REST API.
-3. Looks up the ClinVar allele in the cached TSV and writes four annotation columns:
+2. Resolves each row's ClinGen Allele ID(s) to ClinVar Variation and Allele IDs via
+    the ClinGen Allele Registry REST API.
+3. Looks up the ClinVar allele in the cached TSV and writes six annotation columns:
+
+    ``<namespace>.<version>.variation_id``
+    ``<namespace>.<version>.allele_id``
 
    ``<namespace>.<version>.clinical_significance``
    ``<namespace>.<version>.review_status``
@@ -17,7 +20,7 @@ this script:
    (e.g. ``202601``).
 
 Input rows that have no ``dna_clingen_allele_id``, or whose ClinGen ID does not map to a
-ClinVar allele, receive empty strings for all four annotation columns.
+ClinVar allele, receive empty strings for all six annotation columns.
 
 When ``dna_clingen_allele_id`` is pipe-delimited (produced by
 ``add_dna_clingen_allele_ids.py`` for protein reverse translations), each candidate
@@ -58,7 +61,7 @@ from typing import Optional
 
 import requests
 
-from src.lib.clingen import resolve_clinvar_allele_id
+from src.lib.clingen import resolve_clinvar_ids
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -219,7 +222,7 @@ def stars_for_review_status(review_status: str) -> str:
 def annotate_row(
     row: dict[str, str],
     clinvar_data: dict[str, dict[str, str]],
-    clingen_cache: dict[str, str],
+    clingen_cache: dict[str, tuple[str, str]],
     col_prefix: str,
     dna_clingen_allele_id_col: str = "dna_clingen_allele_id",
 ) -> dict[str, str]:
@@ -229,6 +232,8 @@ def annotate_row(
     ``"clinvar.202601"``.
     """
     empty = {
+        f"{col_prefix}.variation_id": "",
+        f"{col_prefix}.allele_id": "",
         f"{col_prefix}.clinical_significance": "",
         f"{col_prefix}.review_status": "",
         f"{col_prefix}.stars": "",
@@ -244,16 +249,20 @@ def annotate_row(
     # with one entry per candidate (empty string when no ClinVar record is found).
     all_candidates = [c.strip() for c in raw_clingen.split("|")]
 
-    sigs, reviews, stars_list, last_evals = [], [], [], []
+    variation_ids, allele_ids, sigs, reviews, stars_list, last_evals = [], [], [], [], [], []
     for clingen_id in all_candidates:
         if not clingen_id:
+            variation_ids.append("")
+            allele_ids.append("")
             sigs.append("")
             reviews.append("")
             stars_list.append("")
             last_evals.append("")
             continue
-        clinvar_id = resolve_clinvar_allele_id(clingen_id, clingen_cache)
-        record = clinvar_data.get(clinvar_id) if clinvar_id else None
+        variation_id, allele_id = resolve_clinvar_ids(clingen_id, clingen_cache)
+        variation_ids.append(variation_id)
+        allele_ids.append(allele_id)
+        record = clinvar_data.get(allele_id) if allele_id else None
         if record is None:
             sigs.append("")
             reviews.append("")
@@ -272,6 +281,8 @@ def annotate_row(
     # so the output format matches the input cardinality.
     join = "|".join
     return {
+        f"{col_prefix}.variation_id": join(variation_ids),
+        f"{col_prefix}.allele_id": join(allele_ids),
         f"{col_prefix}.clinical_significance": join(sigs),
         f"{col_prefix}.review_status": join(reviews),
         f"{col_prefix}.stars": join(stars_list),
@@ -284,7 +295,7 @@ def _annotate_row_task(
     row: dict[str, str],
     *,
     clinvar_data: dict[str, dict[str, str]],
-    clingen_cache: dict[str, str],
+    clingen_cache: dict[str, tuple[str, str]],
     col_prefix: str,
     dna_clingen_allele_id_col: str,
 ) -> tuple[int, dict[str, str], dict[str, str]]:
@@ -421,8 +432,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     tsv_path = fetch_clinvar_tsv(year, month, cache_dir)
     clinvar_data = load_clinvar_tsv(tsv_path)
 
-    # In-process ClinGen → ClinVar ID cache
-    clingen_cache: dict[str, str] = {}
+    # In-process ClinGen -> (ClinVar Variation ID, ClinVar Allele ID) cache
+    clingen_cache: dict[str, tuple[str, str]] = {}
 
     delim = args.delimiter
     if delim == "\\t":  # handle shell quoting edge case
@@ -432,6 +443,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     out_path = Path(args.output_file)
 
     annotation_cols = [
+        f"{col_prefix}.variation_id",
+        f"{col_prefix}.allele_id",
         f"{col_prefix}.clinical_significance",
         f"{col_prefix}.review_status",
         f"{col_prefix}.stars",
