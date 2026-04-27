@@ -113,6 +113,16 @@ def _cache_path(cache_dir: Path, year: int, month: int) -> Path:
     return cache_dir / f"variant_summary_{year}-{month:02d}.txt.gz"
 
 
+def _normalise_clinvar_field(value: str) -> str:
+    """Return an output-safe ClinVar field value.
+
+    ClinVar uses "-" as a placeholder for missing values in some fields.
+    Emit these as empty strings in downstream annotation columns.
+    """
+    normalised = (value or "").strip()
+    return "" if normalised == "-" else normalised
+
+
 def fetch_clinvar_tsv(year: int, month: int, cache_dir: Path) -> Path:
     """Download (or return cached) the ClinVar variant-summary TSV for *year*-*month*.
 
@@ -187,9 +197,9 @@ def load_clinvar_tsv(path: Path) -> dict[str, dict[str, str]]:
 
             # Only retain germline submissions (skip somatic-only)
             germline_sig = row.get("ClinSigSimple", "")
-            sig = row.get(COL_CLINICAL_SIGNIFICANCE, "").strip()
-            review = row.get(COL_REVIEW_STATUS, "").strip()
-            last_eval = row.get(COL_LAST_EVALUATED, "").strip()
+            sig = _normalise_clinvar_field(row.get(COL_CLINICAL_SIGNIFICANCE, ""))
+            review = _normalise_clinvar_field(row.get(COL_REVIEW_STATUS, ""))
+            last_eval = _normalise_clinvar_field(row.get(COL_LAST_EVALUATED, ""))
 
             data[allele_id] = {
                 COL_CLINICAL_SIGNIFICANCE: sig,
@@ -269,9 +279,9 @@ def annotate_row(
             stars_list.append("")
             last_evals.append("")
         else:
-            sig = record.get(COL_CLINICAL_SIGNIFICANCE, "")
-            review = record.get(COL_REVIEW_STATUS, "")
-            last_eval = record.get(COL_LAST_EVALUATED, "")
+            sig = _normalise_clinvar_field(record.get(COL_CLINICAL_SIGNIFICANCE, ""))
+            review = _normalise_clinvar_field(record.get(COL_REVIEW_STATUS, ""))
+            last_eval = _normalise_clinvar_field(record.get(COL_LAST_EVALUATED, ""))
             sigs.append(sig)
             reviews.append(review)
             stars_list.append(stars_for_review_status(review))

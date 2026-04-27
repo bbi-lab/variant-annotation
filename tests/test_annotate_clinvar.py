@@ -186,6 +186,27 @@ class TestLoadClinvarTsv:
         data = load_clinvar_tsv(path)
         assert len(data) == 5
 
+    def test_normalises_dash_placeholders_to_empty(self, tmp_path):
+        gz_bytes = _make_gz_tsv(
+            [
+                {
+                    "#AlleleID": "333",
+                    "ClinicalSignificance": "-",
+                    "ReviewStatus": "-",
+                    "LastEvaluated": "-",
+                    "Assembly": "GRCh38",
+                    "Origin": "germline",
+                }
+            ],
+            FIELDNAMES,
+        )
+        path = tmp_path / "clinvar.txt.gz"
+        path.write_bytes(gz_bytes)
+        data = load_clinvar_tsv(path)
+        assert data["333"]["ClinicalSignificance"] == ""
+        assert data["333"]["ReviewStatus"] == ""
+        assert data["333"]["LastEvaluated"] == ""
+
 
 # ---------------------------------------------------------------------------
 # resolve_clinvar_allele_id
