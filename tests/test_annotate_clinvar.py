@@ -336,19 +336,28 @@ class TestAnnotateRow:
             out = annotate_row(row, SAMPLE_CLINVAR_DATA, {}, "clinvar.202601")
         assert out["clinvar.202601.clinical_significance"] == ""
 
-    def test_pipe_delimited_first_candidate_hits(self):
+    def test_pipe_delimited_all_candidates_annotated(self):
         row = {"dna_clingen_allele_id": "CA_A|CA_B"}
         with self._patch_resolve({"CA_A": "12345", "CA_B": "99999"}):
             out = annotate_row(row, SAMPLE_CLINVAR_DATA, {}, "clinvar.202601")
-        # CA_A resolves first and is present in TSV
-        assert out["clinvar.202601.clinical_significance"] == "Pathogenic"
+        assert out["clinvar.202601.clinical_significance"] == "Pathogenic|Benign"
+        assert out["clinvar.202601.stars"] == "3|2"
+        assert out["clinvar.202601.last_review_date"] == "2023-06-01|2022-01-01"
 
     def test_pipe_delimited_first_candidate_misses_second_hits(self):
         row = {"dna_clingen_allele_id": "CA_NOHIT|CA_B"}
         with self._patch_resolve({"CA_NOHIT": "", "CA_B": "99999"}):
             out = annotate_row(row, SAMPLE_CLINVAR_DATA, {}, "clinvar.202601")
-        assert out["clinvar.202601.clinical_significance"] == "Benign"
-        assert out["clinvar.202601.stars"] == "2"
+        assert out["clinvar.202601.clinical_significance"] == "|Benign"
+        assert out["clinvar.202601.stars"] == "|2"
+
+    def test_pipe_delimited_empty_slot_preserved(self):
+        # Empty slots in the pipe-delimited ID (like "CA1||CA3") produce empty entries
+        row = {"dna_clingen_allele_id": "CA_A||CA_B"}
+        with self._patch_resolve({"CA_A": "12345", "CA_B": "99999"}):
+            out = annotate_row(row, SAMPLE_CLINVAR_DATA, {}, "clinvar.202601")
+        assert out["clinvar.202601.clinical_significance"] == "Pathogenic||Benign"
+        assert out["clinvar.202601.stars"] == "3||2"
 
     def test_custom_namespace_and_version(self):
         row = {"dna_clingen_allele_id": "CA42"}

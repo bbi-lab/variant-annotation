@@ -21,7 +21,8 @@ ClinVar allele, receive empty strings for all four annotation columns.
 
 When ``dna_clingen_allele_id`` is pipe-delimited (produced by
 ``add_dna_clingen_allele_ids.py`` for protein reverse translations), each candidate
-is tried in order and the first successful ClinVar lookup is used.
+is annotated independently and the output columns are likewise pipe-delimited,
+preserving candidate cardinality.
 
 Provenance
 ----------
@@ -312,7 +313,7 @@ def annotate_row(
     *col_prefix* should already include the namespace and version, e.g.
     ``"clinvar.202601"``.
     """
-    out = {
+    empty = {
         f"{col_prefix}.clinical_significance": "",
         f"{col_prefix}.review_status": "",
         f"{col_prefix}.stars": "",
@@ -321,28 +322,46 @@ def annotate_row(
 
     raw_clingen = row.get(dna_clingen_allele_id_col, "").strip()
     if not raw_clingen:
-        return out
+        return empty
 
-    # Support pipe-delimited candidate IDs (from reverse_translate_protein_variants)
-    candidates = [c.strip() for c in raw_clingen.split("|") if c.strip()]
+    # Support pipe-delimited candidate IDs (from reverse_translate_protein_variants).
+    # Each candidate is annotated independently; output columns are pipe-delimited
+    # with one entry per candidate (empty string when no ClinVar record is found).
+    all_candidates = [c.strip() for c in raw_clingen.split("|")]
 
-    for clingen_id in candidates:
+    sigs, reviews, stars_list, last_evals = [], [], [], []
+    for clingen_id in all_candidates:
+        if not clingen_id:
+            sigs.append("")
+            reviews.append("")
+            stars_list.append("")
+            last_evals.append("")
+            continue
         clinvar_id = resolve_clinvar_allele_id(clingen_id, clingen_cache)
-        if not clinvar_id:
-            continue
-        record = clinvar_data.get(clinvar_id)
+        record = clinvar_data.get(clinvar_id) if clinvar_id else None
         if record is None:
-            continue
-        sig = record.get(COL_CLINICAL_SIGNIFICANCE, "")
-        review = record.get(COL_REVIEW_STATUS, "")
-        last_eval = record.get(COL_LAST_EVALUATED, "")
-        out[f"{col_prefix}.clinical_significance"] = sig
-        out[f"{col_prefix}.review_status"] = review
-        out[f"{col_prefix}.stars"] = stars_for_review_status(review)
-        out[f"{col_prefix}.last_review_date"] = last_eval
-        return out
+            sigs.append("")
+            reviews.append("")
+            stars_list.append("")
+            last_evals.append("")
+        else:
+            sig = record.get(COL_CLINICAL_SIGNIFICANCE, "")
+            review = record.get(COL_REVIEW_STATUS, "")
+            last_eval = record.get(COL_LAST_EVALUATED, "")
+            sigs.append(sig)
+            reviews.append(review)
+            stars_list.append(stars_for_review_status(review))
+            last_evals.append(last_eval)
 
-    return out
+    # Collapse to a single value when there is only one candidate (non-protein rows)
+    # so the output format matches the input cardinality.
+    join = "|".join
+    return {
+        f"{col_prefix}.clinical_significance": join(sigs),
+        f"{col_prefix}.review_status": join(reviews),
+        f"{col_prefix}.stars": join(stars_list),
+        f"{col_prefix}.last_review_date": join(last_evals),
+    }
 
 
 # ---------------------------------------------------------------------------
