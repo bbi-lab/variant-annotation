@@ -8,8 +8,13 @@ Given mapped HGVS columns (genomic/transcript/protein), this script appends:
 - <col>_alt
 
 For protein HGVS, ref/alt use one-character amino acid codes (e.g., A, R, C, etc.;
-* for stop codon; - for deletion). For synonymous variants (ref == alt), the
+* for stop codon; empty string for deletion). For synonymous variants (ref == alt), the
 amino acid is repeated.
+
+When an HGVS column is pipe-delimited (multiple DNA candidates produced by
+``reverse_translate_protein_variants`` + ``add_dna_clingen_allele_ids``), each
+component is parsed independently and the output columns are also pipe-delimited,
+preserving candidate cardinality so downstream steps can correlate columns.
 
 It also adds transcript-derived boolean columns:
 - touches_intronic_region: transcript HGVS contains intronic offset coordinates
@@ -21,6 +26,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import csv
+from itertools import islice
 import logging
 import os
 import re
@@ -40,6 +46,7 @@ _AA_3TO1 = {
     "Leu": "L", "Lys": "K", "Met": "M", "Phe": "F", "Pro": "P",
     "Ser": "S", "Thr": "T", "Trp": "W", "Tyr": "Y", "Val": "V",
     "Sec": "U", "Pyl": "O",  # Selenocysteine and Pyrrolysine
+    "Ter": "*",  # Termination / stop codon
 }
 
 # Map accession prefixes to chromosomes
@@ -181,7 +188,7 @@ def _aa_3to1(aa_3letter: str) -> str:
     key = aa_3letter[0].upper() + aa_3letter[1:].lower()
     if key in _AA_3TO1:
         return _AA_3TO1[key]
-    
+
     # Unknown amino acid, return as-is but uppercase
     return aa_3letter.upper()
 
@@ -273,7 +280,7 @@ def _parse_protein_hgvs(hgvs_body: str) -> tuple[Optional[str], Optional[str], O
             alt_1letter = _normalize_protein_allele(alt_part, False, None) or alt_part
             return start, stop, ref_range, alt_1letter
         if edit.startswith("del"):
-            return start, stop, ref_range, "-"
+            return start, stop, ref_range, ""
         if edit.startswith("dup"):
             return start, stop, ref_range, ref_range + ref_range
         if edit == "=":
@@ -299,7 +306,7 @@ def _parse_protein_hgvs(hgvs_body: str) -> tuple[Optional[str], Optional[str], O
         alt_1letter = _normalize_protein_allele(alt_part, False, ref_1letter) or alt_part
         return start, stop, ref_1letter, alt_1letter
     if edit.startswith("del"):
-        return start, stop, ref_1letter, "-"
+        return start, stop, ref_1letter, ""
     if edit.startswith("dup"):
         return start, stop, ref_1letter, ref_1letter + ref_1letter
     if edit.startswith("ins"):
@@ -413,24 +420,50 @@ def _annotate_row(
     spans_intron_col: str,
     resolve_missing_ref_alleles: bool,
 ) -> tuple[int, dict[str, str]]:
-    """Annotate one row with parsed position/allele/chromosome fields."""
+    """Annotate one row with parsed position/allele/chromosome fields.
+
+    When an HGVS column is pipe-delimited (multiple DNA candidates for a protein
+    reverse translation), each segment is parsed independently and the output
+    columns are likewise pipe-delimited, preserving candidate cardinality.
+    """
     for base_col in (mapped_hgvs_g_col, mapped_hgvs_c_col, mapped_hgvs_p_col):
-        start, stop, ref, alt, _, _, chromosome = _parse_hgvs(
-            row.get(base_col),
+        raw_value = row.get(base_col) or ""
+        segments = raw_value.split("|") if raw_value else [""]
+
+        chromosomes, starts, stops, refs, alts = [], [], [], [], []
+        for seg in segments:
+            start, stop, ref, alt, _, _, chromosome = _parse_hgvs(
+                seg or None,
+                resolve_missing_ref_alleles=resolve_missing_ref_alleles,
+            )
+            chromosomes.append("" if chromosome is None else chromosome)
+            starts.append("" if start is None else start)
+            stops.append("" if stop is None else stop)
+            refs.append("" if ref is None else ref)
+            alts.append("" if alt is None else alt)
+
+        row[f"{base_col}_chromosome"] = "|".join(chromosomes)
+        row[f"{base_col}_start"] = "|".join(starts)
+        row[f"{base_col}_stop"] = "|".join(stops)
+        row[f"{base_col}_ref"] = "|".join(refs)
+        row[f"{base_col}_alt"] = "|".join(alts)
+
+    # touches_intronic_region / spans_intron: true if any c. candidate fires
+    c_raw = row.get(mapped_hgvs_c_col) or ""
+    c_segments = c_raw.split("|") if c_raw else [""]
+    touches_any = False
+    spans_any = False
+    for seg in c_segments:
+        _, _, _, _, touches, spans, _ = _parse_hgvs(
+            seg or None,
             resolve_missing_ref_alleles=resolve_missing_ref_alleles,
         )
-        row[f"{base_col}_chromosome"] = "" if chromosome is None else chromosome
-        row[f"{base_col}_start"] = "" if start is None else start
-        row[f"{base_col}_stop"] = "" if stop is None else stop
-        row[f"{base_col}_ref"] = "" if ref is None else ref
-        row[f"{base_col}_alt"] = "" if alt is None else alt
-
-    _, _, _, _, touches_intronic_region, spans_intron, _ = _parse_hgvs(
-        row.get(mapped_hgvs_c_col),
-        resolve_missing_ref_alleles=resolve_missing_ref_alleles,
-    )
-    row[touches_intronic_region_col] = "true" if touches_intronic_region else "false"
-    row[spans_intron_col] = "true" if spans_intron else "false"
+        if touches:
+            touches_any = True
+        if spans:
+            spans_any = True
+    row[touches_intronic_region_col] = "true" if touches_any else "false"
+    row[spans_intron_col] = "true" if spans_any else "false"
     return row_idx, row
 
 
@@ -445,9 +478,15 @@ def annotate_variants(
     spans_intron_col: str = "spans_intron",
     resolve_missing_ref_alleles: bool = False,
     max_workers: int = 8,
+    skip: int = 0,
+    limit: Optional[int] = None,
 ) -> None:
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")
+    if skip < 0:
+        raise ValueError("skip must be >= 0")
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be >= 0")
 
     in_sep = _detect_separator(input_file)
     out_sep = _detect_separator(output_file)
@@ -485,7 +524,8 @@ def annotate_variants(
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             max_in_flight = max_workers * 4
-            row_iter = enumerate(reader)
+            sliced_reader = islice(reader, skip, None if limit is None else skip + limit)
+            row_iter = enumerate(sliced_reader)
             in_flight: dict = {}
 
             def _submit_until_full() -> None:
@@ -567,6 +607,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=8,
         help="Concurrent worker threads for row annotation.",
     )
+    p.add_argument(
+        "--skip",
+        type=int,
+        default=0,
+        help="Number of data rows to skip from the start of the input.",
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum number of data rows to process after applying --skip.",
+    )
     return p
 
 
@@ -589,6 +641,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         spans_intron_col=args.spans_intron_col,
         resolve_missing_ref_alleles=args.resolve_missing_ref_alleles,
         max_workers=args.max_workers,
+        skip=args.skip,
+        limit=args.limit,
     )
 
 
