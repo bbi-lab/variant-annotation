@@ -84,15 +84,14 @@ from typing import Optional
 import click
 from dotenv import load_dotenv
 import requests
+from src.lib.clingen import query_clingen_by_hgvs
 
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-CLINGEN_API_URL = "https://reg.genome.network/allele"
 ENSEMBL_REST_URL = "https://rest.ensembl.org"
-CLINGEN_RETRY_DELAY = 2.0  # seconds between retries
 PROGRESS_EVERY_ROWS = 1000
 
 
@@ -362,37 +361,7 @@ def _query_clingen_by_hgvs(hgvs_string: str, max_retries: int = 3) -> Optional[d
 
     Returns the full JSON response dict, or None on failure.
     """
-    for attempt in range(max_retries):
-        try:
-            resp = requests.get(
-                CLINGEN_API_URL,
-                params={"hgvs": hgvs_string},
-                timeout=30,
-                headers={"Accept": "application/json"},
-            )
-            if resp.status_code == 200:
-                return resp.json()
-            if resp.status_code == 404:
-                logger.warning("ClinGen 404 for %s", hgvs_string)
-                return None
-            if resp.status_code == 429:
-                wait = CLINGEN_RETRY_DELAY * (2**attempt)
-                logger.warning("ClinGen rate-limited for %s; waiting %.1f s.", hgvs_string, wait)
-                time.sleep(wait)
-                continue
-            logger.warning("ClinGen returned HTTP %d for %s", resp.status_code, hgvs_string)
-            return None
-        except requests.exceptions.RequestException as exc:
-            logger.warning(
-                "ClinGen request failed for %s (attempt %d/%d): %s",
-                hgvs_string,
-                attempt + 1,
-                max_retries,
-                exc,
-            )
-            if attempt < max_retries - 1:
-                time.sleep(CLINGEN_RETRY_DELAY)
-    return None
+    return query_clingen_by_hgvs(hgvs_string, max_retries=max_retries, log_404=True)
 
 
 async def _query_clingen_by_hgvs_batch(

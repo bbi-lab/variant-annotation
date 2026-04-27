@@ -51,19 +51,16 @@ import io
 import logging
 import os
 import sys
-import time
-import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Optional
 
 import requests
 
+from src.lib.clingen import resolve_clinvar_allele_id
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-CLINGEN_API_URL = "https://reg.genome.network/allele"
 
 CLINVAR_TSV_BASE_URL = (
     "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/tab_delimited/archive"
@@ -89,10 +86,6 @@ REVIEW_STATUS_STARS: dict[str, int] = {
     "no classification for the single variant": 0,
     "no classification provided": 0,
 }
-
-# Retry settings for the ClinGen API
-CLINGEN_MAX_RETRIES = 3
-CLINGEN_RETRY_DELAY = 2.0  # seconds between retries
 
 logger = logging.getLogger(__name__)
 
@@ -214,86 +207,6 @@ def stars_for_review_status(review_status: str) -> str:
                 stars = val
                 break
     return str(stars) if stars is not None else ""
-
-
-# ---------------------------------------------------------------------------
-# ClinGen → ClinVar allele ID resolution
-# ---------------------------------------------------------------------------
-
-
-def resolve_clinvar_allele_id(
-    clingen_id: str,
-    cache: dict[str, str],
-    max_retries: int = CLINGEN_MAX_RETRIES,
-    retry_delay: float = CLINGEN_RETRY_DELAY,
-) -> str:
-    """Return the ClinVar allele ID for *clingen_id*, or empty string if not found.
-
-    Results are stored in *cache* (in-memory throughout the run) to avoid redundant
-    API calls when the same ClinGen ID appears multiple times.
-
-    Args:
-        clingen_id: A ClinGen Allele Registry ID, e.g. ``CA123456``.
-        cache: Mutable dict used as an in-process cache (modified in-place).
-        max_retries: Number of retry attempts on transient HTTP errors.
-        retry_delay: Seconds to wait between retries.
-
-    Returns:
-        ClinVar allele ID string (integer as string, e.g. ``"12345"``), or ``""`` if
-        no association exists or the allele is not registered in ClinGen.
-    """
-    if clingen_id in cache:
-        return cache[clingen_id]
-
-    url = f"{CLINGEN_API_URL}/{urllib.parse.quote(clingen_id, safe='')}"
-    last_exc: Optional[Exception] = None
-
-    for attempt in range(max_retries):
-        try:
-            response = requests.get(url, timeout=30)
-            if response.status_code == 404:
-                cache[clingen_id] = ""
-                return ""
-            response.raise_for_status()
-            api_data = response.json()
-            allele_id = (
-                api_data.get("externalRecords", {})
-                .get("ClinVarAlleles", [{}])[0]
-                .get("alleleId")
-            )
-            result = str(allele_id) if allele_id is not None else ""
-            cache[clingen_id] = result
-            return result
-        except (requests.HTTPError, requests.ConnectionError, requests.Timeout) as exc:
-            last_exc = exc
-            if isinstance(exc, requests.HTTPError) and exc.response is not None:
-                status = exc.response.status_code
-                # Don't retry client errors other than rate-limiting
-                if status != 429 and 400 <= status < 500:
-                    logger.warning(
-                        "ClinGen API returned %s for %s; skipping", status, clingen_id
-                    )
-                    cache[clingen_id] = ""
-                    return ""
-            if attempt < max_retries - 1:
-                logger.warning(
-                    "ClinGen API error for %s (attempt %d/%d): %s; retrying in %.1fs",
-                    clingen_id,
-                    attempt + 1,
-                    max_retries,
-                    exc,
-                    retry_delay,
-                )
-                time.sleep(retry_delay)
-
-    logger.error(
-        "ClinGen API failed for %s after %d attempts: %s",
-        clingen_id,
-        max_retries,
-        last_exc,
-    )
-    cache[clingen_id] = ""
-    return ""
 
 
 # ---------------------------------------------------------------------------

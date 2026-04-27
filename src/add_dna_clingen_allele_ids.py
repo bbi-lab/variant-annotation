@@ -25,17 +25,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import logging
 from threading import Lock
-import time
 from pathlib import Path
 from typing import Optional
 
-import requests
+from src.lib.clingen import query_clingen_by_hgvs
 
 logger = logging.getLogger(__name__)
-
-CLINGEN_API_URL = "https://reg.genome.network/allele"
-CLINGEN_RETRY_DELAY = 2.0
-
 
 def _detect_separator(file_path: str) -> str:
     return "\t" if Path(file_path).suffix.lower() in (".tsv", ".txt") else ","
@@ -43,40 +38,7 @@ def _detect_separator(file_path: str) -> str:
 
 def _query_clingen_by_hgvs(hgvs_string: str, max_retries: int = 3) -> Optional[dict]:
     """Query ClinGen Allele Registry by HGVS string."""
-    for attempt in range(max_retries):
-        try:
-            resp = requests.get(
-                CLINGEN_API_URL,
-                params={"hgvs": hgvs_string},
-                timeout=30,
-                headers={"Accept": "application/json"},
-            )
-            if resp.status_code == 200:
-                return resp.json()
-            if resp.status_code == 404:
-                return None
-            if resp.status_code == 429:
-                wait = CLINGEN_RETRY_DELAY * (2**attempt)
-                logger.warning(
-                    "ClinGen rate-limited for %s; waiting %.1f s", hgvs_string, wait
-                )
-                time.sleep(wait)
-                continue
-            logger.warning(
-                "ClinGen returned HTTP %d for %s", resp.status_code, hgvs_string
-            )
-            return None
-        except requests.exceptions.RequestException as exc:
-            logger.warning(
-                "ClinGen request failed for %s (attempt %d/%d): %s",
-                hgvs_string,
-                attempt + 1,
-                max_retries,
-                exc,
-            )
-            if attempt < max_retries - 1:
-                time.sleep(CLINGEN_RETRY_DELAY)
-    return None
+    return query_clingen_by_hgvs(hgvs_string, max_retries=max_retries)
 
 
 def _extract_clingen_allele_id(data: dict) -> Optional[str]:

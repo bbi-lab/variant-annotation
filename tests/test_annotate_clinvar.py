@@ -212,7 +212,7 @@ class TestResolveClinvarAlleleId:
         mock_resp = MagicMock()
         mock_resp.status_code = 404
 
-        with patch("src.annotate_clinvar.requests.get", return_value=mock_resp):
+        with patch("src.lib.clingen.requests.get", return_value=mock_resp):
             result = resolve_clinvar_allele_id("CA_UNKNOWN", cache)
 
         assert result == ""
@@ -228,7 +228,7 @@ class TestResolveClinvarAlleleId:
             }
         }
 
-        with patch("src.annotate_clinvar.requests.get", return_value=mock_resp):
+        with patch("src.lib.clingen.requests.get", return_value=mock_resp):
             result = resolve_clinvar_allele_id("CA42", cache)
 
         assert result == "42"
@@ -240,7 +240,7 @@ class TestResolveClinvarAlleleId:
         mock_resp.status_code = 200
         mock_resp.json.return_value = {"externalRecords": {}}
 
-        with patch("src.annotate_clinvar.requests.get", return_value=mock_resp):
+        with patch("src.lib.clingen.requests.get", return_value=mock_resp):
             result = resolve_clinvar_allele_id("CA_NOCLINVAR", cache)
 
         assert result == ""
@@ -254,7 +254,7 @@ class TestResolveClinvarAlleleId:
         http_error = req_lib.HTTPError(response=mock_resp)
         mock_resp.raise_for_status.side_effect = http_error
 
-        with patch("src.annotate_clinvar.requests.get") as mock_get:
+        with patch("src.lib.clingen.requests.get") as mock_get:
             mock_get.return_value = mock_resp
             # Patch raise_for_status so HTTPError is raised
             mock_resp.raise_for_status.side_effect = http_error
