@@ -2,7 +2,7 @@ import csv
 
 import pytest
 
-from src.merge_rows import merge_rows
+from src.replace_rows import replace_rows
 
 
 def _write_tsv(path, rows, fieldnames):
@@ -40,7 +40,7 @@ def test_merge_rows_replaces_and_appends(tmp_path):
         fieldnames,
     )
 
-    n = merge_rows([str(f1), str(f2)], str(out), ["id", "gene"])
+    n = replace_rows([str(f1), str(f2)], str(out), ["id", "gene"])
 
     assert n == 3
     rows = _read_tsv(out)
@@ -62,7 +62,7 @@ def test_merge_rows_last_file_wins_across_multiple_files(tmp_path):
     _write_tsv(f2, [{"id": "1", "value": "v2"}], fieldnames)
     _write_tsv(f3, [{"id": "1", "value": "v3"}], fieldnames)
 
-    n = merge_rows([str(f1), str(f2), str(f3)], str(out), ["id"])
+    n = replace_rows([str(f1), str(f2), str(f3)], str(out), ["id"])
 
     assert n == 1
     rows = _read_tsv(out)
@@ -75,7 +75,7 @@ def test_merge_rows_missing_key_column_raises(tmp_path):
     _write_tsv(f1, [{"id": "1", "value": "x"}], ["id", "value"])
 
     with pytest.raises(ValueError, match="missing key columns"):
-        merge_rows([str(f1)], str(out), ["id", "gene"])
+        replace_rows([str(f1)], str(out), ["id", "gene"])
 
 
 def test_merge_rows_mismatched_columns_raises(tmp_path):
@@ -87,7 +87,7 @@ def test_merge_rows_mismatched_columns_raises(tmp_path):
     _write_tsv(f2, [{"id": "1", "other": "y"}], ["id", "other"])
 
     with pytest.raises(ValueError, match="columns do not match"):
-        merge_rows([str(f1), str(f2)], str(out), ["id"])
+        replace_rows([str(f1), str(f2)], str(out), ["id"])
 
 
 def test_merge_rows_duplicate_keys_within_one_file_last_row_wins(tmp_path):
@@ -104,7 +104,7 @@ def test_merge_rows_duplicate_keys_within_one_file_last_row_wins(tmp_path):
         fieldnames,
     )
 
-    n = merge_rows([str(f1)], str(out), ["id"])
+    n = replace_rows([str(f1)], str(out), ["id"])
 
     assert n == 1
     rows = _read_tsv(out)

@@ -1,9 +1,10 @@
-"""Filter rows by requiring non-empty values in selected columns.
+"""Filter rows by value presence/absence in selected columns.
 
 Usage::
 
     python -m src.filter_rows in.tsv out.tsv --value-col col_a
     python -m src.filter_rows in.tsv out.tsv --value-col col_a,col_b --match all
+    python -m src.filter_rows in.tsv out.tsv --value-col mapped_hgvs_p --value-state blank
 """
 
 import csv
@@ -42,15 +43,18 @@ def filter_rows(
     output_file: str,
     value_columns: list[str],
     match: str = "any",
+    value_state: str = "non-empty",
 ) -> int:
-    """Filter rows by non-empty values in one or more columns.
+    """Filter rows by value presence/absence in one or more columns.
 
     Args:
         input_file: Input CSV/TSV file.
         output_file: Output CSV/TSV file.
-        value_columns: Columns to test for non-empty values.
+        value_columns: Columns to test.
         match: "any" keeps rows where at least one column has a value,
             "all" keeps rows where every specified column has a value.
+        value_state: "non-empty" keeps rows where selected columns have values;
+            "blank" keeps rows where selected columns are blank.
 
     Returns:
         Number of rows written.
@@ -62,6 +66,8 @@ def filter_rows(
         raise ValueError("At least one --value-col is required.")
     if match not in {"any", "all"}:
         raise ValueError("match must be 'any' or 'all'.")
+    if value_state not in {"non-empty", "blank"}:
+        raise ValueError("value_state must be 'non-empty' or 'blank'.")
 
     in_sep = _detect_separator(input_file)
     out_sep = _detect_separator(output_file)
@@ -88,6 +94,8 @@ def filter_rows(
             n_rows = 0
             for row in reader:
                 checks = [_has_value(row.get(col)) for col in value_columns]
+                if value_state == "blank":
+                    checks = [not c for c in checks]
                 keep = any(checks) if match == "any" else all(checks)
                 if keep:
                     writer.writerow(row)
@@ -118,16 +126,31 @@ def filter_rows(
     show_default=True,
     help="When multiple --value-col columns are supplied, keep rows matching any or all.",
 )
-def main(input_file: str, output_file: str, value_cols_raw: tuple[str, ...], match_mode: str) -> None:
+@click.option(
+    "--value-state",
+    type=click.Choice(["non-empty", "blank"], case_sensitive=False),
+    default="non-empty",
+    show_default=True,
+    help="Whether selected columns should be non-empty or blank.",
+)
+def main(
+    input_file: str,
+    output_file: str,
+    value_cols_raw: tuple[str, ...],
+    match_mode: str,
+    value_state: str,
+) -> None:
     """Filter rows in INPUT_FILE and write OUTPUT_FILE."""
     value_columns = _split_csv_args(value_cols_raw)
     match_mode = match_mode.lower()
+    value_state = value_state.lower()
     try:
         n_rows = filter_rows(
             input_file=input_file,
             output_file=output_file,
             value_columns=value_columns,
             match=match_mode,
+            value_state=value_state,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc

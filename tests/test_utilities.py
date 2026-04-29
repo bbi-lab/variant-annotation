@@ -37,7 +37,7 @@ def test_utilities_filter_columns_command(tmp_path):
     assert rows == [{"a": "1", "c": "3"}]
 
 
-def test_utilities_merge_rows_command(tmp_path):
+def test_utilities_replace_rows_command(tmp_path):
     f1 = tmp_path / "f1.tsv"
     f2 = tmp_path / "f2.tsv"
     out_path = tmp_path / "out.tsv"
@@ -48,12 +48,61 @@ def test_utilities_merge_rows_command(tmp_path):
     runner = CliRunner()
     result = runner.invoke(
         main,
-        ["merge-rows", str(out_path), str(f1), str(f2), "--key-col", "id"],
+        ["replace-rows", str(out_path), str(f1), str(f2), "--key-col", "id"],
     )
 
     assert result.exit_code == 0, result.output
     rows = _read_tsv(out_path)
     assert rows == [{"id": "1", "value": "new"}, {"id": "2", "value": "x"}]
+
+
+def test_utilities_merge_columns_command(tmp_path):
+    base = tmp_path / "base.tsv"
+    extra = tmp_path / "extra.tsv"
+    out_path = tmp_path / "out.tsv"
+    _write_tsv(
+        base,
+        rows=[{"id": "1", "gene": "A"}, {"id": "2", "gene": "B"}],
+        fieldnames=["id", "gene"],
+    )
+    _write_tsv(
+        extra,
+        rows=[{"id": "1", "score": "0.9"}, {"id": "3", "score": "0.5"}],
+        fieldnames=["id", "score"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["merge-columns", str(base), str(extra), str(out_path), "--key-col", "id", "--add-col", "score"],
+    )
+
+    assert result.exit_code == 0, result.output
+    rows = _read_tsv(out_path)
+    assert rows == [
+        {"id": "1", "gene": "A", "score": "0.9"},
+        {"id": "2", "gene": "B", "score": ""},
+    ]
+
+
+def test_utilities_reorder_columns_command(tmp_path):
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+    _write_tsv(
+        in_path,
+        rows=[{"id": "1", "gene": "A", "value": "x"}],
+        fieldnames=["id", "gene", "value"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        ["reorder-columns", str(in_path), str(out_path), "--column-order", "value,id"],
+    )
+
+    assert result.exit_code == 0, result.output
+    rows = _read_tsv(out_path)
+    assert list(rows[0].keys()) == ["value", "id", "gene"]
 
 
 def test_utilities_filter_rows_command_any(tmp_path):
@@ -101,3 +150,34 @@ def test_utilities_filter_rows_command_all(tmp_path):
     assert result.exit_code == 0, result.output
     rows = _read_tsv(out_path)
     assert rows == [{"id": "1", "a": "x", "b": "y"}]
+
+
+def test_utilities_filter_rows_command_blank_mode(tmp_path):
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+    _write_tsv(
+        in_path,
+        rows=[
+            {"id": "1", "mapped_hgvs_p": "p.Ala1Val"},
+            {"id": "2", "mapped_hgvs_p": ""},
+        ],
+        fieldnames=["id", "mapped_hgvs_p"],
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "filter-rows",
+            str(in_path),
+            str(out_path),
+            "--value-col",
+            "mapped_hgvs_p",
+            "--value-state",
+            "blank",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    rows = _read_tsv(out_path)
+    assert rows == [{"id": "2", "mapped_hgvs_p": ""}]

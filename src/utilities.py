@@ -9,7 +9,9 @@ Available commands:
 - compare-columns: find rows where paired columns contain differing values
 - filter-columns: keep or omit selected columns from CSV/TSV files
 - filter-rows: keep rows where selected columns contain values
-- merge-rows: merge rows from multiple CSV/TSV files by composite key
+- replace-rows: replace rows from multiple CSV/TSV files by composite key
+- merge-columns: left-join two files and add selected columns from the second
+- reorder-columns: reorder columns using a requested column order
 """
 
 from __future__ import annotations
@@ -21,7 +23,9 @@ import click
 from src.compare_columns import compare_columns
 from src.filter_columns import filter_columns
 from src.filter_rows import filter_rows
-from src.merge_rows import merge_rows
+from src.merge_columns import merge_columns
+from src.reorder_columns import reorder_columns
+from src.replace_rows import replace_rows
 
 
 def _split_csv_args(values: tuple[str, ...]) -> list[str]:
@@ -92,7 +96,7 @@ def filter_columns_cmd(
     click.echo(f"Wrote {n_rows} row(s) to {output_file}")
 
 
-@main.command("merge-rows")
+@main.command("replace-rows")
 @click.argument("output_file")
 @click.argument("input_files", nargs=-1, required=True)
 @click.option(
@@ -106,19 +110,19 @@ def filter_columns_cmd(
         "for example: --key-col gene --key-col variant or --key-col gene,variant"
     ),
 )
-def merge_rows_cmd(
+def replace_rows_cmd(
     output_file: str,
     input_files: tuple[str, ...],
     key_cols_raw: tuple[str, ...],
 ) -> None:
-    """Merge rows from INPUT_FILES into OUTPUT_FILE using composite keys.
+    """Replace rows from INPUT_FILES into OUTPUT_FILE using composite keys.
 
     Later files override matching keys from earlier files. New keys from later
     files are appended.
     """
     key_columns = _split_csv_args(key_cols_raw)
     try:
-        n_rows = merge_rows(
+        n_rows = replace_rows(
             input_files=list(input_files),
             output_file=output_file,
             key_columns=key_columns,
@@ -126,7 +130,97 @@ def merge_rows_cmd(
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    click.echo(f"Wrote {n_rows} merged row(s) to {output_file}")
+    click.echo(f"Wrote {n_rows} row(s) to {output_file}")
+
+
+@main.command("merge-columns")
+@click.argument("base_file")
+@click.argument("extra_file")
+@click.argument("output_file")
+@click.option(
+    "--key-col",
+    "key_cols_raw",
+    multiple=True,
+    required=True,
+    metavar="COLUMN",
+    help=(
+        "Key column(s) for join identity. May be repeated and/or comma-separated, "
+        "for example: --key-col gene --key-col variant or --key-col gene,variant"
+    ),
+)
+@click.option(
+    "--add-col",
+    "add_cols_raw",
+    multiple=True,
+    metavar="COLUMN",
+    help=(
+        "Column(s) to add from extra file. May be repeated and/or comma-separated. "
+        "If omitted, all new non-key columns from extra are added."
+    ),
+)
+@click.option(
+    "--add-all-cols-from-extra",
+    is_flag=True,
+    help="Add all non-key columns from extra that are not already in base.",
+)
+def merge_columns_cmd(
+    base_file: str,
+    extra_file: str,
+    output_file: str,
+    key_cols_raw: tuple[str, ...],
+    add_cols_raw: tuple[str, ...],
+    add_all_cols_from_extra: bool,
+) -> None:
+    """Left-join BASE_FILE with EXTRA_FILE and write OUTPUT_FILE."""
+    key_columns = _split_csv_args(key_cols_raw)
+    add_columns = _split_csv_args(add_cols_raw)
+
+    try:
+        n_rows = merge_columns(
+            base_file=base_file,
+            extra_file=extra_file,
+            output_file=output_file,
+            key_columns=key_columns,
+            add_columns=add_columns,
+            add_all_cols_from_extra=add_all_cols_from_extra,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"Wrote {n_rows} row(s) to {output_file}")
+
+
+@main.command("reorder-columns")
+@click.argument("input_file")
+@click.argument("output_file")
+@click.option(
+    "--column-order",
+    "column_order_raw",
+    multiple=True,
+    required=True,
+    metavar="COLUMN",
+    help=(
+        "Desired column order. May be repeated and/or comma-separated, "
+        "for example: --column-order a,b,c"
+    ),
+)
+def reorder_columns_cmd(
+    input_file: str,
+    output_file: str,
+    column_order_raw: tuple[str, ...],
+) -> None:
+    """Reorder columns in INPUT_FILE and write OUTPUT_FILE."""
+    column_order = _split_csv_args(column_order_raw)
+    try:
+        n_rows = reorder_columns(
+            input_file=input_file,
+            output_file=output_file,
+            column_order=column_order,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"Wrote {n_rows} row(s) to {output_file}")
 
 
 @main.command("compare-columns")
@@ -223,21 +317,31 @@ def compare_columns_cmd(
     show_default=True,
     help="When multiple --value-col columns are supplied, keep rows matching any or all.",
 )
+@click.option(
+    "--value-state",
+    type=click.Choice(["non-empty", "blank"], case_sensitive=False),
+    default="non-empty",
+    show_default=True,
+    help="Whether selected columns should be non-empty or blank.",
+)
 def filter_rows_cmd(
     input_file: str,
     output_file: str,
     value_cols_raw: tuple[str, ...],
     match_mode: str,
+    value_state: str,
 ) -> None:
     """Filter rows in INPUT_FILE and write OUTPUT_FILE."""
     value_columns = _split_csv_args(value_cols_raw)
     match_mode = match_mode.lower()
+    value_state = value_state.lower()
     try:
         n_rows = filter_rows(
             input_file=input_file,
             output_file=output_file,
             value_columns=value_columns,
             match=match_mode,
+            value_state=value_state,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc

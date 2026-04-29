@@ -73,3 +73,29 @@ def test_filter_rows_no_columns_raises(tmp_path):
 
     with pytest.raises(ValueError, match="At least one --value-col"):
         filter_rows(str(in_path), str(out_path), [], match="any")
+
+
+def test_filter_rows_blank_mode(tmp_path):
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+    _write_tsv(
+        in_path,
+        rows=[
+            {"id": "1", "mapped_hgvs_p": "p.Gly12Asp"},
+            {"id": "2", "mapped_hgvs_p": ""},
+            {"id": "3", "mapped_hgvs_p": "   "},
+        ],
+        fieldnames=["id", "mapped_hgvs_p"],
+    )
+
+    n = filter_rows(
+        str(in_path),
+        str(out_path),
+        ["mapped_hgvs_p"],
+        match="any",
+        value_state="blank",
+    )
+
+    assert n == 2
+    rows = _read_tsv(out_path)
+    assert [r["id"] for r in rows] == ["2", "3"]
