@@ -140,24 +140,29 @@ def _local_ht_path(cache_dir: Path, version: str) -> Path:
     return cache_dir / f"gnomad_{version.replace('.', '_')}_indexed.ht"
 
 
-def _has_path(dtype: Any, parts: list[str]) -> bool:
+def _has_path(dtype: Any, parts: list[Any]) -> bool:
     hl = _import_hail()
     cur = dtype
     for part in parts:
+        if isinstance(part, int):
+            if not isinstance(cur, hl.tarray):
+                return False
+            cur = cur.element_type
+            continue
         if not isinstance(cur, hl.tstruct) or part not in cur:
             return False
         cur = cur[part]
     return True
 
 
-def _get_path(expr: Any, parts: list[str]) -> Any:
+def _get_path(expr: Any, parts: list[Any]) -> Any:
     cur = expr
     for part in parts:
         cur = cur[part]
     return cur
 
 
-def _choose_expr(ht: Any, candidates: list[list[str]]) -> Optional[Any]:
+def _choose_expr(ht: Any, candidates: list[list[Any]]) -> Optional[Any]:
     for path in candidates:
         if _has_path(ht.row.dtype, path):
             return _get_path(ht, path)
@@ -196,18 +201,43 @@ def ensure_local_gnomad_ht(
         except Exception as exc:
             _raise_actionable_hail_error(source_ht_uri, exc)
 
-        # Resolve allele counts: try joint.freq array first, then top-level freq array.
-        if _has_path(source_ht.row.dtype, ["joint", "freq"]):
-            freq_first = source_ht.joint.freq[0]
-            ac_expr: Any = freq_first.AC
-            an_expr: Any = freq_first.AN
-        elif _has_path(source_ht.row.dtype, ["freq"]):
-            freq_first = source_ht.freq[0]
-            ac_expr = freq_first.AC
-            an_expr = freq_first.AN
-        else:
-            ac_expr = _choose_expr(source_ht, [["joint", "AC"], ["AC"]])
-            an_expr = _choose_expr(source_ht, [["joint", "AN"], ["AN"]])
+        # Resolve allele counts across known gnomAD schema variants:
+        # - joint v4.1 sites HT: joint.freq[0].AC / .AN
+        # - browser v4.1.1 sites HT: joint.freq.all.ac / .an
+        ac_expr = _choose_expr(
+            source_ht,
+            [
+                ["joint", "freq", "all", "AC"],
+                ["joint", "freq", "all", "ac"],
+                ["joint", "freq", 0, "AC"],
+                ["joint", "freq", 0, "ac"],
+                ["freq", "all", "AC"],
+                ["freq", "all", "ac"],
+                ["freq", 0, "AC"],
+                ["freq", 0, "ac"],
+                ["joint", "AC"],
+                ["joint", "ac"],
+                ["AC"],
+                ["ac"],
+            ],
+        )
+        an_expr = _choose_expr(
+            source_ht,
+            [
+                ["joint", "freq", "all", "AN"],
+                ["joint", "freq", "all", "an"],
+                ["joint", "freq", 0, "AN"],
+                ["joint", "freq", 0, "an"],
+                ["freq", "all", "AN"],
+                ["freq", "all", "an"],
+                ["freq", 0, "AN"],
+                ["freq", 0, "an"],
+                ["joint", "AN"],
+                ["joint", "an"],
+                ["AN"],
+                ["an"],
+            ],
+        )
 
         if ac_expr is None or an_expr is None:
             raise RuntimeError("Could not find allele count/number fields in source gnomAD Hail table")
