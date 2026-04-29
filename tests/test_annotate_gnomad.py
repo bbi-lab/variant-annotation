@@ -1,4 +1,5 @@
 import csv
+import time
 
 import pytest
 import src.annotate_gnomad as mod
@@ -217,6 +218,19 @@ def test_build_caid_to_gnomad_key_uses_input_coordinate_columns():
         ref_col="mapped_hgvs_g_ref",
         alt_col="mapped_hgvs_g_alt",
     )
-
     assert out["CA1"] == "chr7:117548628:G:A"
     assert out["CA2"] == "chr13:32316461:C:T"
+
+
+def test_cache_progress_message_reports_file_growth(tmp_path):
+    cache_dir = tmp_path / "gnomad_cache"
+    ht_path = cache_dir / "gnomad_v4_1_indexed.ht"
+    ht_path.mkdir(parents=True)
+    (ht_path / "part-00000").write_text("abc", encoding="utf-8")
+
+    message = mod._cache_progress_message("writing local cache table", time.monotonic() - 30, cache_dir, ht_path)
+
+    assert "stage=writing local cache table" in message
+    assert "cache_dir=" in message
+    assert "local_ht=" in message
+    assert "success_marker=no" in message

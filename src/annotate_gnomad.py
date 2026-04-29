@@ -27,6 +27,8 @@ from itertools import islice
 import logging
 import os
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -140,6 +142,85 @@ def _local_ht_path(cache_dir: Path, version: str) -> Path:
     return cache_dir / f"gnomad_{version.replace('.', '_')}_indexed.ht"
 
 
+def _format_bytes(num_bytes: int) -> str:
+    value = float(max(0, num_bytes))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            return f"{value:.1f} {unit}"
+        value /= 1024.0
+    return f"{value:.1f} TiB"
+
+
+def _path_stats(path: Path) -> tuple[int, int]:
+    if not path.exists():
+        return 0, 0
+    if path.is_file():
+        try:
+            return 1, path.stat().st_size
+        except OSError:
+            return 1, 0
+
+    file_count = 0
+    byte_count = 0
+    for child in path.rglob("*"):
+        try:
+            if child.is_file():
+                file_count += 1
+                byte_count += child.stat().st_size
+        except OSError:
+            continue
+    return file_count, byte_count
+
+
+def _cache_progress_message(stage: str, started_at: float, cache_dir: Path, ht_path: Path) -> str:
+    elapsed = max(time.monotonic() - started_at, 0.0)
+    cache_files, cache_bytes = _path_stats(cache_dir)
+    ht_files, ht_bytes = _path_stats(ht_path)
+    success_marker = ht_path.exists() and (ht_path / "_SUCCESS").exists()
+    return (
+        "gnomAD cache prep progress: "
+        f"stage={stage}; elapsed={elapsed / 3600.0:.2f}h; "
+        f"cache_dir={cache_files} files/{_format_bytes(cache_bytes)}; "
+        f"local_ht={ht_files} files/{_format_bytes(ht_bytes)}; "
+        f"success_marker={'yes' if success_marker else 'no'}"
+    )
+
+
+class _CachePrepProgressLogger:
+    def __init__(self, cache_dir: Path, ht_path: Path, interval_seconds: int) -> None:
+        self._cache_dir = cache_dir
+        self._ht_path = ht_path
+        self._interval_seconds = interval_seconds
+        self._started_at = time.monotonic()
+        self._stage = "starting"
+        self._stage_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._interval_seconds <= 0:
+            return
+        self._thread = threading.Thread(target=self._run, name="gnomad-cache-progress", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop_event.set()
+        self._thread.join()
+        self._thread = None
+
+    def set_stage(self, stage: str) -> None:
+        with self._stage_lock:
+            self._stage = stage
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(self._interval_seconds):
+            with self._stage_lock:
+                stage = self._stage
+            logger.info(_cache_progress_message(stage, self._started_at, self._cache_dir, self._ht_path))
+
+
 def _has_path(dtype: Any, parts: list[Any]) -> bool:
     hl = _import_hail()
     cur = dtype
@@ -175,6 +256,7 @@ def ensure_local_gnomad_ht(
     version: str,
     source_ht_uri: str,
     overwrite: bool = False,
+    progress_every_seconds: int = 300,
 ) -> Path:
     """Download and cache a local gnomAD Hail table.
 
@@ -192,14 +274,20 @@ def ensure_local_gnomad_ht(
 
     hail_tmp = cache_dir / "hail-tmp"
     hail_tmp.mkdir(parents=True, exist_ok=True)
+    progress_logger = _CachePrepProgressLogger(cache_dir, ht_path, progress_every_seconds)
 
     logger.info("Initializing Hail and loading source table: %s", source_ht_uri)
+    progress_logger.set_stage("initializing Hail")
+    progress_logger.start()
     hl.init(**_hail_init_kwargs(hail_tmp, source_ht_uri))
     try:
+        progress_logger.set_stage("loading source table")
         try:
             source_ht = hl.read_table(source_ht_uri)
         except Exception as exc:
             _raise_actionable_hail_error(source_ht_uri, exc)
+
+        progress_logger.set_stage("preparing local cache projection")
 
         # Resolve allele counts across known gnomAD schema variants:
         # - joint v4.1 sites HT: joint.freq[0].AC / .AN
@@ -293,9 +381,13 @@ def ensure_local_gnomad_ht(
             prepared = prepared.key_by(prepared.gnomad_key)
 
         logger.info("Writing local gnomAD cache table: %s", ht_path)
+        progress_logger.set_stage("writing local cache table")
         prepared.write(str(ht_path), overwrite=True)
     finally:
+        progress_logger.stop()
         hl.stop()
+
+    logger.info(_cache_progress_message("completed", progress_logger._started_at, cache_dir, ht_path))
 
     return ht_path
 
@@ -429,9 +521,10 @@ def load_gnomad_records_for_caids(
             caid = str(row.caid)
         else:
             row_key_value = getattr(row, key_field)
-            caid = gnomad_key_to_caid.get(str(row_key_value))
-            if caid is None:
+            resolved_caid = gnomad_key_to_caid.get(str(row_key_value))
+            if resolved_caid is None:
                 continue
+            caid = resolved_caid
         ac = int(row.allele_count)
         an = int(row.allele_number)
         if an <= 0:
@@ -540,6 +633,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--download-only", action="store_true", help="Only materialize local gnomAD cache; do not annotate")
     p.add_argument("--refresh-cache", action="store_true", help="Rebuild local gnomAD cache even if present")
     p.add_argument(
+        "--cache-progress-every-seconds",
+        type=int,
+        default=int(os.environ.get("GNOMAD_CACHE_PROGRESS_EVERY_SECONDS", "300")),
+        help="Log cache preparation heartbeat every N seconds (0 disables heartbeat logs)",
+    )
+    p.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -568,6 +667,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         version=args.gnomad_version,
         source_ht_uri=args.gnomad_ht_uri,
         overwrite=args.refresh_cache,
+        progress_every_seconds=args.cache_progress_every_seconds,
     )
 
     if args.download_only:
