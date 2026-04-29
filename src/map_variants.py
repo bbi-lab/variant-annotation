@@ -1218,8 +1218,10 @@ def map_variants(
         writer.writeheader()
         out_fh.flush()
 
-        # Groups for sequence-based cases (2 and 3).
-        # group_key -> [(orig_idx, row, hgvs_nt, hgvs_pro, case, target_sequence)]
+        # Sequence-based rows (cases 2 and 3).
+        # In preserve_order="groups" mode, contiguous blocks are processed as soon
+        # as the block ends so downstream consumers can see output incrementally.
+        # Otherwise rows are accumulated by group_key for end-of-scan processing.
         groups: dict[str, list] = defaultdict(list)
 
         n_total = 0
@@ -1272,6 +1274,11 @@ def map_variants(
             tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
         ] = {}
         pending_case1_rows: list[tuple[int, dict, str]] = []
+        current_group_key: Optional[str] = None
+        current_group_rows: list[tuple[int, dict, str, str, int, str]] = []
+        processed_group_count = 0
+        sequence_loop: Optional[asyncio.AbstractEventLoop] = None
+        dcd_for_groups: Optional[dict] = None
 
         def _record_result(
             idx: int,
@@ -1370,6 +1377,185 @@ def map_variants(
 
             case1_rows.clear()
 
+        def _process_sequence_group(
+            group_name: str,
+            group_rows: list[tuple[int, dict, str, str, int, str]],
+        ) -> None:
+            nonlocal processed_group_count, sequence_loop, dcd_for_groups
+
+            if not group_rows:
+                return
+
+            if dcd_for_groups is None:
+                dcd_for_groups = _try_import_dcd_mapping()
+            if sequence_loop is None:
+                sequence_loop = asyncio.new_event_loop()
+
+            processed_group_count += 1
+            target_seq = group_rows[0][5]
+            target_seqs = {r[5] for r in group_rows}
+            if len(target_seqs) > 1:
+                logger.warning(
+                    "Group %r contains %d different target_sequence values; using the first one.",
+                    group_name,
+                    len(target_seqs),
+                )
+
+            group_rows_by_idx = {r[0]: r[1] for r in group_rows}
+            row_entries = [(r[0], r[2], r[3], r[4]) for r in group_rows]
+
+            per_row = None
+            transcript_nm = None
+            last_error = None
+
+            try:
+                asyncio.set_event_loop(sequence_loop)
+                for attempt in range(1, dcd_max_retry_attempts + 1):
+                    try:
+                        per_row, transcript_nm = sequence_loop.run_until_complete(
+                            _run_dcd_mapping_pipeline(group_name, target_seq, row_entries, dcd_for_groups)
+                        )
+                        break
+                    except Exception as exc:
+                        exc_str = str(exc)
+                        last_error = exc
+                        if dcd_chunk_on_137 and "error code 137" in exc_str and attempt < dcd_max_retry_attempts:
+                            chunk_sz = max(1, dcd_chunk_size_on_137 // (2 ** (attempt - 1)))
+                            logger.warning(
+                                "Group %r failed with BLAT error 137 (attempt %d/%d); retrying with chunk_size=%d.",
+                                group_name,
+                                attempt,
+                                dcd_max_retry_attempts,
+                                chunk_sz,
+                            )
+                            per_row = []
+                            for start_idx in range(0, len(row_entries), chunk_sz):
+                                chunk_entries = row_entries[start_idx : start_idx + chunk_sz]
+                                chunk_name = f"{group_name}#retry{attempt}_chunk{start_idx // chunk_sz + 1}"
+                                try:
+                                    chunk_per_row, chunk_tx = sequence_loop.run_until_complete(
+                                        _run_dcd_mapping_pipeline(chunk_name, target_seq, chunk_entries, dcd_for_groups)
+                                    )
+                                    per_row.extend(chunk_per_row)
+                                    if transcript_nm is None:
+                                        transcript_nm = chunk_tx
+                                except Exception as chunk_exc:
+                                    logger.error(
+                                        "Chunk %s failed: %s",
+                                        chunk_name,
+                                        _format_exc(chunk_exc),
+                                    )
+                                    for orig_idx, _, _, _ in chunk_entries:
+                                        per_row.append((orig_idx, None, f"BLAT chunk failed: {_format_exc(chunk_exc)}"))
+                            break
+                        raise
+
+                if per_row is None:
+                    logger.error(
+                        "Group %r failed after %d attempt(s): %s",
+                        group_name,
+                        dcd_max_retry_attempts,
+                        _format_exc(last_error) if last_error else "unknown error",
+                    )
+                    fallback_error = _format_exc(last_error) if last_error is not None else "unknown error"
+                    per_row = [(orig_idx, None, fallback_error) for orig_idx, _, _, _ in row_entries]
+
+                hgvs_queries = []
+                for orig_idx, hgvs_assay, error in per_row:
+                    row = group_rows_by_idx[orig_idx]
+
+                    if error:
+                        _record_result(orig_idx, row, None, None, None, error, group_id=group_name)
+                        continue
+                    if not hgvs_assay:
+                        _record_result(orig_idx, row, None, None, None, "No HGVS string produced by mapper", group_id=group_name)
+                        continue
+
+                    hgvs_queries.append((orig_idx, row, hgvs_assay))
+
+                if hgvs_queries:
+                    hgvs_strings = [h[2] for h in hgvs_queries]
+                    logger.debug(
+                        "Batch querying ClinGen for %d variants in group %r (transcript: %s)",
+                        len(hgvs_strings),
+                        group_name,
+                        transcript_nm,
+                    )
+                    clingen_batch_start = time.monotonic()
+                    clingen_results = sequence_loop.run_until_complete(
+                        _query_clingen_by_hgvs_batch(hgvs_strings, max_concurrency=max_clingen_concurrency)
+                    )
+                    clingen_batch_elapsed = time.monotonic() - clingen_batch_start
+                    logger.debug(
+                        "ClinGen batch query completed for %d variants in %.2f seconds",
+                        len(hgvs_strings),
+                        clingen_batch_elapsed,
+                    )
+
+                    for orig_idx, row, hgvs_assay in hgvs_queries:
+                        data = clingen_results.get(hgvs_assay)
+                        if data is None:
+                            _assay_is_protein = (
+                                hgvs_assay.startswith("p.") or ":p." in hgvs_assay
+                            )
+                            _record_result(
+                                orig_idx,
+                                row,
+                                None,
+                                None if _assay_is_protein else hgvs_assay,
+                                hgvs_assay if _assay_is_protein else None,
+                                f"ClinGen returned no data for {hgvs_assay!r}",
+                                group_id=group_name,
+                            )
+                            continue
+
+                        hgvs_g, hgvs_c, hgvs_p = _extract_hgvs_from_clingen(data, transcript_nm)
+                        if _clingen_allele_type(data) == "PA" and hgvs_p is None:
+                            hgvs_p = hgvs_assay
+
+                        _record_result(
+                            orig_idx,
+                            row,
+                            hgvs_c,
+                            hgvs_g,
+                            hgvs_p,
+                            None,
+                            _extract_clingen_allele_id(data),
+                            group_id=group_name,
+                        )
+
+                        if n_written % PROGRESS_EVERY_ROWS == 0:
+                            elapsed = max(time.monotonic() - started, 1e-9)
+                            logger.info(
+                                "Output progress: %d/%d rows written (%d errors, %.1f rows/s).",
+                                n_written,
+                                n_total,
+                                n_errors,
+                                n_written / elapsed,
+                            )
+            finally:
+                asyncio.set_event_loop(None)
+
+            elapsed = max(time.monotonic() - started, 1e-9)
+            logger.info(
+                "Group %d complete (%d rows in group). %d/%d rows written so far (%.1f rows/s).",
+                processed_group_count,
+                len(group_rows),
+                n_written,
+                n_total,
+                n_written / elapsed,
+            )
+
+        def _flush_current_group() -> None:
+            nonlocal current_group_key, current_group_rows
+
+            if not current_group_rows or current_group_key is None:
+                return
+
+            _process_sequence_group(current_group_key, current_group_rows)
+            current_group_key = None
+            current_group_rows = []
+
         for src_idx, row in enumerate(reader):
             if src_idx < skip:
                 continue
@@ -1409,6 +1595,8 @@ def map_variants(
                 merge_key = _build_merge_key(row, merge_key_columns)
                 merged_result = existing_results_by_key.get(merge_key)
                 if merged_result is not None:
+                    if preserve_order == "groups":
+                        _flush_current_group()
                     hgvs_c, hgvs_g, hgvs_p, err, clingen_allele_id = merged_result
                     _record_result(
                         idx,
@@ -1429,6 +1617,9 @@ def map_variants(
             # first non-class-1 row that follows it.
             if case != 1 and pending_case1_rows:
                 _flush_case1_rows(pending_case1_rows)
+
+            if preserve_order == "groups" and case not in (2, 3):
+                _flush_current_group()
 
             if case is None:
                 _record_result(idx, row, None, None, None, "No usable HGVS variant data in this row", group_id=None)
@@ -1458,7 +1649,13 @@ def map_variants(
                     group_key = (row.get(group_by_col) or target_seq).strip() or target_seq
                     if idx < 10 or idx % PROGRESS_EVERY_ROWS == 0:
                         logger.debug("Row %d: case %d, group %r", idx, case, group_key)
-                    groups[group_key].append((idx, row, raw_nt.strip(), raw_pro.strip(), case, target_seq))
+                    if preserve_order == "groups":
+                        if current_group_key is not None and group_key != current_group_key:
+                            _flush_current_group()
+                        current_group_key = group_key
+                        current_group_rows.append((idx, row, raw_nt.strip(), raw_pro.strip(), case, target_seq))
+                    else:
+                        groups[group_key].append((idx, row, raw_nt.strip(), raw_pro.strip(), case, target_seq))
 
             if n_total % PROGRESS_EVERY_ROWS == 0:
                 elapsed = max(time.monotonic() - started, 1e-9)
@@ -1486,8 +1683,11 @@ def map_variants(
         if pending_case1_rows:
             _flush_case1_rows(pending_case1_rows)
 
+        if preserve_order == "groups":
+            _flush_current_group()
+
         # Run dcd_mapping pipeline for all sequence-based groups (cases 2 and 3).
-        if groups:
+        if preserve_order != "groups" and groups:
             dcd = _try_import_dcd_mapping()
             n_groups = len(groups)
             loop = asyncio.new_event_loop()
@@ -1564,7 +1764,8 @@ def map_variants(
                             dcd_max_retry_attempts,
                             _format_exc(last_error) if last_error else "unknown error",
                         )
-                        per_row = [(orig_idx, None, _format_exc(last_error)) for orig_idx, _, _, _ in row_entries]
+                        fallback_error = _format_exc(last_error) if last_error is not None else "unknown error"
+                        per_row = [(orig_idx, None, fallback_error) for orig_idx, _, _, _ in row_entries]
 
                     # Collect all HGVS strings that need ClinGen queries
                     hgvs_queries = []  # List of (orig_idx, row, hgvs_assay) tuples
@@ -1663,6 +1864,9 @@ def map_variants(
             finally:
                 asyncio.set_event_loop(None)
                 loop.close()
+
+        if sequence_loop is not None:
+            sequence_loop.close()
 
         # Safety net: emit any buffered rows that could not be flushed during normal flow.
         if preserve_order in {"index", "groups"} and pending_results:

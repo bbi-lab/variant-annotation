@@ -59,6 +59,47 @@ def test_map_variants_default_preserves_input_order(tmp_path, monkeypatch):
     assert [r["variant_urn"] for r in out_rows] == ["v0", "v1", "v2", "v3"]
 
 
+def test_map_variants_groups_mode_uses_contiguous_blocks(tmp_path, monkeypatch):
+    input_path = tmp_path / "in.tsv"
+    output_path = tmp_path / "out.tsv"
+
+    rows = [
+        {"variant_urn": "v0", "raw_hgvs_nt": "", "raw_hgvs_pro": "p.Ala1Val", "target_sequence": "SEQ_A"},
+        {"variant_urn": "v1", "raw_hgvs_nt": "", "raw_hgvs_pro": "p.Ala2Val", "target_sequence": "SEQ_B"},
+        {"variant_urn": "v2", "raw_hgvs_nt": "", "raw_hgvs_pro": "p.Ala3Val", "target_sequence": "SEQ_A"},
+    ]
+    _write_tsv(input_path, rows)
+
+    calls = []
+
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+        calls.append((group_name, [orig_idx for orig_idx, *_ in row_entries]))
+        per_row = []
+        for orig_idx, *_ in row_entries:
+            per_row.append((orig_idx, f"NC_000001.11:g.{orig_idx + 100}A>G", None))
+        return per_row, "NM_000001.1"
+
+    async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
+        return {h: {"hgvs": h, "id": f"CA{idx}"} for idx, h in enumerate(hgvs_strings, start=1)}
+
+    monkeypatch.setattr(mv, "_try_import_dcd_mapping", lambda: object())
+    monkeypatch.setattr(mv, "_run_dcd_mapping_pipeline", fake_pipeline)
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs_batch", fake_clingen_batch)
+    monkeypatch.setattr(
+        mv,
+        "_extract_hgvs_from_clingen",
+        lambda data, transcript_nm: (data["hgvs"], f"{transcript_nm}:c.1A>G", "NP_000001.1:p.Ala1Val"),
+    )
+    monkeypatch.setattr(mv, "_extract_clingen_allele_id", lambda data: data.get("id"))
+    monkeypatch.setattr(mv, "_clingen_allele_type", lambda data: "SNV")
+
+    mv.map_variants(str(input_path), str(output_path), preserve_order="groups")
+
+    assert calls == [("SEQ_A", [0]), ("SEQ_B", [1]), ("SEQ_A", [2])]
+    out_rows = _read_tsv(output_path)
+    assert [r["variant_urn"] for r in out_rows] == ["v0", "v1", "v2"]
+
+
 def test_map_variants_retries_on_137_with_chunking(tmp_path, monkeypatch):
     input_path = tmp_path / "in.tsv"
     output_path = tmp_path / "out.tsv"
