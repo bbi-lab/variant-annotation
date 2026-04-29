@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -402,9 +403,12 @@ def lookup_precomputed_scores(
     hgvs_to_exact_vcf: dict[str, Optional[tuple[str, int, str, str]]],
     nc_to_chrom: dict[str, str],
     vcf_paths: list[Path],
+    progress_every: int = 1000,
 ) -> dict[str, dict[str, str]]:
-    out: dict[str, dict[str, str]] = {}
-    for hgvs_g, exact in hgvs_to_exact_vcf.items():
+    def _lookup_single(
+        hgvs_g: str,
+        exact: Optional[tuple[str, int, str, str]],
+    ) -> tuple[dict[str, str], bool]:
         matcher: Callable[[list[str]], bool]
         if exact is not None:
             chrom, pos, ref, alt = exact
@@ -419,8 +423,7 @@ def lookup_precomputed_scores(
         else:
             query = tabix_query_for_hgvs_g(hgvs_g, nc_to_chrom)
             if query is None:
-                out[hgvs_g] = _empty_score_dict()
-                continue
+                return _empty_score_dict(), False
             query_chrom, query_pos, matcher = query
             alt_for_parse = None
 
@@ -445,7 +448,30 @@ def lookup_precomputed_scores(
             if found:
                 break
 
+        return found_score, found
+
+    out: dict[str, dict[str, str]] = {}
+    total = len(hgvs_to_exact_vcf)
+    processed = 0
+    matched = 0
+    started = time.monotonic()
+
+    for hgvs_g, exact in hgvs_to_exact_vcf.items():
+        found_score, found = _lookup_single(hgvs_g, exact)
         out[hgvs_g] = found_score
+        processed += 1
+        if found:
+            matched += 1
+
+        if progress_every > 0 and (processed % progress_every == 0 or processed == total):
+            elapsed = max(time.monotonic() - started, 1e-9)
+            logger.info(
+                "SpliceAI lookup progress: %d/%d variants checked (%d matched, %.1f variants/s)",
+                processed,
+                total,
+                matched,
+                processed / elapsed,
+            )
     return out
 
 
@@ -603,6 +629,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity",
     )
+    p.add_argument(
+        "--progress-every",
+        type=int,
+        default=1000,
+        help="Log lookup progress every N unique variants (<=0 disables progress logs)",
+    )
     return p.parse_args(argv)
 
 
@@ -677,6 +709,89 @@ def main(argv: Optional[list[str]] = None) -> None:
     input_path = Path(args.input_file)
     output_path = Path(args.output_file)
 
+    if args.mode == "precomputed":
+        logger.info("Precomputed mode: streaming annotation rows as lookups become available")
+        hgvs_score_map: dict[str, dict[str, str]] = {}
+        unique_hgvs_checked = 0
+        unique_hgvs_matched = 0
+        lookup_started = time.monotonic()
+
+        with input_path.open("r", encoding="utf-8", newline="") as in_fh, output_path.open(
+            "w", encoding="utf-8", newline=""
+        ) as out_fh:
+            reader = csv.DictReader(in_fh, delimiter=delim)
+            if reader.fieldnames is None:
+                raise ValueError(f"Input file appears empty: {input_path}")
+            fieldnames = list(reader.fieldnames)
+            out_fieldnames = fieldnames + [col for col in SPLICEAI_COLS if col not in fieldnames]
+
+            writer = csv.DictWriter(
+                out_fh,
+                fieldnames=out_fieldnames,
+                delimiter=delim,
+                lineterminator="\n",
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+
+            selected_rows = 0
+            annotated_rows = 0
+            for src_idx, row in enumerate(reader):
+                if src_idx < args.skip:
+                    continue
+                if args.limit is not None and selected_rows >= args.limit:
+                    break
+
+                selected_rows += 1
+                for hgvs_g in split_pipe_preserve_positions(row.get(args.hgvs_g_col, "")):
+                    if not hgvs_g or hgvs_g in hgvs_score_map:
+                        continue
+                    exact = parse_hgvs_g_to_vcf(hgvs_g, nc_to_chrom, fasta)
+                    score = lookup_precomputed_scores(
+                        {hgvs_g: exact},
+                        nc_to_chrom,
+                        precomputed_vcfs,
+                        progress_every=0,
+                    ).get(hgvs_g, _empty_score_dict())
+                    hgvs_score_map[hgvs_g] = score
+                    unique_hgvs_checked += 1
+                    if score["spliceai.max_delta_score"].strip():
+                        unique_hgvs_matched += 1
+
+                    if args.progress_every > 0 and unique_hgvs_checked % args.progress_every == 0:
+                        elapsed = max(time.monotonic() - lookup_started, 1e-9)
+                        logger.info(
+                            "SpliceAI lookup progress: %d unique variants checked (%d matched, %.1f variants/s)",
+                            unique_hgvs_checked,
+                            unique_hgvs_matched,
+                            unique_hgvs_checked / elapsed,
+                        )
+
+                ann = annotate_row_with_scores(row, args.hgvs_g_col, hgvs_score_map)
+                row.update(ann)
+                writer.writerow(row)
+                if ann["spliceai.max_delta_score"].replace("|", "").strip():
+                    annotated_rows += 1
+
+                if args.progress_every > 0 and selected_rows % args.progress_every == 0:
+                    logger.info(
+                        "SpliceAI row progress: %d rows written (%d annotated, %d unique lookups)",
+                        selected_rows,
+                        annotated_rows,
+                        unique_hgvs_checked,
+                    )
+
+        if unique_hgvs_checked:
+            elapsed = max(time.monotonic() - lookup_started, 1e-9)
+            logger.info(
+                "SpliceAI lookup complete: %d unique variants checked (%d matched, %.1f variants/s)",
+                unique_hgvs_checked,
+                unique_hgvs_matched,
+                unique_hgvs_checked / elapsed,
+            )
+        logger.info("Done. %d/%d rows received SpliceAI annotations", annotated_rows, selected_rows)
+        return
+
     with input_path.open("r", encoding="utf-8", newline="") as in_fh:
         reader = csv.DictReader(in_fh, delimiter=delim)
         if reader.fieldnames is None:
@@ -700,21 +815,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     for hgvs_g in unique_hgvs:
         hgvs_to_exact_vcf[hgvs_g] = parse_hgvs_g_to_vcf(hgvs_g, nc_to_chrom, fasta)
 
-    if args.mode == "precomputed":
-        logger.info(
-            "Looking up SpliceAI annotations for %d unique variants from %d cached VCF(s)",
-            len(hgvs_to_exact_vcf),
-            len(precomputed_vcfs),
-        )
-        hgvs_score_map = lookup_precomputed_scores(hgvs_to_exact_vcf, nc_to_chrom, precomputed_vcfs)
-    else:
-        unique_vcf_keys = list({v for v in hgvs_to_exact_vcf.values() if v is not None})
-        logger.info("Running local SpliceAI on %d unique variants", len(unique_vcf_keys))
-        vcf_score_map = run_spliceai(unique_vcf_keys, args.genome, args.annotation)
-        hgvs_score_map = {
-            hgvs_g: vcf_score_map.get(vcf_key, _empty_score_dict()) if vcf_key is not None else _empty_score_dict()
-            for hgvs_g, vcf_key in hgvs_to_exact_vcf.items()
-        }
+    unique_vcf_keys = list({v for v in hgvs_to_exact_vcf.values() if v is not None})
+    logger.info("Running local SpliceAI on %d unique variants", len(unique_vcf_keys))
+    vcf_score_map = run_spliceai(unique_vcf_keys, args.genome, args.annotation)
+    hgvs_score_map = {
+        hgvs_g: vcf_score_map.get(vcf_key, _empty_score_dict()) if vcf_key is not None else _empty_score_dict()
+        for hgvs_g, vcf_key in hgvs_to_exact_vcf.items()
+    }
 
     out_fieldnames = fieldnames + [col for col in SPLICEAI_COLS if col not in fieldnames]
     annotated_rows = 0
