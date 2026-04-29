@@ -44,6 +44,12 @@ HAIL_GCS_CONNECTOR_JAR_DEFAULT = (
     "https://repo1.maven.org/maven2/com/google/cloud/bigdataoss/"
     "gcs-connector/hadoop3-2.2.11/gcs-connector-hadoop3-2.2.11-shaded.jar"
 )
+GNOMAD_ATHENA_DB_DEFAULT = os.environ.get("GNOMAD_ATHENA_DATABASE", "gnomad")
+GNOMAD_ATHENA_TABLE_DEFAULT = os.environ.get("GNOMAD_ATHENA_TABLE", "")
+GNOMAD_ATHENA_OUTPUT_LOCATION_DEFAULT = os.environ.get("GNOMAD_ATHENA_OUTPUT_LOCATION", "")
+GNOMAD_ATHENA_WORKGROUP_DEFAULT = os.environ.get("GNOMAD_ATHENA_WORKGROUP", "")
+GNOMAD_ATHENA_REGION_DEFAULT = os.environ.get("GNOMAD_ATHENA_REGION", os.environ.get("AWS_REGION", ""))
+GNOMAD_ATHENA_ROW_BATCH_SIZE_DEFAULT = int(os.environ.get("GNOMAD_ATHENA_ROW_BATCH_SIZE", "1000"))
 
 
 @dataclass
@@ -136,6 +142,130 @@ def _split_pipe(value: str) -> list[str]:
     if "|" not in value:
         return [value.strip()] if value.strip() else []
     return [part.strip() for part in value.split("|") if part.strip()]
+
+
+def _split_pipe_preserve_positions(value: str) -> list[str]:
+    raw = value or ""
+    if "|" not in raw:
+        return [raw.strip()]
+    return [part.strip() for part in raw.split("|")]
+
+
+def _batched(values: list[str], batch_size: int) -> list[list[str]]:
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    return [values[i : i + batch_size] for i in range(0, len(values), batch_size)]
+
+
+def _athena_table_name_from_version(version: str) -> str:
+    return version.replace(".", "_")
+
+
+def _load_athena_rows_for_caids(
+    caids: list[str],
+    *,
+    database: str,
+    table: str,
+    output_location: str,
+    workgroup: Optional[str],
+    region: Optional[str],
+    max_caids_per_query: int,
+    poll_seconds: int,
+) -> list[dict[str, Optional[str]]]:
+    try:
+        import boto3  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(
+            "boto3 is required for --execution-mode athena. Install dependencies with boto3 available."
+        ) from exc
+
+    if not caids:
+        return []
+
+    if not output_location:
+        raise ValueError("Athena output location is required")
+
+    client_kwargs: dict[str, Any] = {}
+    if region:
+        client_kwargs["region_name"] = region
+    client = boto3.client("athena", **client_kwargs)
+
+    all_rows: list[dict[str, Optional[str]]] = []
+    caid_chunks = _batched(caids, max_caids_per_query)
+    total_chunks = len(caid_chunks)
+
+    for chunk_index, chunk in enumerate(caid_chunks, start=1):
+        caid_values = ",".join("'" + c.replace("'", "''") + "'" for c in chunk)
+        query = (
+            f'SELECT "caid", '
+            f'"joint.freq.all.ac", '
+            f'"joint.freq.all.an", '
+            f'"joint.fafmax.faf95_max_gen_anc", '
+            f'"joint.fafmax.faf95_max" '
+            f'FROM "{database}"."{table}" '
+            f'WHERE caid IN ({caid_values})'
+        )
+
+        logger.info(
+            "Athena gnomAD query %d/%d: requesting %d CAIDs",
+            chunk_index,
+            total_chunks,
+            len(chunk),
+        )
+
+        start_kwargs: dict[str, Any] = {
+            "QueryString": query,
+            "QueryExecutionContext": {"Database": database},
+            "ResultConfiguration": {"OutputLocation": output_location},
+        }
+        if workgroup:
+            start_kwargs["WorkGroup"] = workgroup
+
+        start_resp = client.start_query_execution(**start_kwargs)
+        execution_id = start_resp["QueryExecutionId"]
+
+        while True:
+            execution = client.get_query_execution(QueryExecutionId=execution_id)
+            status = execution["QueryExecution"]["Status"]["State"]
+            if status in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                break
+            time.sleep(max(1, poll_seconds))
+
+        if status != "SUCCEEDED":
+            reason = execution["QueryExecution"]["Status"].get("StateChangeReason", "")
+            raise RuntimeError(f"Athena query failed ({status}) for chunk {chunk_index}/{total_chunks}: {reason}")
+
+        next_token: Optional[str] = None
+        header: list[str] = []
+        while True:
+            result_kwargs: dict[str, Any] = {"QueryExecutionId": execution_id}
+            if next_token:
+                result_kwargs["NextToken"] = next_token
+            result = client.get_query_results(**result_kwargs)
+
+            result_set = result.get("ResultSet", {})
+            rows = result_set.get("Rows", [])
+            for row_num, row in enumerate(rows):
+                values = [cell.get("VarCharValue") for cell in row.get("Data", [])]
+                if not header:
+                    header = [str(v or "") for v in values]
+                    continue
+                if len(values) < len(header):
+                    values.extend([None] * (len(header) - len(values)))
+                all_rows.append(dict(zip(header, values)))
+
+            next_token = result.get("NextToken")
+            if not next_token:
+                break
+
+        logger.info(
+            "Athena gnomAD query %d/%d complete; cumulative rows fetched: %d",
+            chunk_index,
+            total_chunks,
+            len(all_rows),
+        )
+
+    return all_rows
 
 
 def _local_ht_path(cache_dir: Path, version: str) -> Path:
@@ -545,6 +675,72 @@ def load_gnomad_records_for_caids(
     return out
 
 
+def load_gnomad_records_for_caids_athena(
+    caids: set[str],
+    *,
+    database: str,
+    table: str,
+    output_location: str,
+    workgroup: Optional[str] = None,
+    region: Optional[str] = None,
+    max_caids_per_query: int = 16250,
+    poll_seconds: int = 5,
+) -> dict[str, GnomadRecord]:
+    if not caids:
+        return {}
+
+    rows = _load_athena_rows_for_caids(
+        sorted(caids),
+        database=database,
+        table=table,
+        output_location=output_location,
+        workgroup=workgroup,
+        region=region,
+        max_caids_per_query=max_caids_per_query,
+        poll_seconds=poll_seconds,
+    )
+
+    out: dict[str, GnomadRecord] = {}
+    for row in rows:
+        caid = (row.get("caid") or "").strip()
+        if not caid:
+            continue
+        try:
+            ac = int(str(row.get("joint.freq.all.ac") or "0"))
+            an = int(str(row.get("joint.freq.all.an") or "0"))
+        except ValueError:
+            continue
+        if an <= 0:
+            continue
+
+        af = float(ac) / float(an)
+        maf = min(af, 1.0 - af)
+
+        faf95_max_raw = row.get("joint.fafmax.faf95_max")
+        faf95_max: Optional[float]
+        if faf95_max_raw is None or str(faf95_max_raw).strip() == "":
+            faf95_max = None
+        else:
+            try:
+                faf95_max = float(str(faf95_max_raw))
+            except ValueError:
+                faf95_max = None
+
+        faf95_max_ancestry = str(row.get("joint.fafmax.faf95_max_gen_anc") or "")
+
+        out[caid] = GnomadRecord(
+            caid=caid,
+            allele_count=ac,
+            allele_number=an,
+            allele_frequency=af,
+            minor_allele_frequency=maf,
+            faf95_max=faf95_max,
+            faf95_max_ancestry=faf95_max_ancestry,
+        )
+
+    return out
+
+
 def annotate_row(row: dict[str, str], records: dict[str, GnomadRecord], col_prefix: str, dna_col: str) -> dict[str, str]:
     out = {
         f"{col_prefix}.minor_allele_frequency": "",
@@ -555,18 +751,48 @@ def annotate_row(row: dict[str, str], records: dict[str, GnomadRecord], col_pref
         f"{col_prefix}.faf95_max_ancestry": "",
     }
 
-    caids = _split_pipe((row.get(dna_col) or "").strip())
+    caids = _split_pipe_preserve_positions((row.get(dna_col) or "").strip())
+    if not caids:
+        return out
+
+    minor_af_values: list[str] = []
+    af_values: list[str] = []
+    ac_values: list[str] = []
+    an_values: list[str] = []
+    faf95_values: list[str] = []
+    faf95_anc_values: list[str] = []
+
     for caid in caids:
+        if not caid:
+            minor_af_values.append("")
+            af_values.append("")
+            ac_values.append("")
+            an_values.append("")
+            faf95_values.append("")
+            faf95_anc_values.append("")
+            continue
         rec = records.get(caid)
         if rec is None:
+            minor_af_values.append("")
+            af_values.append("")
+            ac_values.append("")
+            an_values.append("")
+            faf95_values.append("")
+            faf95_anc_values.append("")
             continue
-        out[f"{col_prefix}.minor_allele_frequency"] = str(rec.minor_allele_frequency)
-        out[f"{col_prefix}.allele_frequency"] = str(rec.allele_frequency)
-        out[f"{col_prefix}.allele_count"] = str(rec.allele_count)
-        out[f"{col_prefix}.allele_number"] = str(rec.allele_number)
-        out[f"{col_prefix}.faf95_max"] = "" if rec.faf95_max is None else str(rec.faf95_max)
-        out[f"{col_prefix}.faf95_max_ancestry"] = rec.faf95_max_ancestry
-        return out
+        minor_af_values.append(str(rec.minor_allele_frequency))
+        af_values.append(str(rec.allele_frequency))
+        ac_values.append(str(rec.allele_count))
+        an_values.append(str(rec.allele_number))
+        faf95_values.append("" if rec.faf95_max is None else str(rec.faf95_max))
+        faf95_anc_values.append(rec.faf95_max_ancestry)
+
+    out[f"{col_prefix}.minor_allele_frequency"] = "|".join(minor_af_values)
+    out[f"{col_prefix}.allele_frequency"] = "|".join(af_values)
+    out[f"{col_prefix}.allele_count"] = "|".join(ac_values)
+    out[f"{col_prefix}.allele_number"] = "|".join(an_values)
+    out[f"{col_prefix}.faf95_max"] = "|".join(faf95_values)
+    out[f"{col_prefix}.faf95_max_ancestry"] = "|".join(faf95_anc_values)
 
     return out
 
@@ -580,6 +806,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("input_file", help="Input CSV/TSV file")
     p.add_argument("output_file", help="Output CSV/TSV file")
+    p.add_argument(
+        "--execution-mode",
+        choices=["hail", "athena"],
+        default="hail",
+        help="Execution backend for gnomAD lookups (default: hail)",
+    )
     p.add_argument("--gnomad-version", default=GNOMAD_DATA_VERSION, help="gnomAD version label for output columns")
     p.add_argument(
         "--gnomad-namespace",
@@ -595,6 +827,49 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--cache-dir",
         default=os.environ.get("GNOMAD_CACHE_DIR", "/tmp/gnomad_cache"),
         help="Cache dir for local gnomAD Hail table",
+    )
+    p.add_argument(
+        "--athena-database",
+        default=GNOMAD_ATHENA_DB_DEFAULT,
+        help="Athena database containing gnomAD table (used in --execution-mode athena)",
+    )
+    p.add_argument(
+        "--athena-table",
+        default=GNOMAD_ATHENA_TABLE_DEFAULT,
+        help="Athena table containing gnomAD data (default derived from --gnomad-version)",
+    )
+    p.add_argument(
+        "--athena-output-location",
+        default=GNOMAD_ATHENA_OUTPUT_LOCATION_DEFAULT,
+        help="Athena query output S3 location (s3://...)",
+    )
+    p.add_argument(
+        "--athena-workgroup",
+        default=GNOMAD_ATHENA_WORKGROUP_DEFAULT,
+        help="Optional Athena workgroup",
+    )
+    p.add_argument(
+        "--athena-region",
+        default=GNOMAD_ATHENA_REGION_DEFAULT,
+        help="Optional AWS region for Athena client",
+    )
+    p.add_argument(
+        "--athena-max-caids-per-query",
+        type=int,
+        default=16250,
+        help="Maximum CAIDs per Athena IN query batch",
+    )
+    p.add_argument(
+        "--athena-poll-seconds",
+        type=int,
+        default=5,
+        help="Polling interval in seconds for Athena query execution",
+    )
+    p.add_argument(
+        "--athena-row-batch-size",
+        type=int,
+        default=GNOMAD_ATHENA_ROW_BATCH_SIZE_DEFAULT,
+        help="Input rows per Athena lookup/write batch (preserves input row order)",
     )
     p.add_argument(
         "--dna-clingen-allele-id-col",
@@ -661,22 +936,151 @@ def main(argv: Optional[list[str]] = None) -> None:
         logger.error("--limit must be >= 1 when provided, got: %d", args.limit)
         sys.exit(1)
 
+    local_ht: Optional[Path] = None
     cache_dir = Path(args.cache_dir)
-    local_ht = ensure_local_gnomad_ht(
-        cache_dir,
-        version=args.gnomad_version,
-        source_ht_uri=args.gnomad_ht_uri,
-        overwrite=args.refresh_cache,
-        progress_every_seconds=args.cache_progress_every_seconds,
-    )
+    if args.execution_mode == "hail":
+        local_ht = ensure_local_gnomad_ht(
+            cache_dir,
+            version=args.gnomad_version,
+            source_ht_uri=args.gnomad_ht_uri,
+            overwrite=args.refresh_cache,
+            progress_every_seconds=args.cache_progress_every_seconds,
+        )
 
-    if args.download_only:
-        logger.info("Local gnomAD cache ready at %s", local_ht)
-        return
+        if args.download_only:
+            logger.info("Local gnomAD cache ready at %s", local_ht)
+            return
+    else:
+        if args.download_only:
+            logger.error("--download-only is only supported in --execution-mode hail")
+            sys.exit(1)
+        if not args.athena_output_location:
+            logger.error("--athena-output-location (or GNOMAD_ATHENA_OUTPUT_LOCATION env var) is required in athena mode")
+            sys.exit(1)
+        if args.athena_max_caids_per_query < 1:
+            logger.error("--athena-max-caids-per-query must be >= 1, got: %d", args.athena_max_caids_per_query)
+            sys.exit(1)
+        if args.athena_poll_seconds < 1:
+            logger.error("--athena-poll-seconds must be >= 1, got: %d", args.athena_poll_seconds)
+            sys.exit(1)
+        if args.athena_row_batch_size < 1:
+            logger.error("--athena-row-batch-size must be >= 1, got: %d", args.athena_row_batch_size)
+            sys.exit(1)
+        if args.refresh_cache:
+            logger.warning("--refresh-cache is ignored in --execution-mode athena")
 
     delim = "\t" if args.delimiter == "\\t" else args.delimiter
     input_path = Path(args.input_file)
     output_path = Path(args.output_file)
+
+    prefix = f"{args.gnomad_namespace}.{args.gnomad_version.replace('.', '_')}"
+    ann_cols = [
+        f"{prefix}.minor_allele_frequency",
+        f"{prefix}.allele_frequency",
+        f"{prefix}.allele_count",
+        f"{prefix}.allele_number",
+        f"{prefix}.faf95_max",
+        f"{prefix}.faf95_max_ancestry",
+    ]
+
+    if args.execution_mode == "athena":
+        athena_table = args.athena_table or _athena_table_name_from_version(args.gnomad_version)
+        logger.info(
+            "Using Athena backend for gnomAD lookups: database=%s table=%s",
+            args.athena_database,
+            athena_table,
+        )
+
+        looked_up_caids: set[str] = set()
+        record_cache: dict[str, GnomadRecord] = {}
+        selected_rows = 0
+        annotated = 0
+
+        def _process_athena_batch(
+            batch_rows: list[dict[str, str]],
+            writer: csv.DictWriter,
+            out_handle: Any,
+        ) -> tuple[int, int]:
+            if not batch_rows:
+                return 0, 0
+
+            batch_caids: set[str] = set()
+            for row in batch_rows:
+                batch_caids.update(_split_pipe((row.get(args.dna_clingen_allele_id_col) or "").strip()))
+
+            missing_caids = batch_caids - looked_up_caids
+            if missing_caids:
+                logger.info(
+                    "Athena row batch: %d rows, %d unique CAIDs (%d new lookups)",
+                    len(batch_rows),
+                    len(batch_caids),
+                    len(missing_caids),
+                )
+                fetched = load_gnomad_records_for_caids_athena(
+                    missing_caids,
+                    database=args.athena_database,
+                    table=athena_table,
+                    output_location=args.athena_output_location,
+                    workgroup=args.athena_workgroup or None,
+                    region=args.athena_region or None,
+                    max_caids_per_query=args.athena_max_caids_per_query,
+                    poll_seconds=args.athena_poll_seconds,
+                )
+                record_cache.update(fetched)
+                looked_up_caids.update(missing_caids)
+
+            batch_annotated = 0
+            for row in batch_rows:
+                ann = annotate_row(row, record_cache, prefix, args.dna_clingen_allele_id_col)
+                row.update(ann)
+                writer.writerow(row)
+                if ann[f"{prefix}.minor_allele_frequency"].replace("|", "").strip():
+                    batch_annotated += 1
+
+            out_handle.flush()
+            return len(batch_rows), batch_annotated
+
+        with input_path.open("r", encoding="utf-8", newline="") as in_fh, output_path.open(
+            "w", encoding="utf-8", newline=""
+        ) as out_fh:
+            reader = csv.DictReader(in_fh, delimiter=delim)
+            if reader.fieldnames is None:
+                logger.error("Input file appears empty: %s", input_path)
+                sys.exit(1)
+            fieldnames = list(reader.fieldnames)
+            out_fieldnames = fieldnames + [c for c in ann_cols if c not in fieldnames]
+
+            writer = csv.DictWriter(
+                out_fh,
+                fieldnames=out_fieldnames,
+                delimiter=delim,
+                lineterminator="\n",
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+
+            selected_reader = islice(
+                reader,
+                args.skip,
+                None if args.limit is None else args.skip + args.limit,
+            )
+
+            batch_rows: list[dict[str, str]] = []
+            for row in selected_reader:
+                batch_rows.append(row)
+                if len(batch_rows) >= args.athena_row_batch_size:
+                    wrote, batch_annotated = _process_athena_batch(batch_rows, writer, out_fh)
+                    selected_rows += wrote
+                    annotated += batch_annotated
+                    batch_rows = []
+
+            if batch_rows:
+                wrote, batch_annotated = _process_athena_batch(batch_rows, writer, out_fh)
+                selected_rows += wrote
+                annotated += batch_annotated
+
+        logger.info("Done. %d/%d rows annotated -> %s", annotated, selected_rows, output_path)
+        return
 
     with input_path.open("r", encoding="utf-8", newline="") as in_fh:
         reader = csv.DictReader(in_fh, delimiter=delim)
@@ -696,52 +1100,61 @@ def main(argv: Optional[list[str]] = None) -> None:
     for row in rows:
         caids.update(_split_pipe((row.get(args.dna_clingen_allele_id_col) or "").strip()))
 
-    coord_cols = [
-        args.coord_chromosome_col,
-        args.coord_pos_col,
-        args.coord_ref_col,
-        args.coord_alt_col,
-    ]
-    present_coord_cols = [col for col in coord_cols if col in fieldnames]
-    missing_coord_cols = [col for col in coord_cols if col not in fieldnames]
-    coord_cols_present = len(missing_coord_cols) == 0
-    if present_coord_cols and missing_coord_cols:
-        logger.warning(
-            "Only some coordinate columns were found in input. Found: %s. Missing: %s. "
-            "Case-2 coordinate lookup requires all four columns; falling back to case-1/3 lookup.",
-            ", ".join(present_coord_cols),
-            ", ".join(missing_coord_cols),
-        )
-    coord_mapping = (
-        _build_caid_to_gnomad_key(
-            rows,
-            dna_col=args.dna_clingen_allele_id_col,
-            chrom_col=args.coord_chromosome_col,
-            pos_col=args.coord_pos_col,
-            ref_col=args.coord_ref_col,
-            alt_col=args.coord_alt_col,
-        )
-        if coord_cols_present
-        else None
-    )
-
     logger.info("Loading gnomAD records for %d unique CAIDs", len(caids))
-    records = load_gnomad_records_for_caids(
-        local_ht,
-        caids,
-        cache_dir,
-        caid_to_gnomad_key=coord_mapping,
-    )
+    if args.execution_mode == "hail":
+        assert local_ht is not None
+        coord_cols = [
+            args.coord_chromosome_col,
+            args.coord_pos_col,
+            args.coord_ref_col,
+            args.coord_alt_col,
+        ]
+        present_coord_cols = [col for col in coord_cols if col in fieldnames]
+        missing_coord_cols = [col for col in coord_cols if col not in fieldnames]
+        coord_cols_present = len(missing_coord_cols) == 0
+        if present_coord_cols and missing_coord_cols:
+            logger.warning(
+                "Only some coordinate columns were found in input. Found: %s. Missing: %s. "
+                "Case-2 coordinate lookup requires all four columns; falling back to case-1/3 lookup.",
+                ", ".join(present_coord_cols),
+                ", ".join(missing_coord_cols),
+            )
+        coord_mapping = (
+            _build_caid_to_gnomad_key(
+                rows,
+                dna_col=args.dna_clingen_allele_id_col,
+                chrom_col=args.coord_chromosome_col,
+                pos_col=args.coord_pos_col,
+                ref_col=args.coord_ref_col,
+                alt_col=args.coord_alt_col,
+            )
+            if coord_cols_present
+            else None
+        )
 
-    prefix = f"{args.gnomad_namespace}.{args.gnomad_version.replace('.', '_')}"
-    ann_cols = [
-        f"{prefix}.minor_allele_frequency",
-        f"{prefix}.allele_frequency",
-        f"{prefix}.allele_count",
-        f"{prefix}.allele_number",
-        f"{prefix}.faf95_max",
-        f"{prefix}.faf95_max_ancestry",
-    ]
+        records = load_gnomad_records_for_caids(
+            local_ht,
+            caids,
+            cache_dir,
+            caid_to_gnomad_key=coord_mapping,
+        )
+    else:
+        athena_table = args.athena_table or _athena_table_name_from_version(args.gnomad_version)
+        logger.info(
+            "Using Athena backend for gnomAD lookups: database=%s table=%s",
+            args.athena_database,
+            athena_table,
+        )
+        records = load_gnomad_records_for_caids_athena(
+            caids,
+            database=args.athena_database,
+            table=athena_table,
+            output_location=args.athena_output_location,
+            workgroup=args.athena_workgroup or None,
+            region=args.athena_region or None,
+            max_caids_per_query=args.athena_max_caids_per_query,
+            poll_seconds=args.athena_poll_seconds,
+        )
 
     out_fieldnames = fieldnames + [c for c in ann_cols if c not in fieldnames]
     annotated = 0
@@ -752,7 +1165,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             ann = annotate_row(row, records, prefix, args.dna_clingen_allele_id_col)
             row.update(ann)
             writer.writerow(row)
-            if ann[f"{prefix}.minor_allele_frequency"]:
+            if ann[f"{prefix}.minor_allele_frequency"].replace("|", "").strip():
                 annotated += 1
 
     logger.info("Done. %d/%d rows annotated -> %s", annotated, len(rows), output_path)

@@ -326,15 +326,52 @@ src/scripts/run_annotate_gnomad.sh output_clinvar.tsv output_final.tsv \
     --download-only
 ```
 
-**Notes:**
+**Notes (Hail mode):**
 - Requires Java runtime and Hail library (installed via `gnomad` extra)
 - First run downloads the source Hail table from GCP public data; this creates a local indexed cache
 - Subsequent runs reuse the local cache (much faster)
 - Default gnomAD version is `v4.1`; customize with `--gnomad-version` flag
 - Custom table URI: `--gnomad-ht-uri gs://your-bucket/path/to/table.ht`
-- Uses pipe-delimited candidates; tries each in order, returns first gnomAD match
+- Output columns are pipe-delimited and candidate-aligned across all annotation fields
 - Supports custom DNA ID column via `--dna-clingen-allele-id-col` if needed
 - Cache refresh: use `--refresh-cache` flag to re-download the source table
+
+#### Athena execution mode (alternative to Hail)
+
+Use `--execution-mode athena` to query gnomAD via AWS Athena instead of a local Hail cache. This is intended for use in environments where the gnomAD data is already registered as an Athena table — for example, the same parquet-backed gnomAD dataset used by a **MaveDB worker** environment. (See the [MaveDB API documentation](https://github.com/VariantEffect/mavedb-api/wiki/gnomAD-Data-Ingestion).) No local Hail installation or GCP access is required.
+
+The Athena table schema and query structure match the `gnomad_variant_data_for_caids` function in `mavedb-api/src/mavedb/lib/gnomad.py`, which selects `caid`, `joint.freq.all.ac`, `joint.freq.all.an`, `joint.fafmax.faf95_max_gen_anc`, and `joint.fafmax.faf95_max` from the gnomAD parquet table.
+
+**Command:**
+```bash
+src/scripts/run_annotate_gnomad.sh output_clinvar.tsv output_final.tsv \
+    --execution-mode athena \
+    --gnomad-version v4.1 \
+    --athena-output-location s3://your-bucket/athena-query-results/ \
+    --athena-region us-east-1
+```
+
+**Environment variables (can be set in `settings/.env` instead of flags):**
+
+| Variable | Flag | Description |
+|---|---|---|
+| `GNOMAD_ATHENA_DATABASE` | `--athena-database` | Athena database name (default: `gnomad`) |
+| `GNOMAD_ATHENA_TABLE` | `--athena-table` | Table name (default: derived from `--gnomad-version`, e.g. `gnomad_joint_v4_1`) |
+| `GNOMAD_ATHENA_OUTPUT_LOCATION` | `--athena-output-location` | S3 URI for Athena query result storage (**required**) |
+| `GNOMAD_ATHENA_WORKGROUP` | `--athena-workgroup` | Optional Athena workgroup |
+| `GNOMAD_ATHENA_REGION` or `AWS_REGION` | `--athena-region` | AWS region for the Athena client |
+| `GNOMAD_ATHENA_ROW_BATCH_SIZE` | `--athena-row-batch-size` | Input rows processed per Athena query batch (default: 1000) |
+
+**Additional tuning flags:**
+- `--athena-max-caids-per-query N` — maximum number of CAIDs per Athena `IN` clause (default: 16250, matching MaveDB batch size)
+- `--athena-poll-seconds N` — polling interval while waiting for Athena query completion (default: 5)
+
+**Notes (Athena mode):**
+- Requires `boto3` (included in project dependencies via `pyproject.toml`); AWS credentials must be available in the standard boto3 credential chain (environment variables, instance profile, `~/.aws/credentials`, etc.)
+- Input rows are processed in batches; output is written and flushed after each batch, preserving input row order
+- CAID lookups are cached in memory across batches to avoid redundant Athena queries within a single run
+- `--download-only` and `--refresh-cache` flags are ignored in Athena mode (no local cache involved)
+- All six output columns are pipe-delimited and candidate-aligned (same format as Hail mode)
 
 ### Step 7: Annotate with SpliceAI Scores (Optional)
 

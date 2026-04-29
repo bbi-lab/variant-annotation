@@ -16,11 +16,12 @@ classifiers = [
     "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
 ]
 dependencies = [
+    "biopython",
+    "boto3",
     "click",
     "python-dotenv",
-    "requests",
     "redis",
-    "biopython",
+    "requests",
     "variant-translation==1.1.0b1",
 ]
 
