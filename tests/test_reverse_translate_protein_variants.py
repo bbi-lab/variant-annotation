@@ -114,7 +114,7 @@ def test_reverse_translate_adds_error_when_transcript_unresolved(tmp_path, monke
     out_rows = _read_tsv(output_path)
     assert len(out_rows) == 1
     assert "existing" in out_rows[0]["mapping_error"]
-    assert "Unable to resolve transcript accession" in out_rows[0]["mapping_error"]
+    assert "Unable to resolve transcript accession" in out_rows[0]["reverse_translation_error"]
 
 
 def test_derive_joined_hgvs_fields_tracks_intronic_and_spans(monkeypatch):

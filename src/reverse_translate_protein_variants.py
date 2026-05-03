@@ -360,7 +360,7 @@ def reverse_translate_protein_variants(
     mapped_hgvs_g_col: str = "mapped_hgvs_g",
     mapped_hgvs_c_col: str = "mapped_hgvs_c",
     mapped_hgvs_p_col: str = "mapped_hgvs_p",
-    mapping_error_col: str = "mapping_error",
+    reverse_translation_error_col: str = "reverse_translation_error",
     assayed_variant_level_col: str = "assayed_variant_level",
     mapped_hgvs_g_start_col: str = "mapped_hgvs_g_start",
     mapped_hgvs_g_stop_col: str = "mapped_hgvs_g_stop",
@@ -484,8 +484,8 @@ def reverse_translate_protein_variants(
 
         for offset, row in enumerate(block_rows):
             if block_errors[offset]:
-                row[mapping_error_col] = _append_error(
-                    row.get(mapping_error_col, ""),
+                row[reverse_translation_error_col] = _append_error(
+                    row.get(reverse_translation_error_col, ""),
                     block_errors[offset],
                 )
             _populate_derived_hgvs_columns(
@@ -521,7 +521,6 @@ def reverse_translate_protein_variants(
                 mapped_hgvs_g_col,
                 mapped_hgvs_c_col,
                 mapped_hgvs_p_col,
-                mapping_error_col,
                 assayed_variant_level_col,
                 mapped_hgvs_g_start_col,
                 mapped_hgvs_g_stop_col,
@@ -533,6 +532,7 @@ def reverse_translate_protein_variants(
                 mapped_hgvs_c_alt_col,
                 touches_intronic_region_col,
                 spans_intron_col,
+                reverse_translation_error_col,
             ):
                 if col not in out_fieldnames:
                     out_fieldnames.append(col)
@@ -628,7 +628,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mapped-hgvs-g", dest="mapped_hgvs_g_col", default="mapped_hgvs_g")
     parser.add_argument("--mapped-hgvs-c", dest="mapped_hgvs_c_col", default="mapped_hgvs_c")
     parser.add_argument("--mapped-hgvs-p", dest="mapped_hgvs_p_col", default="mapped_hgvs_p")
-    parser.add_argument("--mapping-error", dest="mapping_error_col", default="mapping_error")
+    parser.add_argument("--reverse-translation-error", dest="reverse_translation_error_col", default="reverse_translation_error")
     parser.add_argument(
         "--assayed-variant-level",
         dest="assayed_variant_level_col",
@@ -699,7 +699,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         mapped_hgvs_g_col=args.mapped_hgvs_g_col,
         mapped_hgvs_c_col=args.mapped_hgvs_c_col,
         mapped_hgvs_p_col=args.mapped_hgvs_p_col,
-        mapping_error_col=args.mapping_error_col,
+        reverse_translation_error_col=args.reverse_translation_error_col,
         assayed_variant_level_col=args.assayed_variant_level_col,
         mapped_hgvs_g_start_col=args.mapped_hgvs_g_start_col,
         mapped_hgvs_g_stop_col=args.mapped_hgvs_g_stop_col,
