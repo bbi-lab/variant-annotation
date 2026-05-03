@@ -32,7 +32,7 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 import psycopg2  # type: ignore[import-untyped]
-from src.add_vcf_identifiers import _parse_hgvs
+from src.add_vcf_identifiers import _parse_hgvs, _reverse_complement
 
 load_dotenv()
 
@@ -270,10 +270,10 @@ def _derive_joined_hgvs_fields(
     joined_hgvs: str,
     *,
     resolve_missing_ref_alleles: bool,
-) -> tuple[str, str, str, str, str, str]:
+) -> tuple[str, str, str, str, str, str, str]:
     candidates = _split_hgvs_candidates(joined_hgvs)
     if not candidates:
-        return "", "", "", "", "", ""
+        return "", "", "", "", "", "", ""
 
     starts: list[str] = []
     stops: list[str] = []
@@ -281,6 +281,7 @@ def _derive_joined_hgvs_fields(
     alts: list[str] = []
     touches_intronic: list[str] = []
     spans_intron: list[str] = []
+    chromosomes: list[str] = []
 
     for candidate in candidates:
         if not candidate:
@@ -290,18 +291,22 @@ def _derive_joined_hgvs_fields(
             alts.append("")
             touches_intronic.append("")
             spans_intron.append("")
+            chromosomes.append("")
             continue
 
-        start, stop, ref, alt, touches_intronic_region, spans_intronic_region = _parse_hgvs(
+        start, stop, ref, alt, touches_intronic_region, spans_intronic_region, chromosome = _parse_hgvs(
             candidate,
             resolve_missing_ref_alleles=resolve_missing_ref_alleles,
         )
         starts.append(start or "")
         stops.append(stop or "")
         refs.append(ref or "")
+        if alt == "inv" and ref:
+            alt = _reverse_complement(ref)
         alts.append(alt or "")
         touches_intronic.append("true" if touches_intronic_region else "false")
         spans_intron.append("true" if spans_intronic_region else "false")
+        chromosomes.append(chromosome or "")
 
     return (
         "|".join(starts),
@@ -310,6 +315,7 @@ def _derive_joined_hgvs_fields(
         "|".join(alts),
         "|".join(touches_intronic),
         "|".join(spans_intron),
+        "|".join(chromosomes),
     )
 
 
@@ -318,6 +324,8 @@ def _populate_derived_hgvs_columns(
     *,
     mapped_hgvs_g_col: str,
     mapped_hgvs_c_col: str,
+    mapped_hgvs_g_chromosome_col: str,
+    mapped_hgvs_c_chromosome_col: str,
     mapped_hgvs_g_start_col: str,
     mapped_hgvs_g_stop_col: str,
     mapped_hgvs_g_ref_col: str,
@@ -330,20 +338,22 @@ def _populate_derived_hgvs_columns(
     spans_intron_col: str,
     resolve_missing_ref_alleles: bool,
 ) -> None:
-    g_start, g_stop, g_ref, g_alt, _, _ = _derive_joined_hgvs_fields(
+    g_start, g_stop, g_ref, g_alt, _, _, g_chromosome = _derive_joined_hgvs_fields(
         row.get(mapped_hgvs_g_col, ""),
         resolve_missing_ref_alleles=resolve_missing_ref_alleles,
     )
-    c_start, c_stop, c_ref, c_alt, touches_intronic_region, spans_intron = _derive_joined_hgvs_fields(
+    c_start, c_stop, c_ref, c_alt, touches_intronic_region, spans_intron, c_chromosome = _derive_joined_hgvs_fields(
         row.get(mapped_hgvs_c_col, ""),
         resolve_missing_ref_alleles=resolve_missing_ref_alleles,
     )
 
+    row[mapped_hgvs_g_chromosome_col] = g_chromosome
     row[mapped_hgvs_g_start_col] = g_start
     row[mapped_hgvs_g_stop_col] = g_stop
     row[mapped_hgvs_g_ref_col] = g_ref
     row[mapped_hgvs_g_alt_col] = g_alt
 
+    row[mapped_hgvs_c_chromosome_col] = c_chromosome
     row[mapped_hgvs_c_start_col] = c_start
     row[mapped_hgvs_c_stop_col] = c_stop
     row[mapped_hgvs_c_ref_col] = c_ref
@@ -362,6 +372,8 @@ def reverse_translate_protein_variants(
     mapped_hgvs_p_col: str = "mapped_hgvs_p",
     reverse_translation_error_col: str = "reverse_translation_error",
     assayed_variant_level_col: str = "assayed_variant_level",
+    mapped_hgvs_g_chromosome_col: str = "mapped_hgvs_g_chromosome",
+    mapped_hgvs_c_chromosome_col: str = "mapped_hgvs_c_chromosome",
     mapped_hgvs_g_start_col: str = "mapped_hgvs_g_start",
     mapped_hgvs_g_stop_col: str = "mapped_hgvs_g_stop",
     mapped_hgvs_g_ref_col: str = "mapped_hgvs_g_ref",
@@ -492,6 +504,8 @@ def reverse_translate_protein_variants(
                 row,
                 mapped_hgvs_g_col=mapped_hgvs_g_col,
                 mapped_hgvs_c_col=mapped_hgvs_c_col,
+                mapped_hgvs_g_chromosome_col=mapped_hgvs_g_chromosome_col,
+                mapped_hgvs_c_chromosome_col=mapped_hgvs_c_chromosome_col,
                 mapped_hgvs_g_start_col=mapped_hgvs_g_start_col,
                 mapped_hgvs_g_stop_col=mapped_hgvs_g_stop_col,
                 mapped_hgvs_g_ref_col=mapped_hgvs_g_ref_col,
@@ -522,6 +536,8 @@ def reverse_translate_protein_variants(
                 mapped_hgvs_c_col,
                 mapped_hgvs_p_col,
                 assayed_variant_level_col,
+                mapped_hgvs_g_chromosome_col,
+                mapped_hgvs_c_chromosome_col,
                 mapped_hgvs_g_start_col,
                 mapped_hgvs_g_stop_col,
                 mapped_hgvs_g_ref_col,
@@ -579,6 +595,8 @@ def reverse_translate_protein_variants(
                         row,
                         mapped_hgvs_g_col=mapped_hgvs_g_col,
                         mapped_hgvs_c_col=mapped_hgvs_c_col,
+                        mapped_hgvs_g_chromosome_col=mapped_hgvs_g_chromosome_col,
+                        mapped_hgvs_c_chromosome_col=mapped_hgvs_c_chromosome_col,
                         mapped_hgvs_g_start_col=mapped_hgvs_g_start_col,
                         mapped_hgvs_g_stop_col=mapped_hgvs_g_stop_col,
                         mapped_hgvs_g_ref_col=mapped_hgvs_g_ref_col,
@@ -635,6 +653,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default="assayed_variant_level",
         help="Output column name distinguishing dna vs protein assay level.",
     )
+    parser.add_argument("--mapped-hgvs-g-chromosome", dest="mapped_hgvs_g_chromosome_col", default="mapped_hgvs_g_chromosome")
+    parser.add_argument("--mapped-hgvs-c-chromosome", dest="mapped_hgvs_c_chromosome_col", default="mapped_hgvs_c_chromosome")
     parser.add_argument("--mapped-hgvs-g-start", dest="mapped_hgvs_g_start_col", default="mapped_hgvs_g_start")
     parser.add_argument("--mapped-hgvs-g-stop", dest="mapped_hgvs_g_stop_col", default="mapped_hgvs_g_stop")
     parser.add_argument("--mapped-hgvs-g-ref", dest="mapped_hgvs_g_ref_col", default="mapped_hgvs_g_ref")
@@ -701,6 +721,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         mapped_hgvs_p_col=args.mapped_hgvs_p_col,
         reverse_translation_error_col=args.reverse_translation_error_col,
         assayed_variant_level_col=args.assayed_variant_level_col,
+        mapped_hgvs_g_chromosome_col=args.mapped_hgvs_g_chromosome_col,
+        mapped_hgvs_c_chromosome_col=args.mapped_hgvs_c_chromosome_col,
         mapped_hgvs_g_start_col=args.mapped_hgvs_g_start_col,
         mapped_hgvs_g_stop_col=args.mapped_hgvs_g_stop_col,
         mapped_hgvs_g_ref_col=args.mapped_hgvs_g_ref_col,

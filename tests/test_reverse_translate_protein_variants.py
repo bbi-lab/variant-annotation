@@ -118,16 +118,17 @@ def test_reverse_translate_adds_error_when_transcript_unresolved(tmp_path, monke
 
 
 def test_derive_joined_hgvs_fields_tracks_intronic_and_spans(monkeypatch):
+
     # Simulate parser behavior for an intron-spanning del and a standard substitution.
     def fake_parse_hgvs(candidate, resolve_missing_ref_alleles=True):
         if "76+1_77-1del" in candidate:
-            return ("76+1", "77-1", "AG", "", True, True)
-        return ("90", "90", "A", "G", False, False)
+            return ("76+1", "77-1", "AG", "", True, True, "1")
+        return ("90", "90", "A", "G", False, False, "1")
 
     monkeypatch.setattr(rtpv, "_parse_hgvs", fake_parse_hgvs)
 
     joined = "NM_000001.1:c.76+1_77-1del|NM_000001.1:c.90A>G"
-    start, stop, ref, alt, touches_intronic, spans_intron = rtpv._derive_joined_hgvs_fields(
+    start, stop, ref, alt, touches_intronic, spans_intron, chromosome = rtpv._derive_joined_hgvs_fields(
         joined,
         resolve_missing_ref_alleles=True,
     )
@@ -138,6 +139,7 @@ def test_derive_joined_hgvs_fields_tracks_intronic_and_spans(monkeypatch):
     assert alt == "|G"
     assert touches_intronic == "true|false"
     assert spans_intron == "true|false"
+    assert chromosome == "1|1"
 
 
 def test_build_parser_defaults_and_flags():
