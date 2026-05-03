@@ -1,7 +1,11 @@
+x-tools-image: &tools-image
+  build: .
+  image: variant-annotation-tools:local
+  platform: linux/amd64
+
 services:
   map-variants:
-    build: .
-    platform: linux/amd64
+    <<: *tools-image
     profiles:
       - tools
     depends_on:
@@ -23,8 +27,7 @@ services:
       - ${VARIANT_DATA_DIR:-./data}:/work
 
   reverse-translate-proteins:
-    build: .
-    platform: linux/amd64
+    <<: *tools-image
     profiles:
       - tools
     depends_on:
@@ -40,8 +43,7 @@ services:
       - ${VARIANT_DATA_DIR:-./data}:/work
 
   annotate-clinvar:
-    build: .
-    platform: linux/amd64
+    <<: *tools-image
     profiles:
       - tools
     depends_on:
@@ -58,8 +60,7 @@ services:
       - ${VARIANT_DATA_DIR:-./data}:/work
 
   annotate-gnomad:
-    build: .
-    platform: linux/amd64
+    <<: *tools-image
     profiles:
       - tools
     env_file:
@@ -74,8 +75,7 @@ services:
       - ${VARIANT_DATA_DIR:-./data}:/work
 
   annotate-spliceai:
-    build: .
-    platform: linux/amd64
+    <<: *tools-image
     profiles:
       - tools
     env_file:
@@ -92,8 +92,7 @@ services:
       - ${VARIANT_DATA_DIR:-./data}:/work
 
   flatten-dna-variants:
-    build: .
-    platform: linux/amd64
+    <<: *tools-image
     profiles:
       - tools
     env_file:
@@ -105,8 +104,7 @@ services:
       - ${VARIANT_DATA_DIR:-./data}:/work
 
   utilities:
-    build: .
-    platform: linux/amd64
+    <<: *tools-image
     profiles:
       - tools
     env_file:
