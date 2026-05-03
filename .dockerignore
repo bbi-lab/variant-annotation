@@ -1,0 +1,32 @@
+.git
+.gitignore
+
+# Local environments and editor artifacts
+.venv
+.pytest_cache
+.mypy_cache
+__pycache__
+*.pyc
+.DS_Store
+
+# Build and package artifacts
+*.egg-info
+dist
+build
+
+# Runtime logs
+*.log
+
+# Large local datasets and caches are mounted at runtime, not baked into image
+data
+clinvar_cache
+gnomad_cache
+
+# Large SpliceAI resources should be mounted from host, never copied in image
+spliceai_scores.masked.snv.hg38.vcf.gz
+spliceai_scores.masked.snv.hg38.vcf.gz.tbi
+spliceai_scores.masked.indel.hg38.vcf.gz
+spliceai_scores.masked.indel.hg38.vcf.gz.tbi
+
+# Nested project data not needed in this image build
+mavedb-api
