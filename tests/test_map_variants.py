@@ -1,4 +1,5 @@
 import csv
+import asyncio
 
 import pytest
 
@@ -19,6 +20,37 @@ def _write_tsv(path, rows):
 def _read_tsv(path):
     with open(path, newline="", encoding="utf-8") as fh:
         return list(csv.DictReader(fh, delimiter="\t"))
+
+
+def test_normalize_case2_haplotype_to_delins_success(monkeypatch):
+    async def fake_run_pipeline(group_name, target_sequence, row_entries, dcd, allow_row_fallback=True, precomputed_align_result=None, precomputed_transcript=None):
+        # Component mapping call from haplotype normalization helper.
+        assert group_name.endswith("#haplotype-components")
+        assert target_sequence == "ATGCC"
+        return [(0, "NC_1", ""), (1, "NC_2", "")], "NM_000001.1"
+
+    def fake_query_clingen(hgvs):
+        if hgvs == "NC_1":
+            return {"c": "NM_000001.1:c.1A>G"}
+        if hgvs == "NC_2":
+            return {"c": "NM_000001.1:c.3G>T"}
+        return None
+
+    monkeypatch.setattr(mv, "_run_dcd_mapping_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs", fake_query_clingen)
+    monkeypatch.setattr(mv, "_extract_hgvs_from_clingen", lambda data, tx: (None, data.get("c"), None))
+
+    normalized, error = asyncio.run(
+        mv._normalize_case2_haplotype_to_delins(
+            raw_hgvs_nt="c.[1A>G;3G>T]",
+            target_sequence="ATGCC",
+            row_label="row-1",
+            dcd={},
+        )
+    )
+
+    assert error is None
+    assert normalized == "c.1_3delinsGTT"
 
 
 def test_map_variants_default_preserves_input_order(tmp_path, monkeypatch):

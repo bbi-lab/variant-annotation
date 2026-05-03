@@ -176,6 +176,14 @@ _HGVS_P_1LETTER_RE = re.compile(
     r"(?P<suffix>.*)$"
 )
 
+# Matches bare c.-haplotype expressions for case-2 rows, for example
+# ``c.[1A>G;3G>T]``.
+_CASE2_C_HAPLOTYPE_RE = re.compile(r"^c\.\[(?P<body>[^\]]+)\]$")
+_CASE2_C_SUB_RE = re.compile(r"^(?P<coord>\d+)(?P<ref>[ACGTN])>(?P<alt>[ACGTN])$")
+_MAPPED_C_SUB_RE = re.compile(
+    r"^(?:(?P<accession>[^:]+):)?c\.(?P<coord>\d+)(?P<ref>[ACGTN])>(?P<alt>[ACGTN])$"
+)
+
 
 def normalize_protein_hgvs(hgvs: str) -> str:
     """Convert a protein HGVS string from 1-letter to 3-letter amino acid codes.
@@ -248,6 +256,149 @@ def _detect_case(raw_nt: Optional[str], raw_pro: Optional[str]) -> Optional[int]
     if not _is_blank(raw_pro_text):
         return 3
     return None
+
+
+def _parse_case2_haplotype_components(raw_hgvs_nt: str) -> Optional[list[str]]:
+    """Parse a bare case-2 c.-haplotype into component substitutions.
+
+    Returns a list like ["1A>G", "3G>T"] for inputs like ``c.[1A>G;3G>T]``.
+    Returns None when the row is not a supported c.-haplotype expression.
+    """
+    text = (raw_hgvs_nt or "").strip()
+    if ";" not in text:
+        return None
+    m = _CASE2_C_HAPLOTYPE_RE.match(text)
+    if m is None:
+        return None
+    body = m.group("body")
+    components = [part.strip() for part in body.split(";") if part.strip()]
+    if len(components) < 2:
+        return None
+    return components
+
+
+def _parse_case2_component_substitution(component: str) -> Optional[tuple[int, str, str]]:
+    """Parse a simple coding substitution component (for example ``123A>G``).
+
+    Intronic/UTR coordinates such as ``76+1G>A``, ``*12A>G``, ``-3A>G`` are
+    intentionally rejected.
+    """
+    m = _CASE2_C_SUB_RE.match((component or "").strip().upper())
+    if m is None:
+        return None
+    return int(m.group("coord")), m.group("ref"), m.group("alt")
+
+
+def _parse_mapped_c_substitution(mapped_hgvs_c: str) -> Optional[tuple[int, str, str]]:
+    """Parse mapped transcript HGVS of the form ``NM_...:c.123A>G`` or ``c.123A>G``."""
+    m = _MAPPED_C_SUB_RE.match((mapped_hgvs_c or "").strip())
+    if m is None:
+        return None
+    return int(m.group("coord")), m.group("ref").upper(), m.group("alt").upper()
+
+
+def _compose_intra_codon_delins(
+    parsed_subs: list[tuple[int, str, str]],
+    target_sequence: str,
+) -> Optional[str]:
+    """Build a delins HGVS if all substitutions are within one codon."""
+    if len(parsed_subs) < 2:
+        return None
+    codons = {(coord - 1) // 3 for coord, _, _ in parsed_subs}
+    if len(codons) != 1:
+        return None
+
+    by_pos = {coord: (ref, alt) for coord, ref, alt in parsed_subs}
+    start = min(by_pos)
+    end = max(by_pos)
+
+    seq = (target_sequence or "").strip().upper()
+    if not seq:
+        return None
+
+    alt_parts: list[str] = []
+    ref_parts: list[str] = []
+    for pos in range(start, end + 1):
+        if pos in by_pos:
+            ref_base, alt_base = by_pos[pos]
+        else:
+            if pos > len(seq):
+                return None
+            ref_base = seq[pos - 1]
+            alt_base = ref_base
+            if ref_base not in {"A", "C", "G", "T", "N"}:
+                return None
+        ref_parts.append(ref_base)
+        alt_parts.append(alt_base)
+
+    ref_seq = "".join(ref_parts)
+    alt_seq = "".join(alt_parts)
+    if ref_seq == alt_seq:
+        return None
+    return f"c.{start}_{end}delins{alt_seq}" if start != end else f"c.{start}delins{alt_seq}"
+
+
+async def _normalize_case2_haplotype_to_delins(
+    raw_hgvs_nt: str,
+    target_sequence: str,
+    row_label: str,
+    dcd: dict,
+    precomputed_align_result=None,
+    precomputed_transcript=None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Normalize supported case-2 intra-codon haplotypes to c.-delins notation.
+
+    Returns ``(normalized_hgvs_nt, error)``. ``normalized_hgvs_nt`` is None when
+    the row is not a supported candidate for normalization.
+
+    When *precomputed_align_result* and *precomputed_transcript* are provided
+    (already computed by the enclosing pipeline run), BLAT alignment and
+    transcript selection are skipped for the component mapping calls.
+    """
+    components = _parse_case2_haplotype_components(raw_hgvs_nt)
+    if components is None:
+        return None, None
+
+    parsed_components = [_parse_case2_component_substitution(c) for c in components]
+    if any(p is None for p in parsed_components):
+        return None, None
+
+    row_entries = [(idx, f"c.{comp}", "", 2) for idx, comp in enumerate(components)]
+    per_component, transcript_nm = await _run_dcd_mapping_pipeline(
+        group_name=f"{row_label}#haplotype-components",
+        target_sequence=target_sequence,
+        row_entries=row_entries,
+        dcd=dcd,
+        allow_row_fallback=False,
+        precomputed_align_result=precomputed_align_result,
+        precomputed_transcript=precomputed_transcript,
+    )
+
+    assay_by_idx: dict[int, str] = {}
+    for idx, hgvs_assay, error in per_component:
+        if error:
+            return None, f"Haplotype component mapping failed: {error}"
+        if not hgvs_assay:
+            return None, "Haplotype component mapping produced no HGVS"
+        assay_by_idx[idx] = hgvs_assay
+
+    mapped_subs: list[tuple[int, str, str]] = []
+    for idx in range(len(components)):
+        data = _query_clingen_by_hgvs(assay_by_idx[idx])
+        if data is None:
+            return None, f"ClinGen returned no data for {assay_by_idx[idx]!r}"
+        _, hgvs_c, _ = _extract_hgvs_from_clingen(data, transcript_nm)
+        if not hgvs_c:
+            return None, f"No mapped transcript HGVS for {assay_by_idx[idx]!r}"
+        parsed = _parse_mapped_c_substitution(hgvs_c)
+        if parsed is None:
+            return None, f"Unsupported mapped transcript HGVS for haplotype component: {hgvs_c!r}"
+        mapped_subs.append(parsed)
+
+    normalized = _compose_intra_codon_delins(mapped_subs, target_sequence=target_sequence)
+    if not normalized:
+        return None, None
+    return normalized, None
 
 
 def _load_targets_file(
@@ -855,6 +1006,8 @@ async def _run_dcd_mapping_pipeline(
     row_entries: list[tuple[int, str, str, int]],
     dcd: dict,
     allow_row_fallback: bool = True,
+    precomputed_align_result=None,
+    precomputed_transcript=None,
 ) -> tuple[list[tuple[int, Optional[str], str]], Optional[str]]:
     """Run the full dcd_mapping pipeline for one group of rows sharing a target sequence.
 
@@ -921,63 +1074,68 @@ async def _run_dcd_mapping_pipeline(
 
     records = {group_name: score_rows}
 
-    logger.info("Aligning target sequence for group %r (%d rows).", group_name, len(row_entries))
-    try:
-        alignment_results = build_alignment_result(metadata, silent=True)
-    except Exception as exc:
-        logger.error("BLAT alignment failed for group %r: %s", group_name, _format_exc(exc))
-        logger.debug("BLAT alignment failure details:", exc_info=True)
-        return _fail_all(f"BLAT alignment failed: {_format_exc(exc)}")
-
-    logger.info("Selecting transcripts for group %r.", group_name)
-    try:
-        transcripts = await select_transcripts(metadata, records, alignment_results)
-    except Exception as exc:
-        logger.error(
-            "Transcript selection failed for group %r: %s",
-            group_name,
-            _format_exc(exc),
-        )
-        logger.debug("Transcript selection full-group failure details:", exc_info=True)
-
-        # Retry transcript selection with a single representative row. Some
-        # dcd_mapping paths can fail on large record sets even when one-row
-        # selection succeeds and can be reused for the full group.
+    if precomputed_align_result is not None and precomputed_transcript is not None:
+        logger.debug("Reusing precomputed alignment and transcript for group %r.", group_name)
+        alignment_results = {group_name: precomputed_align_result}
+        transcripts = {group_name: precomputed_transcript}
+    else:
+        logger.info("Aligning target sequence for group %r (%d rows).", group_name, len(row_entries))
         try:
-            representative_records = {group_name: score_rows[:1]}
-            transcripts = await select_transcripts(metadata, representative_records, alignment_results)
-            logger.info(
-                "Transcript selection retry (single representative row) succeeded for group %r.",
-                group_name,
-            )
-        except Exception as retry_exc:
+            alignment_results = build_alignment_result(metadata, silent=True)
+        except Exception as exc:
+            logger.error("BLAT alignment failed for group %r: %s", group_name, _format_exc(exc))
+            logger.debug("BLAT alignment failure details:", exc_info=True)
+            return _fail_all(f"BLAT alignment failed: {_format_exc(exc)}")
+
+        logger.info("Selecting transcripts for group %r.", group_name)
+        try:
+            transcripts = await select_transcripts(metadata, records, alignment_results)
+        except Exception as exc:
             logger.error(
-                "Transcript selection retry failed for group %r: %s",
+                "Transcript selection failed for group %r: %s",
                 group_name,
-                _format_exc(retry_exc),
+                _format_exc(exc),
             )
-            logger.debug("Transcript selection retry failure details:", exc_info=True)
-            if allow_row_fallback and len(row_entries) > 1:
-                logger.warning(
-                    "Falling back to per-row mapping for group %r after transcript selection failure.",
+            logger.debug("Transcript selection full-group failure details:", exc_info=True)
+
+            # Retry transcript selection with a single representative row. Some
+            # dcd_mapping paths can fail on large record sets even when one-row
+            # selection succeeds and can be reused for the full group.
+            try:
+                representative_records = {group_name: score_rows[:1]}
+                transcripts = await select_transcripts(metadata, representative_records, alignment_results)
+                logger.info(
+                    "Transcript selection retry (single representative row) succeeded for group %r.",
                     group_name,
                 )
-                merged_results: list[tuple[int, Optional[str], str]] = []
-                selected_transcript_nm: Optional[str] = None
-                for orig_idx, hgvs_nt, hgvs_pro, case in row_entries:
-                    one_row_results, one_tx_nm = await _run_dcd_mapping_pipeline(
-                        group_name=f"{group_name}#row{orig_idx}",
-                        target_sequence=target_sequence,
-                        row_entries=[(orig_idx, hgvs_nt, hgvs_pro, case)],
-                        dcd=dcd,
-                        allow_row_fallback=False,
+            except Exception as retry_exc:
+                logger.error(
+                    "Transcript selection retry failed for group %r: %s",
+                    group_name,
+                    _format_exc(retry_exc),
+                )
+                logger.debug("Transcript selection retry failure details:", exc_info=True)
+                if allow_row_fallback and len(row_entries) > 1:
+                    logger.warning(
+                        "Falling back to per-row mapping for group %r after transcript selection failure.",
+                        group_name,
                     )
-                    merged_results.extend(one_row_results)
-                    if selected_transcript_nm is None and one_tx_nm is not None:
-                        selected_transcript_nm = one_tx_nm
-                return merged_results, selected_transcript_nm
+                    merged_results: list[tuple[int, Optional[str], str]] = []
+                    selected_transcript_nm: Optional[str] = None
+                    for orig_idx, hgvs_nt, hgvs_pro, case in row_entries:
+                        one_row_results, one_tx_nm = await _run_dcd_mapping_pipeline(
+                            group_name=f"{group_name}#row{orig_idx}",
+                            target_sequence=target_sequence,
+                            row_entries=[(orig_idx, hgvs_nt, hgvs_pro, case)],
+                            dcd=dcd,
+                            allow_row_fallback=False,
+                        )
+                        merged_results.extend(one_row_results)
+                        if selected_transcript_nm is None and one_tx_nm is not None:
+                            selected_transcript_nm = one_tx_nm
+                    return merged_results, selected_transcript_nm
 
-            return _fail_all(f"Transcript selection failed: {_format_exc(retry_exc)}")
+                return _fail_all(f"Transcript selection failed: {_format_exc(retry_exc)}")
 
     transcript = transcripts.get(group_name)
     transcript_nm: Optional[str] = None
@@ -1013,6 +1171,8 @@ async def _run_dcd_mapping_pipeline(
     for ann in annotated:
         ann_by_accession[ann.mavedb_id].append(ann)
 
+    row_entry_by_idx = {orig_idx: (hgvs_nt, hgvs_pro, case) for orig_idx, hgvs_nt, hgvs_pro, case in row_entries}
+
     per_row: list[tuple[int, Optional[str], str]] = []
     for orig_idx, _, _, _ in row_entries:
         ann_list = ann_by_accession.get(str(orig_idx), [])
@@ -1024,6 +1184,52 @@ async def _run_dcd_mapping_pipeline(
             per_row.append((orig_idx, None, ann.error_message))
             continue
         hgvs_assay = _hgvs_from_annotation(ann)
+
+        # Fallback for unsupported multi-variant DNA haplotypes: if dcd_mapping
+        # produced no assay-level HGVS for a case-2 row, try rewriting supported
+        # intra-codon c.-haplotypes to a delins expression and remap.
+        if hgvs_assay is None:
+            row_hgvs_nt, row_hgvs_pro, row_case = row_entry_by_idx.get(orig_idx, ("", "", 0))
+            if row_case == 2:
+                normalized_hgvs_nt, norm_error = await _normalize_case2_haplotype_to_delins(
+                    raw_hgvs_nt=row_hgvs_nt,
+                    target_sequence=target_sequence,
+                    row_label=f"{group_name}#row{orig_idx}",
+                    dcd=dcd,
+                    precomputed_align_result=align_result,
+                    precomputed_transcript=transcript,
+                )
+                if normalized_hgvs_nt and normalized_hgvs_nt != (row_hgvs_nt or "").strip():
+                    logger.info(
+                        "Row %s: normalized unsupported DNA haplotype %r -> %r and retrying mapping.",
+                        orig_idx,
+                        row_hgvs_nt,
+                        normalized_hgvs_nt,
+                    )
+                    retry_rows, _ = await _run_dcd_mapping_pipeline(
+                        group_name=f"{group_name}#haplotype-normalized-row{orig_idx}",
+                        target_sequence=target_sequence,
+                        row_entries=[(orig_idx, normalized_hgvs_nt, row_hgvs_pro, row_case)],
+                        dcd=dcd,
+                        allow_row_fallback=False,
+                        precomputed_align_result=align_result,
+                        precomputed_transcript=transcript,
+                    )
+                    if retry_rows:
+                        retry_idx, retry_hgvs_assay, retry_error = retry_rows[0]
+                        if retry_error:
+                            per_row.append((retry_idx, None, retry_error))
+                            continue
+                        if retry_hgvs_assay:
+                            per_row.append((retry_idx, retry_hgvs_assay, ""))
+                            continue
+                    if norm_error:
+                        per_row.append((orig_idx, None, norm_error))
+                        continue
+                elif norm_error:
+                    per_row.append((orig_idx, None, norm_error))
+                    continue
+
         per_row.append((orig_idx, hgvs_assay, ""))
 
     return per_row, transcript_nm
