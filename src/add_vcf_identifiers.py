@@ -63,9 +63,9 @@ _ACCESSION_TO_CHROMOSOME = {
 
 class _HgvsRefResolver:
     def __init__(self) -> None:
-        import hgvs.dataproviders.uta  # type: ignore[import-not-found]
-        import hgvs.normalizer  # type: ignore[import-not-found]
-        import hgvs.parser  # type: ignore[import-not-found]
+        import hgvs.dataproviders.uta  # type: ignore[import-untyped]
+        import hgvs.normalizer  # type: ignore[import-untyped]
+        import hgvs.parser  # type: ignore[import-untyped]
 
         uta_db_url = (os.environ.get("UTA_DB_URL") or "").strip()
         if not uta_db_url:
@@ -212,17 +212,17 @@ def _normalize_protein_allele(allele: Optional[str], is_ref: bool, ref_aa: Optio
     # Handle range deletions like "Ala_Arg"
     if "_" in allele:
         parts = allele.split("_")
-        converted = [_aa_3to1(p) for p in parts]
-        result = "_".join(converted)
+        converted_parts = [_aa_3to1(p) for p in parts]
+        result = "_".join(converted_parts)
         # If this is a deletion (no ref/alt in range form), use "-"
         return result if not is_ref else result
     
     # Single amino acid
-    converted = _aa_3to1(allele)
+    converted_allele = _aa_3to1(allele)
     
     # For synonymous variants: if ref and alt are the same, repeat the amino acid
     # This will only apply to single-position variants where ref_aa == converted
-    return converted
+    return converted_allele
 
 
 def _parse_nucleotide_hgvs(hgvs_body: str) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
