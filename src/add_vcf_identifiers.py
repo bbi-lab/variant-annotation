@@ -193,6 +193,11 @@ def _aa_3to1(aa_3letter: str) -> str:
     return aa_3letter.upper()
 
 
+def _reverse_complement(seq: str) -> str:
+    complement_table = str.maketrans("ACGTacgtNn", "TGCAtgcaNn")
+    return seq.translate(complement_table)[::-1]
+
+
 def _normalize_protein_allele(allele: Optional[str], is_ref: bool, ref_aa: Optional[str]) -> Optional[str]:
     """Convert protein allele to 1-letter codes.
     
@@ -440,6 +445,8 @@ def _annotate_row(
             starts.append("" if start is None else start)
             stops.append("" if stop is None else stop)
             refs.append("" if ref is None else ref)
+            if alt == "inv" and ref:
+                alt = _reverse_complement(ref)
             alts.append("" if alt is None else alt)
 
         row[f"{base_col}_chromosome"] = "|".join(chromosomes)
