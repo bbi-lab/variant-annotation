@@ -737,7 +737,10 @@ def _process_case1(
     original_accession = raw[:colon_pos]
     if dcd is not None:
         fetch_clingen_genomic_hgvs = dcd["fetch_clingen_genomic_hgvs"]
-        assay_level_hgvs = fetch_clingen_genomic_hgvs(raw)
+        try:
+            assay_level_hgvs = fetch_clingen_genomic_hgvs(raw)
+        except Exception as exc:
+            return raw, None, None, f"ClinGen connection failed for {raw!r}: {exc}", None
     else:
         assay_level_hgvs = raw
 
@@ -916,6 +919,7 @@ _GRCH38_CHR_NC: dict[str, str] = {
 }
 
 _seqrepo_chr_patch_applied = False
+_dcd_clingen_patch_applied = False
 
 
 def _patch_seqrepo_chr_lookup() -> None:
@@ -945,6 +949,64 @@ def _patch_seqrepo_chr_lookup() -> None:
     SeqRepoAccess.translate_identifier = _patched_translate
     _seqrepo_chr_patch_applied = True
     logger.debug("Applied SeqRepo chromosome-alias fallback patch.")
+
+
+def _patch_dcd_clingen_fetch() -> None:
+    """Monkey-patch ``dcd_mapping.vrs_map.fetch_clingen_genomic_hgvs`` to add
+    Redis caching and graceful error handling for network failures.
+
+    On a cache miss the original function is called (which uses
+    ``request_with_backoff`` internally for retries).  If a connection error
+    still occurs after all retries are exhausted the exception is caught,
+    logged at ERROR level, and re-raised as ``RuntimeError`` so that
+    map_variants' existing broad ``except Exception`` handlers can record it
+    as a mapping error rather than crashing the whole process.
+
+    Successful results are stored in Redis.  Cache misses (``None`` returns)
+    are stored with the shorter miss TTL.  Applied at most once per process.
+    """
+    global _dcd_clingen_patch_applied
+    if _dcd_clingen_patch_applied:
+        return
+
+    import dcd_mapping.vrs_map as _vrs_map_module  # noqa: PLC0415
+    from src.lib.clingen import _cache_get, _cache_prefix, _cache_set  # noqa: PLC0415
+
+    _NONE_SENTINEL = "__NONE__"
+
+    def _genomic_hgvs_cache_key(hgvs: str) -> str:
+        return f"{_cache_prefix()}:genomic_hgvs:{hgvs}"
+
+    _original_fetch = _vrs_map_module.fetch_clingen_genomic_hgvs
+
+    def _cached_fetch(hgvs: str) -> "str | None":
+        cache_key = _genomic_hgvs_cache_key(hgvs)
+        hit, cached = _cache_get(cache_key)
+        if hit:
+            logger.debug("DCD ClinGen cache hit for %r", hgvs)
+            return None if cached == _NONE_SENTINEL else cached
+
+        try:
+            result = _original_fetch(hgvs)
+        except Exception as exc:
+            logger.error(
+                "ClinGen connection failed for HGVS %r (all retries exhausted): %s",
+                hgvs,
+                exc,
+            )
+            raise RuntimeError(
+                f"ClinGen connection failed for {hgvs!r}: {exc}"
+            ) from exc
+
+        if result is None:
+            _cache_set(cache_key, _NONE_SENTINEL, miss=True)
+        else:
+            _cache_set(cache_key, result)
+        return result
+
+    _vrs_map_module.fetch_clingen_genomic_hgvs = _cached_fetch
+    _dcd_clingen_patch_applied = True
+    logger.debug("Applied DCD ClinGen fetch patch (Redis cache + connection error handling).")
 
 
 def _try_import_dcd_mapping() -> dict:
@@ -989,6 +1051,7 @@ def _try_import_dcd_mapping() -> dict:
         ) from exc
 
     _patch_seqrepo_chr_lookup()
+    _patch_dcd_clingen_fetch()
 
     return {
         "AnnotationLayer": AnnotationLayer,
