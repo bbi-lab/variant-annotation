@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import io
 import logging
 import os
 import shutil
@@ -266,14 +267,48 @@ def _split_hgvs_candidates(joined_hgvs: str) -> list[str]:
     return [part.strip() for part in text.split("|")]
 
 
+def _capture_hgvs_warnings():
+    """Return a context manager that captures hgvs logger warnings."""
+    class WarningCapture:
+        def __init__(self):
+            self.warnings = []
+            self.handler = None
+            self.hgvs_logger = logging.getLogger("hgvs")
+        
+        def __enter__(self):
+            self.handler = logging.StreamHandler(io.StringIO())
+            self.handler.setLevel(logging.WARNING)
+            # Store original propagate setting
+            self.original_propagate = self.hgvs_logger.propagate
+            self.hgvs_logger.propagate = False
+            self.hgvs_logger.addHandler(self.handler)
+            return self
+        
+        def __exit__(self, *args):
+            if self.handler:
+                # Get any warnings that were logged
+                stream = self.handler.stream
+                if hasattr(stream, 'getvalue'):
+                    content = stream.getvalue()
+                    if content:
+                        self.warnings.append(content.strip())
+                self.hgvs_logger.removeHandler(self.handler)
+            self.hgvs_logger.propagate = self.original_propagate
+        
+        def get_warnings(self) -> str:
+            return "|".join(self.warnings) if self.warnings else ""
+    
+    return WarningCapture()
+
+
 def _derive_joined_hgvs_fields(
     joined_hgvs: str,
     *,
     resolve_missing_ref_alleles: bool,
-) -> tuple[str, str, str, str, str, str, str]:
+) -> tuple[str, str, str, str, str, str, str, str]:
     candidates = _split_hgvs_candidates(joined_hgvs)
     if not candidates:
-        return "", "", "", "", "", "", ""
+        return "", "", "", "", "", "", "", ""
 
     starts: list[str] = []
     stops: list[str] = []
@@ -282,6 +317,7 @@ def _derive_joined_hgvs_fields(
     touches_intronic: list[str] = []
     spans_intron: list[str] = []
     chromosomes: list[str] = []
+    warnings: list[str] = []
 
     for candidate in candidates:
         if not candidate:
@@ -292,12 +328,15 @@ def _derive_joined_hgvs_fields(
             touches_intronic.append("")
             spans_intron.append("")
             chromosomes.append("")
+            warnings.append("")
             continue
 
-        start, stop, ref, alt, touches_intronic_region, spans_intronic_region, chromosome = _parse_hgvs(
-            candidate,
-            resolve_missing_ref_alleles=resolve_missing_ref_alleles,
-        )
+        with _capture_hgvs_warnings() as warn_capture:
+            start, stop, ref, alt, touches_intronic_region, spans_intronic_region, chromosome = _parse_hgvs(
+                candidate,
+                resolve_missing_ref_alleles=resolve_missing_ref_alleles,
+            )
+        
         starts.append(start or "")
         stops.append(stop or "")
         refs.append(ref or "")
@@ -307,6 +346,7 @@ def _derive_joined_hgvs_fields(
         touches_intronic.append("true" if touches_intronic_region else "false")
         spans_intron.append("true" if spans_intronic_region else "false")
         chromosomes.append(chromosome or "")
+        warnings.append(warn_capture.get_warnings())
 
     return (
         "|".join(starts),
@@ -316,6 +356,7 @@ def _derive_joined_hgvs_fields(
         "|".join(touches_intronic),
         "|".join(spans_intron),
         "|".join(chromosomes),
+        "|".join(warnings),
     )
 
 
@@ -336,13 +377,14 @@ def _populate_derived_hgvs_columns(
     mapped_hgvs_c_alt_col: str,
     touches_intronic_region_col: str,
     spans_intron_col: str,
+    reverse_translation_warnings_col: str,
     resolve_missing_ref_alleles: bool,
 ) -> None:
-    g_start, g_stop, g_ref, g_alt, _, _, g_chromosome = _derive_joined_hgvs_fields(
+    g_start, g_stop, g_ref, g_alt, _, _, g_chromosome, g_warnings = _derive_joined_hgvs_fields(
         row.get(mapped_hgvs_g_col, ""),
         resolve_missing_ref_alleles=resolve_missing_ref_alleles,
     )
-    c_start, c_stop, c_ref, c_alt, touches_intronic_region, spans_intron, c_chromosome = _derive_joined_hgvs_fields(
+    c_start, c_stop, c_ref, c_alt, touches_intronic_region, spans_intron, c_chromosome, c_warnings = _derive_joined_hgvs_fields(
         row.get(mapped_hgvs_c_col, ""),
         resolve_missing_ref_alleles=resolve_missing_ref_alleles,
     )
@@ -361,6 +403,10 @@ def _populate_derived_hgvs_columns(
 
     row[touches_intronic_region_col] = touches_intronic_region
     row[spans_intron_col] = spans_intron
+    
+    # Combine warnings from both g and c columns, with c warnings taking priority
+    combined_warnings = c_warnings if c_warnings else g_warnings
+    row[reverse_translation_warnings_col] = combined_warnings
 
 
 def reverse_translate_protein_variants(
@@ -384,6 +430,7 @@ def reverse_translate_protein_variants(
     mapped_hgvs_c_alt_col: str = "mapped_hgvs_c_alt",
     touches_intronic_region_col: str = "touches_intronic_region",
     spans_intron_col: str = "spans_intron",
+    reverse_translation_warnings_col: str = "reverse_translation_warnings",
     resolve_missing_ref_alleles: bool = True,
     transcript_fallback_columns: tuple[str, ...] = (),
     assembly: str = "GRCh38",
@@ -516,6 +563,7 @@ def reverse_translate_protein_variants(
                 mapped_hgvs_c_alt_col=mapped_hgvs_c_alt_col,
                 touches_intronic_region_col=touches_intronic_region_col,
                 spans_intron_col=spans_intron_col,
+                reverse_translation_warnings_col=reverse_translation_warnings_col,
                 resolve_missing_ref_alleles=resolve_missing_ref_alleles,
             )
             writer.writerow(row)
@@ -549,6 +597,7 @@ def reverse_translate_protein_variants(
                 touches_intronic_region_col,
                 spans_intron_col,
                 reverse_translation_error_col,
+                reverse_translation_warnings_col,
             ):
                 if col not in out_fieldnames:
                     out_fieldnames.append(col)
@@ -607,6 +656,7 @@ def reverse_translate_protein_variants(
                         mapped_hgvs_c_alt_col=mapped_hgvs_c_alt_col,
                         touches_intronic_region_col=touches_intronic_region_col,
                         spans_intron_col=spans_intron_col,
+                        reverse_translation_warnings_col=reverse_translation_warnings_col,
                         resolve_missing_ref_alleles=resolve_missing_ref_alleles,
                     )
                     writer.writerow(row)
@@ -647,6 +697,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mapped-hgvs-c", dest="mapped_hgvs_c_col", default="mapped_hgvs_c")
     parser.add_argument("--mapped-hgvs-p", dest="mapped_hgvs_p_col", default="mapped_hgvs_p")
     parser.add_argument("--reverse-translation-error", dest="reverse_translation_error_col", default="reverse_translation_error")
+    parser.add_argument("--reverse-translation-warnings", dest="reverse_translation_warnings_col", default="reverse_translation_warnings")
     parser.add_argument(
         "--assayed-variant-level",
         dest="assayed_variant_level_col",
@@ -733,6 +784,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         mapped_hgvs_c_alt_col=args.mapped_hgvs_c_alt_col,
         touches_intronic_region_col=args.touches_intronic_region_col,
         spans_intron_col=args.spans_intron_col,
+        reverse_translation_warnings_col=args.reverse_translation_warnings_col,
         resolve_missing_ref_alleles=args.resolve_missing_ref_alleles,
         transcript_fallback_columns=tuple(args.transcript_fallback_columns),
         assembly=args.assembly,

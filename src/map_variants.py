@@ -73,6 +73,7 @@ Library usage::
 import asyncio
 import re
 import csv
+import io
 import logging
 import os
 import sys
@@ -98,6 +99,40 @@ PROGRESS_EVERY_ROWS = 1000
 # ---------------------------------------------------------------------------
 # File / format utilities
 # ---------------------------------------------------------------------------
+
+
+def _capture_hgvs_warnings():
+    """Return a context manager that captures hgvs logger warnings."""
+    class WarningCapture:
+        def __init__(self):
+            self.warnings = []
+            self.handler = None
+            self.hgvs_logger = logging.getLogger("hgvs")
+        
+        def __enter__(self):
+            self.handler = logging.StreamHandler(io.StringIO())
+            self.handler.setLevel(logging.WARNING)
+            # Store original propagate setting
+            self.original_propagate = self.hgvs_logger.propagate
+            self.hgvs_logger.propagate = False
+            self.hgvs_logger.addHandler(self.handler)
+            return self
+        
+        def __exit__(self, *args):
+            if self.handler:
+                # Get any warnings that were logged
+                stream = self.handler.stream
+                if hasattr(stream, 'getvalue'):
+                    content = stream.getvalue()
+                    if content:
+                        self.warnings.append(content.strip())
+                self.hgvs_logger.removeHandler(self.handler)
+            self.hgvs_logger.propagate = self.original_propagate
+        
+        def get_warnings(self) -> str:
+            return "|".join(self.warnings) if self.warnings else ""
+    
+    return WarningCapture()
 
 
 def _detect_separator(file_path: str) -> str:
@@ -436,16 +471,17 @@ def _load_existing_results(
     mapped_hgvs_c_col: str,
     mapped_hgvs_p_col: str,
     mapping_error_col: str,
+    mapping_warnings_col: str,
     clingen_allele_id_col: str,
     key_columns: tuple[str, ...],
 ) -> dict[
     tuple[str, ...],
-    tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
+    tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
 ]:
     """Load previously computed mapping results from one or more annotated files.
 
     Returns a dict mapping merge-key tuples to
-    ``(hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id)``.
+    ``(hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id, warnings)``.
     Rows with all-empty mapped columns and no error are ignored.
     """
     if not key_columns:
@@ -453,7 +489,7 @@ def _load_existing_results(
 
     merged: dict[
         tuple[str, ...],
-        tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
+        tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
     ] = {}
 
     for file_path in existing_files:
@@ -486,6 +522,7 @@ def _load_existing_results(
                 hgvs_g = _normalize_merge_value(row.get(mapped_hgvs_g_col)) or None
                 hgvs_p = _normalize_merge_value(row.get(mapped_hgvs_p_col)) or None
                 error = _normalize_merge_value(row.get(mapping_error_col)) or None
+                warnings = _normalize_merge_value(row.get(mapping_warnings_col)) or None
                 clingen_allele_id = _normalize_merge_value(row.get(clingen_allele_id_col)) or None
                 if hgvs_c is None and hgvs_g is None and hgvs_p is None and error is None:
                     continue
@@ -494,7 +531,7 @@ def _load_existing_results(
                 if key in merged:
                     # Keep first-seen entry to ensure deterministic precedence by file order.
                     continue
-                merged[key] = (hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id)
+                merged[key] = (hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id, warnings)
                 loaded_from_file += 1
 
         logger.info("Loaded %d reusable mapped rows from %s", loaded_from_file, file_path)
@@ -1289,6 +1326,7 @@ def map_variants(
     mapped_hgvs_c_col: str = "mapped_hgvs_c",
     mapped_hgvs_p_col: str = "mapped_hgvs_p",
     mapping_error_col: str = "mapping_error",
+    mapping_warnings_col: str = "mapping_warnings",
     clingen_allele_id_col: str = "clingen_allele_id",
     skip: int = 0,
     limit: Optional[int] = None,
@@ -1369,12 +1407,14 @@ def map_variants(
         hgvs_p: Optional[str],
         error: Optional[str],
         clingen_allele_id: Optional[str],
+        warnings: Optional[str] = None,
     ) -> None:
         out_row = dict(row)
         out_row[mapped_hgvs_c_col] = hgvs_c or ""
         out_row[mapped_hgvs_g_col] = hgvs_g or ""
         out_row[mapped_hgvs_p_col] = hgvs_p or ""
         out_row[mapping_error_col] = error or ""
+        out_row[mapping_warnings_col] = warnings or ""
         out_row[clingen_allele_id_col] = clingen_allele_id or ""
         writer.writerow(out_row)
         # Keep output visible/usable during long runs.
@@ -1407,6 +1447,7 @@ def map_variants(
             mapped_hgvs_c_col,
             mapped_hgvs_p_col,
             mapping_error_col,
+            mapping_warnings_col,
             clingen_allele_id_col,
         ]:
             if col not in out_fieldnames:
@@ -1444,7 +1485,7 @@ def map_variants(
         )
         existing_results_by_key: dict[
             tuple[str, ...],
-            tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
+            tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
         ] = {}
         if merge_existing_files:
             missing_in_input = [c for c in merge_key_columns if c not in in_fieldnames]
@@ -1464,6 +1505,7 @@ def map_variants(
                     mapped_hgvs_c_col=mapped_hgvs_c_col,
                     mapped_hgvs_p_col=mapped_hgvs_p_col,
                     mapping_error_col=mapping_error_col,
+                    mapping_warnings_col=mapping_warnings_col,
                     clingen_allele_id_col=clingen_allele_id_col,
                     key_columns=merge_key_columns,
                 )
@@ -1494,6 +1536,7 @@ def map_variants(
             hgvs_p: Optional[str],
             error: Optional[str],
             clingen_allele_id: Optional[str] = None,
+            warnings: Optional[str] = None,
             group_id: Optional[str] = None,
         ) -> None:
             nonlocal n_written, n_errors, next_to_write
@@ -1508,6 +1551,7 @@ def map_variants(
                     hgvs_p,
                     error,
                     clingen_allele_id,
+                    warnings,
                 )
                 n_written += 1
                 if error:
@@ -1518,7 +1562,7 @@ def map_variants(
             # buffer by index and emit in order. The only difference is semantic—
             # "groups" is an optimization hint that groups are contiguous.
             rows_by_idx[idx] = row
-            pending_results[idx] = (hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id)
+            pending_results[idx] = (hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id, warnings)
             while next_to_write in pending_results:
                 next_row = rows_by_idx.pop(next_to_write)
                 (
@@ -1527,6 +1571,7 @@ def map_variants(
                     next_hgvs_p,
                     next_error,
                     next_clingen_allele_id,
+                    next_warnings,
                 ) = pending_results.pop(next_to_write)
                 _write_result_row(
                     writer,
@@ -1537,6 +1582,7 @@ def map_variants(
                     next_hgvs_p,
                     next_error,
                     next_clingen_allele_id,
+                    next_warnings,
                 )
                 n_written += 1
                 if next_error:
@@ -1803,7 +1849,7 @@ def map_variants(
                 if merged_result is not None:
                     if preserve_order == "groups":
                         _flush_current_group()
-                    hgvs_c, hgvs_g, hgvs_p, err, clingen_allele_id = merged_result
+                    hgvs_c, hgvs_g, hgvs_p, err, clingen_allele_id, warnings = merged_result
                     _record_result(
                         idx,
                         row,
@@ -1812,6 +1858,7 @@ def map_variants(
                         hgvs_p,
                         err,
                         clingen_allele_id,
+                        warnings,
                         group_id="__merged__",
                     )
                     n_merged += 1
@@ -2200,6 +2247,13 @@ def map_variants(
     help="Output column name for error messages.",
 )
 @click.option(
+    "--mapping-warnings",
+    "mapping_warnings_col",
+    default="mapping_warnings",
+    show_default=True,
+    help="Output column name for coordinate extraction warnings.",
+)
+@click.option(
     "--clingen-allele-id",
     "clingen_allele_id_col",
     default="clingen_allele_id",
@@ -2325,6 +2379,7 @@ def main(
     mapped_hgvs_c_col: str,
     mapped_hgvs_p_col: str,
     mapping_error_col: str,
+    mapping_warnings_col: str,
     clingen_allele_id_col: str,
     skip: int,
     limit: Optional[int],
@@ -2368,6 +2423,7 @@ def main(
         mapped_hgvs_c_col=mapped_hgvs_c_col,
         mapped_hgvs_p_col=mapped_hgvs_p_col,
         mapping_error_col=mapping_error_col,
+        mapping_warnings_col=mapping_warnings_col,
         clingen_allele_id_col=clingen_allele_id_col,
         skip=skip,
         limit=limit,

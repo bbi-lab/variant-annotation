@@ -128,7 +128,7 @@ def test_derive_joined_hgvs_fields_tracks_intronic_and_spans(monkeypatch):
     monkeypatch.setattr(rtpv, "_parse_hgvs", fake_parse_hgvs)
 
     joined = "NM_000001.1:c.76+1_77-1del|NM_000001.1:c.90A>G"
-    start, stop, ref, alt, touches_intronic, spans_intron, chromosome = rtpv._derive_joined_hgvs_fields(
+    start, stop, ref, alt, touches_intronic, spans_intron, chromosome, warnings = rtpv._derive_joined_hgvs_fields(
         joined,
         resolve_missing_ref_alleles=True,
     )
