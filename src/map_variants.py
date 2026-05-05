@@ -410,7 +410,7 @@ async def _normalize_case2_haplotype_to_delins(
     )
 
     assay_by_idx: dict[int, str] = {}
-    for idx, hgvs_assay, error in per_component:
+    for idx, hgvs_assay, error, _dna_d, _pro_d in per_component:
         if error:
             return None, f"Haplotype component mapping failed: {error}"
         if not hgvs_assay:
@@ -472,16 +472,18 @@ def _load_existing_results(
     mapped_hgvs_p_col: str,
     mapping_error_col: str,
     mapping_warnings_col: str,
+    dna_vrs_digest_col: str,
+    protein_vrs_digest_col: str,
     clingen_allele_id_col: str,
     key_columns: tuple[str, ...],
 ) -> dict[
     tuple[str, ...],
-    tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
+    tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
 ]:
     """Load previously computed mapping results from one or more annotated files.
 
     Returns a dict mapping merge-key tuples to
-    ``(hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id, warnings)``.
+    ``(hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id, warnings, dna_vrs_digest, protein_vrs_digest)``.
     Rows with all-empty mapped columns and no error are ignored.
     """
     if not key_columns:
@@ -489,7 +491,7 @@ def _load_existing_results(
 
     merged: dict[
         tuple[str, ...],
-        tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
+        tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
     ] = {}
 
     for file_path in existing_files:
@@ -524,6 +526,8 @@ def _load_existing_results(
                 error = _normalize_merge_value(row.get(mapping_error_col)) or None
                 warnings = _normalize_merge_value(row.get(mapping_warnings_col)) or None
                 clingen_allele_id = _normalize_merge_value(row.get(clingen_allele_id_col)) or None
+                dna_vrs_digest = _normalize_merge_value(row.get(dna_vrs_digest_col)) or None
+                protein_vrs_digest = _normalize_merge_value(row.get(protein_vrs_digest_col)) or None
                 if hgvs_c is None and hgvs_g is None and hgvs_p is None and error is None:
                     continue
 
@@ -531,7 +535,7 @@ def _load_existing_results(
                 if key in merged:
                     # Keep first-seen entry to ensure deterministic precedence by file order.
                     continue
-                merged[key] = (hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id, warnings)
+                merged[key] = (hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id, warnings, dna_vrs_digest, protein_vrs_digest)
                 loaded_from_file += 1
 
         logger.info("Loaded %d reusable mapped rows from %s", loaded_from_file, file_path)
@@ -1076,6 +1080,43 @@ def _is_dna_sequence(sequence: str) -> bool:
     return all(c in nucleotide_chars for c in sequence)
 
 
+def _vrs_digest_from_annotation(annotation) -> tuple[Optional[str], Optional[str]]:
+    """Extract VRS digest from a dcd_mapping ``ScoreAnnotationWithLayer``.
+
+    Returns:
+        A ``(dna_vrs_digest, protein_vrs_digest)`` tuple. Exactly one of the two will
+        be populated (or both will be None on error/missing data). Genomic/transcript
+        annotation layers populate *dna_vrs_digest*; protein annotation layers populate
+        *protein_vrs_digest*.
+    """
+    try:
+        from cool_seq_tool.schemas import AnnotationLayer  # noqa: PLC0415
+    except Exception:
+        return None, None
+
+    pm = getattr(annotation, "post_mapped", None)
+    if pm is None:
+        return None, None
+
+    # Prefer the pre-computed digest field (populated by ga4gh_identify in vrs_map).
+    digest: Optional[str] = getattr(pm, "digest", None)
+    if not digest:
+        # Fall back to parsing the id field (format: "ga4gh:VA.<digest>")
+        id_val: Optional[str] = getattr(pm, "id", None)
+        if id_val and "." in id_val:
+            digest = id_val.rsplit(".", 1)[-1]
+
+    if not digest:
+        return None, None
+
+    layer = getattr(annotation, "annotation_layer", None)
+    if layer == AnnotationLayer.PROTEIN:
+        return None, digest
+    else:
+        # GENOMIC layer, or unspecified — treat as DNA
+        return digest, None
+
+
 def _hgvs_from_annotation(annotation) -> Optional[str]:
     """Extract the HGVS string from the ``post_mapped`` VRS object of a dcd_mapping
     ``ScoreAnnotationWithLayer``.
@@ -1127,8 +1168,10 @@ async def _run_dcd_mapping_pipeline(
 
     Returns:
         A 2-tuple of:
-        - A list of ``(orig_idx, hgvs_assay_level, error)`` per row. *hgvs_assay_level*
-          is the post-mapped HGVS string; *error* is an empty string on success.
+        - A list of ``(orig_idx, hgvs_assay_level, error, dna_vrs_digest,
+          protein_vrs_digest)`` per row. *hgvs_assay_level* is the post-mapped HGVS
+          string; *error* is an empty string on success. Exactly one of the two
+          digest fields will be populated per row (or both None on error).
         - The NM_ transcript accession selected by dcd_mapping, or None if unavailable.
     """
     ScoresetMetadata = dcd["ScoresetMetadata"]
@@ -1144,7 +1187,7 @@ async def _run_dcd_mapping_pipeline(
     annotate = dcd["annotate"]
 
     def _fail_all(error: str):
-        return [(orig_idx, None, error) for orig_idx, _, _, _ in row_entries], None
+        return [(orig_idx, None, error, None, None) for orig_idx, _, _, _ in row_entries], None
 
     seq_type = (
         TargetSequenceType.DNA if _is_dna_sequence(target_sequence) else TargetSequenceType.PROTEIN
@@ -1220,7 +1263,7 @@ async def _run_dcd_mapping_pipeline(
                         "Falling back to per-row mapping for group %r after transcript selection failure.",
                         group_name,
                     )
-                    merged_results: list[tuple[int, Optional[str], str]] = []
+                    merged_results: list[tuple[int, Optional[str], str, Optional[str], Optional[str]]] = []
                     selected_transcript_nm: Optional[str] = None
                     for orig_idx, hgvs_nt, hgvs_pro, case in row_entries:
                         one_row_results, one_tx_nm = await _run_dcd_mapping_pipeline(
@@ -1273,17 +1316,18 @@ async def _run_dcd_mapping_pipeline(
 
     row_entry_by_idx = {orig_idx: (hgvs_nt, hgvs_pro, case) for orig_idx, hgvs_nt, hgvs_pro, case in row_entries}
 
-    per_row: list[tuple[int, Optional[str], str]] = []
+    per_row: list[tuple[int, Optional[str], str, Optional[str], Optional[str]]] = []
     for orig_idx, _, _, _ in row_entries:
         ann_list = ann_by_accession.get(str(orig_idx), [])
         if not ann_list:
-            per_row.append((orig_idx, None, "No mapping result returned by dcd_mapping"))
+            per_row.append((orig_idx, None, "No mapping result returned by dcd_mapping", None, None))
             continue
         ann = ann_list[0]
         if ann.error_message:
-            per_row.append((orig_idx, None, ann.error_message))
+            per_row.append((orig_idx, None, ann.error_message, None, None))
             continue
         hgvs_assay = _hgvs_from_annotation(ann)
+        dna_digest, protein_digest = _vrs_digest_from_annotation(ann)
 
         # Fallback for unsupported multi-variant DNA haplotypes: if dcd_mapping
         # produced no assay-level HGVS for a case-2 row, try rewriting supported
@@ -1316,21 +1360,21 @@ async def _run_dcd_mapping_pipeline(
                         precomputed_transcript=transcript,
                     )
                     if retry_rows:
-                        retry_idx, retry_hgvs_assay, retry_error = retry_rows[0]
+                        retry_idx, retry_hgvs_assay, retry_error, retry_dna_digest, retry_pro_digest = retry_rows[0]
                         if retry_error:
-                            per_row.append((retry_idx, None, retry_error))
+                            per_row.append((retry_idx, None, retry_error, None, None))
                             continue
                         if retry_hgvs_assay:
-                            per_row.append((retry_idx, retry_hgvs_assay, ""))
+                            per_row.append((retry_idx, retry_hgvs_assay, "", retry_dna_digest, retry_pro_digest))
                             continue
                     if norm_error:
-                        per_row.append((orig_idx, None, norm_error))
+                        per_row.append((orig_idx, None, norm_error, None, None))
                         continue
                 elif norm_error:
-                    per_row.append((orig_idx, None, norm_error))
+                    per_row.append((orig_idx, None, norm_error, None, None))
                     continue
 
-        per_row.append((orig_idx, hgvs_assay, ""))
+        per_row.append((orig_idx, hgvs_assay, "", dna_digest, protein_digest))
 
     return per_row, transcript_nm
 
@@ -1364,7 +1408,7 @@ async def _process_all_groups(
         per_row, transcript_nm = await _run_dcd_mapping_pipeline(
             group_name, target_seq, row_entries, dcd
         )
-        for orig_idx, hgvs_assay, error in per_row:
+        for orig_idx, hgvs_assay, error, _dna_digest, _pro_digest in per_row:
             all_results[orig_idx] = (hgvs_assay, transcript_nm, error)
 
     return all_results
@@ -1390,6 +1434,8 @@ def map_variants(
     mapped_hgvs_p_col: str = "mapped_hgvs_p",
     mapping_error_col: str = "mapping_error",
     mapping_warnings_col: str = "mapping_warnings",
+    dna_vrs_digest_col: str = "dna_vrs_digest",
+    protein_vrs_digest_col: str = "protein_vrs_digest",
     clingen_allele_id_col: str = "clingen_allele_id",
     skip: int = 0,
     limit: Optional[int] = None,
@@ -1471,6 +1517,8 @@ def map_variants(
         error: Optional[str],
         clingen_allele_id: Optional[str],
         warnings: Optional[str] = None,
+        dna_vrs_digest: Optional[str] = None,
+        protein_vrs_digest: Optional[str] = None,
     ) -> None:
         out_row = dict(row)
         out_row[mapped_hgvs_c_col] = hgvs_c or ""
@@ -1478,6 +1526,8 @@ def map_variants(
         out_row[mapped_hgvs_p_col] = hgvs_p or ""
         out_row[mapping_error_col] = error or ""
         out_row[mapping_warnings_col] = warnings or ""
+        out_row[dna_vrs_digest_col] = dna_vrs_digest or ""
+        out_row[protein_vrs_digest_col] = protein_vrs_digest or ""
         out_row[clingen_allele_id_col] = clingen_allele_id or ""
         writer.writerow(out_row)
         # Keep output visible/usable during long runs.
@@ -1511,6 +1561,8 @@ def map_variants(
             mapped_hgvs_p_col,
             mapping_error_col,
             mapping_warnings_col,
+            dna_vrs_digest_col,
+            protein_vrs_digest_col,
             clingen_allele_id_col,
         ]:
             if col not in out_fieldnames:
@@ -1548,7 +1600,7 @@ def map_variants(
         )
         existing_results_by_key: dict[
             tuple[str, ...],
-            tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
+            tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
         ] = {}
         if merge_existing_files:
             missing_in_input = [c for c in merge_key_columns if c not in in_fieldnames]
@@ -1569,6 +1621,8 @@ def map_variants(
                     mapped_hgvs_p_col=mapped_hgvs_p_col,
                     mapping_error_col=mapping_error_col,
                     mapping_warnings_col=mapping_warnings_col,
+                    dna_vrs_digest_col=dna_vrs_digest_col,
+                    protein_vrs_digest_col=protein_vrs_digest_col,
                     clingen_allele_id_col=clingen_allele_id_col,
                     key_columns=merge_key_columns,
                 )
@@ -1582,7 +1636,7 @@ def map_variants(
         rows_by_idx: dict[int, dict] = {}
         pending_results: dict[
             int,
-            tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
+            tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
         ] = {}
         pending_case1_rows: list[tuple[int, dict, str]] = []
         current_group_key: Optional[str] = None
@@ -1600,6 +1654,8 @@ def map_variants(
             error: Optional[str],
             clingen_allele_id: Optional[str] = None,
             warnings: Optional[str] = None,
+            dna_vrs_digest: Optional[str] = None,
+            protein_vrs_digest: Optional[str] = None,
             group_id: Optional[str] = None,
         ) -> None:
             nonlocal n_written, n_errors, next_to_write
@@ -1615,6 +1671,8 @@ def map_variants(
                     error,
                     clingen_allele_id,
                     warnings,
+                    dna_vrs_digest,
+                    protein_vrs_digest,
                 )
                 n_written += 1
                 if error:
@@ -1625,7 +1683,7 @@ def map_variants(
             # buffer by index and emit in order. The only difference is semantic—
             # "groups" is an optimization hint that groups are contiguous.
             rows_by_idx[idx] = row
-            pending_results[idx] = (hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id, warnings)
+            pending_results[idx] = (hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id, warnings, dna_vrs_digest, protein_vrs_digest)
             while next_to_write in pending_results:
                 next_row = rows_by_idx.pop(next_to_write)
                 (
@@ -1635,6 +1693,8 @@ def map_variants(
                     next_error,
                     next_clingen_allele_id,
                     next_warnings,
+                    next_dna_digest,
+                    next_pro_digest,
                 ) = pending_results.pop(next_to_write)
                 _write_result_row(
                     writer,
@@ -1646,6 +1706,8 @@ def map_variants(
                     next_error,
                     next_clingen_allele_id,
                     next_warnings,
+                    next_dna_digest,
+                    next_pro_digest,
                 )
                 n_written += 1
                 if next_error:
@@ -1761,7 +1823,7 @@ def map_variants(
                                         _format_exc(chunk_exc),
                                     )
                                     for orig_idx, _, _, _ in chunk_entries:
-                                        per_row.append((orig_idx, None, f"BLAT chunk failed: {_format_exc(chunk_exc)}"))
+                                        per_row.append((orig_idx, None, f"BLAT chunk failed: {_format_exc(chunk_exc)}", None, None))
                             break
                         raise
 
@@ -1773,10 +1835,10 @@ def map_variants(
                         _format_exc(last_error) if last_error else "unknown error",
                     )
                     fallback_error = _format_exc(last_error) if last_error is not None else "unknown error"
-                    per_row = [(orig_idx, None, fallback_error) for orig_idx, _, _, _ in row_entries]
+                    per_row = [(orig_idx, None, fallback_error, None, None) for orig_idx, _, _, _ in row_entries]
 
-                hgvs_queries = []
-                for orig_idx, hgvs_assay, error in per_row:
+                hgvs_queries = []  # list of (orig_idx, row, hgvs_assay, dna_digest, pro_digest)
+                for orig_idx, hgvs_assay, error, dna_digest, pro_digest in per_row:
                     row = group_rows_by_idx[orig_idx]
 
                     if error:
@@ -1786,7 +1848,7 @@ def map_variants(
                         _record_result(orig_idx, row, None, None, None, "No HGVS string produced by mapper", group_id=group_name)
                         continue
 
-                    hgvs_queries.append((orig_idx, row, hgvs_assay))
+                    hgvs_queries.append((orig_idx, row, hgvs_assay, dna_digest, pro_digest))
 
                 if hgvs_queries:
                     hgvs_strings = [h[2] for h in hgvs_queries]
@@ -1807,7 +1869,7 @@ def map_variants(
                         clingen_batch_elapsed,
                     )
 
-                    for orig_idx, row, hgvs_assay in hgvs_queries:
+                    for orig_idx, row, hgvs_assay, dna_digest, pro_digest in hgvs_queries:
                         data = clingen_results.get(hgvs_assay)
                         if data is None:
                             _assay_is_protein = (
@@ -1820,6 +1882,8 @@ def map_variants(
                                 None if _assay_is_protein else hgvs_assay,
                                 hgvs_assay if _assay_is_protein else None,
                                 f"ClinGen returned no data for {hgvs_assay!r}",
+                                dna_vrs_digest=dna_digest,
+                                protein_vrs_digest=pro_digest,
                                 group_id=group_name,
                             )
                             continue
@@ -1836,6 +1900,8 @@ def map_variants(
                             hgvs_p,
                             None,
                             _extract_clingen_allele_id(data),
+                            dna_vrs_digest=dna_digest,
+                            protein_vrs_digest=pro_digest,
                             group_id=group_name,
                         )
 
@@ -1912,7 +1978,7 @@ def map_variants(
                 if merged_result is not None:
                     if preserve_order == "groups":
                         _flush_current_group()
-                    hgvs_c, hgvs_g, hgvs_p, err, clingen_allele_id, warnings = merged_result
+                    hgvs_c, hgvs_g, hgvs_p, err, clingen_allele_id, warnings, dna_vrs_digest, protein_vrs_digest = merged_result
                     _record_result(
                         idx,
                         row,
@@ -1922,6 +1988,8 @@ def map_variants(
                         err,
                         clingen_allele_id,
                         warnings,
+                        dna_vrs_digest,
+                        protein_vrs_digest,
                         group_id="__merged__",
                     )
                     n_merged += 1
@@ -2066,7 +2134,7 @@ def map_variants(
                                         )
                                         # Fail individual rows in this chunk
                                         for orig_idx, _, _, _ in chunk_entries:
-                                            per_row.append((orig_idx, None, f"BLAT chunk failed: {_format_exc(chunk_exc)}"))
+                                            per_row.append((orig_idx, None, f"BLAT chunk failed: {_format_exc(chunk_exc)}", None, None))
                                 break  # Chunked attempt completed; exit retry loop
                             else:
                                 # No retry, or non-137 error
@@ -2081,11 +2149,11 @@ def map_variants(
                             _format_exc(last_error) if last_error else "unknown error",
                         )
                         fallback_error = _format_exc(last_error) if last_error is not None else "unknown error"
-                        per_row = [(orig_idx, None, fallback_error) for orig_idx, _, _, _ in row_entries]
+                        per_row = [(orig_idx, None, fallback_error, None, None) for orig_idx, _, _, _ in row_entries]
 
                     # Collect all HGVS strings that need ClinGen queries
-                    hgvs_queries = []  # List of (orig_idx, row, hgvs_assay) tuples
-                    for orig_idx, hgvs_assay, error in per_row:
+                    hgvs_queries = []  # List of (orig_idx, row, hgvs_assay, dna_digest, pro_digest) tuples
+                    for orig_idx, hgvs_assay, error, dna_digest, pro_digest in per_row:
                         row = group_rows_by_idx[orig_idx]
 
                         if error:
@@ -2095,7 +2163,7 @@ def map_variants(
                             _record_result(orig_idx, row, None, None, None, "No HGVS string produced by mapper", group_id=group_name)
                             continue
 
-                        hgvs_queries.append((orig_idx, row, hgvs_assay))
+                        hgvs_queries.append((orig_idx, row, hgvs_assay, dna_digest, pro_digest))
 
                     # Batch query ClinGen for all HGVS strings concurrently
                     if hgvs_queries:
@@ -2118,7 +2186,7 @@ def map_variants(
                         )
 
                         # Process results in the same order as queries
-                        for orig_idx, row, hgvs_assay in hgvs_queries:
+                        for orig_idx, row, hgvs_assay, dna_digest, pro_digest in hgvs_queries:
                             data = clingen_results.get(hgvs_assay)
                             if data is None:
                                 # Preserve the assay-level HGVS even when ClinGen has no record.
@@ -2134,6 +2202,8 @@ def map_variants(
                                     None if _assay_is_protein else hgvs_assay,
                                     hgvs_assay if _assay_is_protein else None,
                                     f"ClinGen returned no data for {hgvs_assay!r}",
+                                    dna_vrs_digest=dna_digest,
+                                    protein_vrs_digest=pro_digest,
                                     group_id=group_name,
                                 )
                                 continue
@@ -2154,6 +2224,8 @@ def map_variants(
                                 hgvs_p,
                                 None,
                                 _extract_clingen_allele_id(data),
+                                dna_vrs_digest=dna_digest,
+                                protein_vrs_digest=pro_digest,
                                 group_id=group_name,
                             )
 
@@ -2198,6 +2270,9 @@ def map_variants(
                     pending_hgvs_p,
                     pending_error,
                     pending_clingen_allele_id,
+                    pending_warnings,
+                    pending_dna_digest,
+                    pending_pro_digest,
                 ) = pending_results[idx]
                 _write_result_row(
                     writer,
@@ -2208,6 +2283,9 @@ def map_variants(
                     pending_hgvs_p,
                     pending_error,
                     pending_clingen_allele_id,
+                    pending_warnings,
+                    pending_dna_digest,
+                    pending_pro_digest,
                 )
                 n_written += 1
                 if pending_error:
@@ -2315,6 +2393,20 @@ def map_variants(
     default="mapping_warnings",
     show_default=True,
     help="Output column name for coordinate extraction warnings.",
+)
+@click.option(
+    "--dna-vrs-digest",
+    "dna_vrs_digest_col",
+    default="dna_vrs_digest",
+    show_default=True,
+    help="Output column name for DNA/genomic VRS digests.",
+)
+@click.option(
+    "--protein-vrs-digest",
+    "protein_vrs_digest_col",
+    default="protein_vrs_digest",
+    show_default=True,
+    help="Output column name for protein VRS digests.",
 )
 @click.option(
     "--clingen-allele-id",
@@ -2443,6 +2535,8 @@ def main(
     mapped_hgvs_p_col: str,
     mapping_error_col: str,
     mapping_warnings_col: str,
+    dna_vrs_digest_col: str,
+    protein_vrs_digest_col: str,
     clingen_allele_id_col: str,
     skip: int,
     limit: Optional[int],
@@ -2487,6 +2581,8 @@ def main(
         mapped_hgvs_p_col=mapped_hgvs_p_col,
         mapping_error_col=mapping_error_col,
         mapping_warnings_col=mapping_warnings_col,
+        dna_vrs_digest_col=dna_vrs_digest_col,
+        protein_vrs_digest_col=protein_vrs_digest_col,
         clingen_allele_id_col=clingen_allele_id_col,
         skip=skip,
         limit=limit,

@@ -27,7 +27,7 @@ def test_normalize_case2_haplotype_to_delins_success(monkeypatch):
         # Component mapping call from haplotype normalization helper.
         assert group_name.endswith("#haplotype-components")
         assert target_sequence == "ATGCC"
-        return [(0, "NC_1", ""), (1, "NC_2", "")], "NM_000001.1"
+        return [(0, "NC_1", "", None, None), (1, "NC_2", "", None, None)], "NM_000001.1"
 
     def fake_query_clingen(hgvs):
         if hgvs == "NC_1":
@@ -68,7 +68,7 @@ def test_map_variants_default_preserves_input_order(tmp_path, monkeypatch):
     async def fake_pipeline(group_name, target_seq, row_entries, dcd):
         per_row = []
         for orig_idx, _, raw_pro, _ in row_entries:
-            per_row.append((orig_idx, f"NC_000001.11:g.{orig_idx + 100}A>G", None))
+            per_row.append((orig_idx, f"NC_000001.11:g.{orig_idx + 100}A>G", None, None, None))
         return per_row, "NM_000001.1"
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
@@ -108,7 +108,7 @@ def test_map_variants_groups_mode_uses_contiguous_blocks(tmp_path, monkeypatch):
         calls.append((group_name, [orig_idx for orig_idx, *_ in row_entries]))
         per_row = []
         for orig_idx, *_ in row_entries:
-            per_row.append((orig_idx, f"NC_000001.11:g.{orig_idx + 100}A>G", None))
+            per_row.append((orig_idx, f"NC_000001.11:g.{orig_idx + 100}A>G", None, None, None))
         return per_row, "NM_000001.1"
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
@@ -149,7 +149,7 @@ def test_map_variants_retries_on_137_with_chunking(tmp_path, monkeypatch):
         calls.append((group_name, len(row_entries)))
         if "#retry" not in group_name:
             raise RuntimeError("BLAT process returned error code 137")
-        per_row = [(orig_idx, f"NC_000001.11:g.{orig_idx + 100}A>G", None) for orig_idx, *_ in row_entries]
+        per_row = [(orig_idx, f"NC_000001.11:g.{orig_idx + 100}A>G", None, None, None) for orig_idx, *_ in row_entries]
         return per_row, "NM_000001.1"
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
@@ -260,7 +260,7 @@ def test_map_variants_with_targets_file_populates_sequence(tmp_path, monkeypatch
 
     async def fake_pipeline(group_name, target_seq, row_entries, dcd):
         assert target_seq == "SEQ_A", "target_sequence was not merged from targets file"
-        return [(orig_idx, f"NC_000001.11:g.{orig_idx}A>G", None) for orig_idx, *_ in row_entries], "NM_000001.1"
+        return [(orig_idx, f"NC_000001.11:g.{orig_idx}A>G", None, None, None) for orig_idx, *_ in row_entries], "NM_000001.1"
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
         return {h: {"hgvs": h, "id": "CA1"} for h in hgvs_strings}
@@ -307,7 +307,7 @@ def test_map_variants_with_targets_file_extra_cols_in_output(tmp_path, monkeypat
     output_path = tmp_path / "out.tsv"
 
     async def fake_pipeline(group_name, target_seq, row_entries, dcd):
-        return [(orig_idx, f"NC_000001.11:g.{orig_idx}A>G", None) for orig_idx, *_ in row_entries], "NM_000001.1"
+        return [(orig_idx, f"NC_000001.11:g.{orig_idx}A>G", None, None, None) for orig_idx, *_ in row_entries], "NM_000001.1"
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
         return {h: {"hgvs": h, "id": "CA1"} for h in hgvs_strings}
@@ -440,7 +440,7 @@ def test_map_variants_normalizes_raw_hgvs_pro_in_output(tmp_path, monkeypatch):
         )
 
     async def fake_pipeline(group_name, target_seq, row_entries, dcd):
-        return [(orig_idx, f"NC_000001.11:g.{orig_idx}A>G", None) for orig_idx, *_ in row_entries], "NM_1"
+        return [(orig_idx, f"NC_000001.11:g.{orig_idx}A>G", None, None, None) for orig_idx, *_ in row_entries], "NM_1"
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
         return {h: {"hgvs": h, "id": "CA1"} for h in hgvs_strings}
@@ -501,7 +501,7 @@ def test_map_variants_clingen_no_data_preserves_protein_hgvs(tmp_path, monkeypat
         )
 
     async def fake_pipeline(group_name, target_seq, row_entries, dcd):
-        return [(orig_idx, "NP_005624.2:p.Gln2Ter", None) for orig_idx, *_ in row_entries], "NM_005633.4"
+        return [(orig_idx, "NP_005624.2:p.Gln2Ter", None, None, None) for orig_idx, *_ in row_entries], "NM_005633.4"
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
         # Simulate ClinGen returning no data
@@ -537,7 +537,7 @@ def test_map_variants_clingen_no_data_preserves_genomic_hgvs(tmp_path, monkeypat
     genomic = "NC_000002.12:g.12345A>T"
 
     async def fake_pipeline(group_name, target_seq, row_entries, dcd):
-        return [(orig_idx, genomic, None) for orig_idx, *_ in row_entries], "NM_005633.4"
+        return [(orig_idx, genomic, None, None, None) for orig_idx, *_ in row_entries], "NM_005633.4"
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
         return {h: None for h in hgvs_strings}
@@ -596,7 +596,7 @@ def test_map_variants_routes_class1_class2_class3(tmp_path, monkeypatch):
         pipeline_calls.append((group_name, target_seq, row_entries))
         per_row = []
         for orig_idx, hgvs_nt, hgvs_pro, case in row_entries:
-            per_row.append((orig_idx, f"NC_000001.11:g.{orig_idx + 100}A>G", None))
+            per_row.append((orig_idx, f"NC_000001.11:g.{orig_idx + 100}A>G", None, None, None))
         return per_row, "NM_000001.1"
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
