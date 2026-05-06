@@ -635,6 +635,13 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=1000,
         help="Log lookup progress every N unique variants (<=0 disables progress logs)",
     )
+    p.add_argument(
+        "--csv-field-size-limit",
+        type=int,
+        default=csv.field_size_limit(),
+        metavar="BYTES",
+        help="Maximum per-field character length for CSV/TSV parsing (default: %(default)s).",
+    )
     return p.parse_args(argv)
 
 
@@ -684,6 +691,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    csv.field_size_limit(args.csv_field_size_limit)
     if args.skip < 0:
         raise ValueError(f"--skip must be >= 0, got: {args.skip}")
     if args.limit is not None and args.limit < 1:

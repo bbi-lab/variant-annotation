@@ -400,6 +400,13 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=None,
         help="Maximum number of data rows to annotate.",
     )
+    parser.add_argument(
+        "--csv-field-size-limit",
+        type=int,
+        default=csv.field_size_limit(),
+        metavar="BYTES",
+        help="Maximum per-field character length for CSV/TSV parsing (default: %(default)s).",
+    )
     return parser.parse_args(argv)
 
 
@@ -410,6 +417,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    csv.field_size_limit(args.csv_field_size_limit)
 
     if args.max_workers < 1:
         logger.error("--max-workers must be >= 1, got: %d", args.max_workers)

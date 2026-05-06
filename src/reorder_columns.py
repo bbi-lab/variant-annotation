@@ -86,7 +86,15 @@ def reorder_columns(
         "for example: --column-order a,b,c"
     ),
 )
-def main(input_file: str, output_file: str, column_order_raw: tuple[str, ...]) -> None:
+@click.option(
+    "--csv-field-size-limit",
+    default=csv.field_size_limit(),
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Maximum per-field character length for CSV/TSV parsing.",
+)
+def main(input_file: str, output_file: str, column_order_raw: tuple[str, ...], csv_field_size_limit: int) -> None:
+    csv.field_size_limit(csv_field_size_limit)
     column_order = _split_csv_args(column_order_raw)
     try:
         n_rows = reorder_columns(

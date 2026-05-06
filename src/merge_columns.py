@@ -150,6 +150,13 @@ def merge_columns(
     is_flag=True,
     help="Add all non-key columns from extra that are not already in base.",
 )
+@click.option(
+    "--csv-field-size-limit",
+    default=csv.field_size_limit(),
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Maximum per-field character length for CSV/TSV parsing.",
+)
 def main(
     base_file: str,
     extra_file: str,
@@ -157,7 +164,9 @@ def main(
     key_cols_raw: tuple[str, ...],
     add_cols_raw: tuple[str, ...],
     add_all_cols_from_extra: bool,
+    csv_field_size_limit: int,
 ) -> None:
+    csv.field_size_limit(csv_field_size_limit)
     key_columns = _split_csv_args(key_cols_raw)
     add_columns = _split_csv_args(add_cols_raw)
 

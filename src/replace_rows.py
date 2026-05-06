@@ -125,12 +125,20 @@ def replace_rows(
         "for example: --key-col gene --key-col variant or --key-col gene,variant"
     ),
 )
-def main(output_file: str, input_files: tuple[str, ...], key_cols_raw: tuple[str, ...]) -> None:
+@click.option(
+    "--csv-field-size-limit",
+    default=csv.field_size_limit(),
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Maximum per-field character length for CSV/TSV parsing.",
+)
+def main(output_file: str, input_files: tuple[str, ...], key_cols_raw: tuple[str, ...], csv_field_size_limit: int) -> None:
     """Replace rows from INPUT_FILES into OUTPUT_FILE using composite keys.
 
     Later files override matching keys from earlier files. New keys from later
     files are appended.
     """
+    csv.field_size_limit(csv_field_size_limit)
     key_columns = _split_csv_args(key_cols_raw)
     try:
         n_rows = replace_rows(

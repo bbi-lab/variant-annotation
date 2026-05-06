@@ -137,11 +137,19 @@ def filter_columns(
         "for example: --omit-col x,y"
     ),
 )
+@click.option(
+    "--csv-field-size-limit",
+    default=csv.field_size_limit(),
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Maximum per-field character length for CSV/TSV parsing.",
+)
 def main(
     input_file: str,
     output_file: str,
     keep_cols_raw: tuple[str, ...],
     omit_cols_raw: tuple[str, ...],
+    csv_field_size_limit: int,
 ) -> None:
     """Filter columns in INPUT_FILE and write OUTPUT_FILE.
 
@@ -153,6 +161,7 @@ def main(
     Omit mode example:
         python -m src.filter_columns in.tsv out.tsv --omit-col large_blob,notes
     """
+    csv.field_size_limit(csv_field_size_limit)
     keep_cols = _split_csv_args(keep_cols_raw)
     omit_cols = _split_csv_args(omit_cols_raw)
     try:

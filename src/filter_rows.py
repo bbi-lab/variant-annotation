@@ -133,14 +133,23 @@ def filter_rows(
     show_default=True,
     help="Whether selected columns should be non-empty or blank.",
 )
+@click.option(
+    "--csv-field-size-limit",
+    default=csv.field_size_limit(),
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Maximum per-field character length for CSV/TSV parsing.",
+)
 def main(
     input_file: str,
     output_file: str,
     value_cols_raw: tuple[str, ...],
     match_mode: str,
     value_state: str,
+    csv_field_size_limit: int,
 ) -> None:
     """Filter rows in INPUT_FILE and write OUTPUT_FILE."""
+    csv.field_size_limit(csv_field_size_limit)
     value_columns = _split_csv_args(value_cols_raw)
     match_mode = match_mode.lower()
     value_state = value_state.lower()

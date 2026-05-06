@@ -2522,6 +2522,13 @@ def map_variants(
     is_flag=True,
     help="Enable DEBUG-level logging.",
 )
+@click.option(
+    "--csv-field-size-limit",
+    default=csv.field_size_limit(),
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Maximum per-field character length for CSV/TSV parsing.",
+)
 def main(
     input_file: str,
     output_file: str,
@@ -2551,6 +2558,7 @@ def main(
     targets_file: Optional[str],
     target_name_col: str,
     verbose: bool,
+    csv_field_size_limit: int,
 ) -> None:
     """Map variants in INPUT_FILE to human-genome HGVS strings and write OUTPUT_FILE.
 
@@ -2568,6 +2576,7 @@ def main(
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         stream=sys.stderr,
     )
+    csv.field_size_limit(csv_field_size_limit)
     map_variants(
         input_file=input_file,
         output_file=output_file,

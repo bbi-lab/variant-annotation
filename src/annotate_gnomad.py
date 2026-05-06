@@ -932,12 +932,20 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity",
     )
+    p.add_argument(
+        "--csv-field-size-limit",
+        type=int,
+        default=csv.field_size_limit(),
+        metavar="BYTES",
+        help="Maximum per-field character length for CSV/TSV parsing (default: %(default)s).",
+    )
     return p.parse_args(argv)
 
 
 def main(argv: Optional[list[str]] = None) -> None:
     args = _parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    csv.field_size_limit(args.csv_field_size_limit)
 
     if not args.gnomad_ht_uri:
         logger.error("--gnomad-ht-uri (or GNOMAD_HT_URI env var) is required")

@@ -190,6 +190,13 @@ def compare_columns(
     type=int,
     help="Maximum number of data rows to examine. Examines all rows when omitted.",
 )
+@click.option(
+    "--csv-field-size-limit",
+    default=csv.field_size_limit(),
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Maximum per-field character length for CSV/TSV parsing.",
+)
 def main(
     input_file: str,
     cols_a: tuple[str, ...],
@@ -197,6 +204,7 @@ def main(
     output_file: Optional[str],
     skip: int,
     limit: Optional[int],
+    csv_field_size_limit: int,
 ) -> None:
     """Find rows in INPUT_FILE where paired column values differ.
 
@@ -212,6 +220,7 @@ def main(
             --col-a mapped_hgvs_c --col-b old_hgvs_c \\
             --output diffs.tsv
     """
+    csv.field_size_limit(csv_field_size_limit)
     try:
         compare_columns(
             input_file=input_file,

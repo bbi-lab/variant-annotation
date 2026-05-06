@@ -419,6 +419,13 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity",
     )
+    p.add_argument(
+        "--csv-field-size-limit",
+        type=int,
+        default=csv.field_size_limit(),
+        metavar="BYTES",
+        help="Maximum per-field character length for CSV/TSV parsing (default: %(default)s).",
+    )
     return p
 
 
@@ -430,6 +437,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    csv.field_size_limit(args.csv_field_size_limit)
 
     add_dna_clingen_allele_ids(
         args.input,

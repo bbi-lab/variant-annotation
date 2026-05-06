@@ -312,6 +312,13 @@ def haplotypes_to_delins(
     default="INFO",
     show_default=True,
 )
+@click.option(
+    "--csv-field-size-limit",
+    default=csv.field_size_limit(),
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Maximum per-field character length for CSV/TSV parsing.",
+)
 def main(
     input_file: str,
     output_file: str,
@@ -319,8 +326,10 @@ def main(
     target_sequence_col: str,
     orig_raw_hgvs_nt_col: str,
     log_level: str,
+    csv_field_size_limit: int,
 ) -> None:
     """Rewrite intra-codon c.-haplotypes to delins in INPUT_FILE and write OUTPUT_FILE."""
+    csv.field_size_limit(csv_field_size_limit)
     logging.basicConfig(
         level=getattr(logging, log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
