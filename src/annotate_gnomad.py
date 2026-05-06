@@ -26,6 +26,7 @@ import csv
 from itertools import islice
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -142,6 +143,18 @@ def _split_pipe(value: str) -> list[str]:
     if "|" not in value:
         return [value.strip()] if value.strip() else []
     return [part.strip() for part in value.split("|") if part.strip()]
+
+
+def _normalize_caid(caid: str) -> str:
+    """Strip leading zeroes from the numeric part of a ClinGen allele ID.
+
+    gnomAD stores CAIDs without leading zeroes (e.g. ``CA25094``), while the
+    ClinGen Allele Registry returns them zero-padded (e.g. ``CA025094``).
+    """
+    m = re.fullmatch(r"([A-Za-z]+)(\d+)", caid)
+    if m:
+        return m.group(1) + str(int(m.group(2)))
+    return caid
 
 
 def _split_pipe_preserve_positions(value: str) -> list[str]:
@@ -771,7 +784,7 @@ def annotate_row(row: dict[str, str], records: dict[str, GnomadRecord], col_pref
             faf95_values.append("")
             faf95_anc_values.append("")
             continue
-        rec = records.get(caid)
+        rec = records.get(_normalize_caid(caid))
         if rec is None:
             minor_af_values.append("")
             af_values.append("")
@@ -1006,7 +1019,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
             batch_caids: set[str] = set()
             for row in batch_rows:
-                batch_caids.update(_split_pipe((row.get(args.dna_clingen_allele_id_col) or "").strip()))
+                batch_caids.update(_normalize_caid(c) for c in _split_pipe((row.get(args.dna_clingen_allele_id_col) or "").strip()))
 
             missing_caids = batch_caids - looked_up_caids
             if missing_caids:
@@ -1098,7 +1111,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     caids: set[str] = set()
     for row in rows:
-        caids.update(_split_pipe((row.get(args.dna_clingen_allele_id_col) or "").strip()))
+        caids.update(_normalize_caid(c) for c in _split_pipe((row.get(args.dna_clingen_allele_id_col) or "").strip()))
 
     logger.info("Loading gnomAD records for %d unique CAIDs", len(caids))
     if args.execution_mode == "hail":
