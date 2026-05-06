@@ -240,6 +240,8 @@ if [[ -n "$compose_no_cache_flag" ]]; then
   cmd+=("$compose_no_cache_flag")
 fi
 cmd+=(--rm utilities)
-cmd+=("${mapped_args[@]}")
+if [[ ${#mapped_args[@]} -gt 0 ]]; then
+  cmd+=("${mapped_args[@]}")
+fi
 
 exec "${cmd[@]}"

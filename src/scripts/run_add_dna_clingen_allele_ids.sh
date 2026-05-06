@@ -89,7 +89,12 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-exec docker compose --profile tools run \
-  ${compose_build_flag:+$compose_build_flag} ${compose_no_cache_flag:+$compose_no_cache_flag} --rm --no-deps \
-  --entrypoint python map-variants \
-  -m src.add_dna_clingen_allele_ids "$input_in_container" "$output_in_container" "${mapped_args[@]}"
+cmd=(docker compose --profile tools run)
+[[ -n "$compose_build_flag" ]] && cmd+=("$compose_build_flag")
+[[ -n "$compose_no_cache_flag" ]] && cmd+=("$compose_no_cache_flag")
+cmd+=(--rm --no-deps --entrypoint python map-variants
+  -m src.add_dna_clingen_allele_ids "$input_in_container" "$output_in_container")
+if [[ ${#mapped_args[@]} -gt 0 ]]; then
+  cmd+=("${mapped_args[@]}")
+fi
+exec "${cmd[@]}"

@@ -140,6 +140,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-exec docker compose --profile tools run \
-  ${compose_build_flag:+$compose_build_flag} ${compose_no_cache_flag:+$compose_no_cache_flag} --rm \
-  map-variants "$input_in_container" "$output_in_container" "${mapped_args[@]}"
+cmd=(docker compose --profile tools run)
+[[ -n "$compose_build_flag" ]] && cmd+=("$compose_build_flag")
+[[ -n "$compose_no_cache_flag" ]] && cmd+=("$compose_no_cache_flag")
+cmd+=(--rm map-variants "$input_in_container" "$output_in_container")
+if [[ ${#mapped_args[@]} -gt 0 ]]; then
+  cmd+=("${mapped_args[@]}")
+fi
+exec "${cmd[@]}"
