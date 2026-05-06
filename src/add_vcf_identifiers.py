@@ -359,6 +359,89 @@ def _extract_chromosome_from_hgvs(hgvs_value: Optional[str]) -> Optional[str]:
     return None
 
 
+def _parse_genomic_haplotype(
+    accession: str,
+    posedit: str,
+    *,
+    resolve_missing_ref_alleles: bool = False,
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Parse a genomic haplotype posedit like ``[3483520T>A;3483522C>A]``.
+
+    Returns ``(start, stop, ref, alt)`` as strings, or ``(None, None, None, None)``
+    on failure.  Positions not explicitly changed (pass-through bases between
+    component variants) are filled from the reference sequence via UTA when
+    *resolve_missing_ref_alleles* is True; if UTA is unavailable and such gaps
+    exist the function returns all Nones.
+    """
+    posedit = posedit.strip()
+    if not (posedit.startswith("[") and posedit.endswith("]")):
+        return None, None, None, None
+
+    inner = posedit[1:-1]
+    raw_components = [c.strip() for c in inner.split(";") if c.strip()]
+    if not raw_components:
+        return None, None, None, None
+
+    # Parse each component into integer (start, stop, ref, alt)
+    components: list[tuple[int, int, str, str]] = []
+    for raw in raw_components:
+        s_str, e_str, ref, alt = _parse_nucleotide_hgvs(raw)
+        if s_str is None or ref is None or alt is None:
+            return None, None, None, None
+        try:
+            s_int = int(s_str)
+            e_int = int(e_str) if e_str else s_int
+        except (ValueError, TypeError):
+            return None, None, None, None
+        components.append((s_int, e_int, ref, alt))
+
+    overall_start = min(c[0] for c in components)
+    overall_stop = max(c[1] for c in components)
+    span_len = overall_stop - overall_start + 1
+
+    # ref_bases[i] / alt_bases[i] = None means the position is a pass-through
+    # (not explicitly changed by any haplotype component).
+    ref_bases: list[Optional[str]] = [None] * span_len
+    alt_bases: list[Optional[str]] = [None] * span_len
+
+    for start, stop, ref, alt in components:
+        for i, base in enumerate(ref):
+            idx = start - overall_start + i
+            if 0 <= idx < span_len:
+                ref_bases[idx] = base
+        for i, base in enumerate(alt):
+            idx = start - overall_start + i
+            if 0 <= idx < span_len:
+                alt_bases[idx] = base
+
+    # Resolve pass-through bases (same in ref and alt but value unknown without the reference)
+    has_gaps = any(b is None for b in ref_bases)
+    if has_gaps:
+        if not resolve_missing_ref_alleles:
+            return None, None, None, None
+        # Construct a synthetic deletion spanning the region to fetch the ref sequence via UTA.
+        hgvs_del = f"{accession}:g.{overall_start}_{overall_stop}del"
+        resolved = _resolve_missing_ref_allele(hgvs_del)
+        if resolved is None or len(resolved) != span_len:
+            return None, None, None, None
+        for i, base in enumerate(resolved):
+            if ref_bases[i] is None:
+                ref_bases[i] = base
+            if alt_bases[i] is None:
+                # Pass-through position: alt equals ref
+                alt_bases[i] = base
+
+    if any(b is None for b in ref_bases) or any(b is None for b in alt_bases):
+        return None, None, None, None
+
+    return (
+        str(overall_start),
+        str(overall_stop),
+        "".join(ref_bases),  # type: ignore[arg-type]
+        "".join(alt_bases),  # type: ignore[arg-type]
+    )
+
+
 def _parse_hgvs(
     hgvs_value: Optional[str],
     *,
@@ -386,6 +469,16 @@ def _parse_hgvs(
 
     if coord_type == "p":
         start, stop, ref, alt = _parse_protein_hgvs(posedit)
+        return start, stop, ref, alt, False, False, chromosome
+
+    # Genomic haplotype: g.[comp1;comp2;...]
+    if coord_type == "g" and posedit.startswith("[") and posedit.endswith("]"):
+        accession = text.split(":", 1)[0].strip()
+        start, stop, ref, alt = _parse_genomic_haplotype(
+            accession,
+            posedit,
+            resolve_missing_ref_alleles=resolve_missing_ref_alleles,
+        )
         return start, stop, ref, alt, False, False, chromosome
 
     start, stop, ref, alt = _parse_nucleotide_hgvs(posedit)
