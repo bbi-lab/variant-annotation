@@ -366,7 +366,7 @@ def _populate_derived_hgvs_columns(
     mapped_hgvs_g_col: str,
     mapped_hgvs_c_col: str,
     mapped_hgvs_g_chromosome_col: str,
-    mapped_hgvs_c_chromosome_col: str,
+    mapped_hgvs_c_transcript_col: str,
     mapped_hgvs_g_start_col: str,
     mapped_hgvs_g_stop_col: str,
     mapped_hgvs_g_ref_col: str,
@@ -384,7 +384,7 @@ def _populate_derived_hgvs_columns(
         row.get(mapped_hgvs_g_col, ""),
         resolve_missing_ref_alleles=resolve_missing_ref_alleles,
     )
-    c_start, c_stop, c_ref, c_alt, touches_intronic_region, spans_intron, c_chromosome, c_warnings = _derive_joined_hgvs_fields(
+    c_start, c_stop, c_ref, c_alt, touches_intronic_region, spans_intron, c_transcript, c_warnings = _derive_joined_hgvs_fields(
         row.get(mapped_hgvs_c_col, ""),
         resolve_missing_ref_alleles=resolve_missing_ref_alleles,
     )
@@ -395,7 +395,7 @@ def _populate_derived_hgvs_columns(
     row[mapped_hgvs_g_ref_col] = g_ref
     row[mapped_hgvs_g_alt_col] = g_alt
 
-    row[mapped_hgvs_c_chromosome_col] = c_chromosome
+    row[mapped_hgvs_c_transcript_col] = c_transcript
     row[mapped_hgvs_c_start_col] = c_start
     row[mapped_hgvs_c_stop_col] = c_stop
     row[mapped_hgvs_c_ref_col] = c_ref
@@ -419,7 +419,7 @@ def reverse_translate_protein_variants(
     reverse_translation_error_col: str = "reverse_translation_error",
     assayed_variant_level_col: str = "assayed_variant_level",
     mapped_hgvs_g_chromosome_col: str = "mapped_hgvs_g_chromosome",
-    mapped_hgvs_c_chromosome_col: str = "mapped_hgvs_c_chromosome",
+    mapped_hgvs_c_transcript_col: str = "mapped_hgvs_c_transcript",
     mapped_hgvs_g_start_col: str = "mapped_hgvs_g_start",
     mapped_hgvs_g_stop_col: str = "mapped_hgvs_g_stop",
     mapped_hgvs_g_ref_col: str = "mapped_hgvs_g_ref",
@@ -439,6 +439,8 @@ def reverse_translate_protein_variants(
     strict_ref_aa: bool = True,
     use_inv_notation: bool = False,
     allow_length_changing_stop_candidates: bool = True,
+    skip: int = 0,
+    limit: int = 0,
 ) -> None:
     in_sep = _detect_separator(input_file)
     out_sep = _detect_separator(output_file)
@@ -552,7 +554,7 @@ def reverse_translate_protein_variants(
                 mapped_hgvs_g_col=mapped_hgvs_g_col,
                 mapped_hgvs_c_col=mapped_hgvs_c_col,
                 mapped_hgvs_g_chromosome_col=mapped_hgvs_g_chromosome_col,
-                mapped_hgvs_c_chromosome_col=mapped_hgvs_c_chromosome_col,
+                mapped_hgvs_c_transcript_col=mapped_hgvs_c_transcript_col,
                 mapped_hgvs_g_start_col=mapped_hgvs_g_start_col,
                 mapped_hgvs_g_stop_col=mapped_hgvs_g_stop_col,
                 mapped_hgvs_g_ref_col=mapped_hgvs_g_ref_col,
@@ -585,7 +587,7 @@ def reverse_translate_protein_variants(
                 mapped_hgvs_p_col,
                 assayed_variant_level_col,
                 mapped_hgvs_g_chromosome_col,
-                mapped_hgvs_c_chromosome_col,
+                mapped_hgvs_c_transcript_col,
                 mapped_hgvs_g_start_col,
                 mapped_hgvs_g_stop_col,
                 mapped_hgvs_g_ref_col,
@@ -618,6 +620,10 @@ def reverse_translate_protein_variants(
             n_reverse_translated = 0
 
             for idx, row in enumerate(reader):
+                if idx < skip:
+                    continue
+                if limit > 0 and n_rows >= limit:
+                    break
                 protein_origin, target_for_reverse_translation = _classify_row(
                     row,
                     mapped_hgvs_g_col=mapped_hgvs_g_col,
@@ -645,7 +651,7 @@ def reverse_translate_protein_variants(
                         mapped_hgvs_g_col=mapped_hgvs_g_col,
                         mapped_hgvs_c_col=mapped_hgvs_c_col,
                         mapped_hgvs_g_chromosome_col=mapped_hgvs_g_chromosome_col,
-                        mapped_hgvs_c_chromosome_col=mapped_hgvs_c_chromosome_col,
+                        mapped_hgvs_c_transcript_col=mapped_hgvs_c_transcript_col,
                         mapped_hgvs_g_start_col=mapped_hgvs_g_start_col,
                         mapped_hgvs_g_stop_col=mapped_hgvs_g_stop_col,
                         mapped_hgvs_g_ref_col=mapped_hgvs_g_ref_col,
@@ -705,7 +711,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output column name distinguishing dna vs protein assay level.",
     )
     parser.add_argument("--mapped-hgvs-g-chromosome", dest="mapped_hgvs_g_chromosome_col", default="mapped_hgvs_g_chromosome")
-    parser.add_argument("--mapped-hgvs-c-chromosome", dest="mapped_hgvs_c_chromosome_col", default="mapped_hgvs_c_chromosome")
+    parser.add_argument("--mapped-hgvs-c-transcript", dest="mapped_hgvs_c_transcript_col", default="mapped_hgvs_c_transcript")
     parser.add_argument("--mapped-hgvs-g-start", dest="mapped_hgvs_g_start_col", default="mapped_hgvs_g_start")
     parser.add_argument("--mapped-hgvs-g-stop", dest="mapped_hgvs_g_stop_col", default="mapped_hgvs_g_stop")
     parser.add_argument("--mapped-hgvs-g-ref", dest="mapped_hgvs_g_ref_col", default="mapped_hgvs_g_ref")
@@ -750,6 +756,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="For premature stops, suppress length-changing insertion/deletion candidates.",
     )
     parser.add_argument(
+        "--skip",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Skip the first N input rows (after the header).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Stop after processing N rows (0 = no limit).",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -773,7 +793,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         reverse_translation_error_col=args.reverse_translation_error_col,
         assayed_variant_level_col=args.assayed_variant_level_col,
         mapped_hgvs_g_chromosome_col=args.mapped_hgvs_g_chromosome_col,
-        mapped_hgvs_c_chromosome_col=args.mapped_hgvs_c_chromosome_col,
+        mapped_hgvs_c_transcript_col=args.mapped_hgvs_c_transcript_col,
         mapped_hgvs_g_start_col=args.mapped_hgvs_g_start_col,
         mapped_hgvs_g_stop_col=args.mapped_hgvs_g_stop_col,
         mapped_hgvs_g_ref_col=args.mapped_hgvs_g_ref_col,
@@ -793,6 +813,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         strict_ref_aa=args.strict_ref_aa,
         use_inv_notation=args.use_inv_notation,
         allow_length_changing_stop_candidates=args.allow_length_changing_stop_candidates,
+        skip=args.skip,
+        limit=args.limit,
     )
 
 

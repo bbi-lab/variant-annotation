@@ -333,29 +333,30 @@ def _parse_protein_hgvs(hgvs_body: str) -> tuple[Optional[str], Optional[str], O
     return start, stop, ref_1letter, None
 
 
+def _extract_accession_from_hgvs(hgvs_value: Optional[str]) -> Optional[str]:
+    """Extract the raw accession from an HGVS string (the part before the colon)."""
+    if _is_blank(hgvs_value):
+        return None
+    text = (hgvs_value or "").strip()
+    if ":" not in text:
+        return None
+    return text.split(":", 1)[0].strip() or None
+
+
 def _extract_chromosome_from_hgvs(hgvs_value: Optional[str]) -> Optional[str]:
-    """Extract chromosome number from HGVS accession code.
-    
+    """Extract chromosome number from a genomic HGVS accession code.
+
     Examples:
     - "NC_000001.11:g..." -> "1"
     - "NC_000023.11:g..." -> "X"
     - "NC_012920.1:m..." -> "M"
     """
-    if _is_blank(hgvs_value):
+    accession = _extract_accession_from_hgvs(hgvs_value)
+    if accession is None:
         return None
-    
-    text = (hgvs_value or "").strip()
-    if ":" not in text:
-        return None
-    
-    accession, _ = text.split(":", 1)
-    accession = accession.strip()
-    
-    # Try to match known RefSeq prefixes
     for prefix, chromosome in _ACCESSION_TO_CHROMOSOME.items():
         if accession.startswith(prefix):
             return chromosome
-    
     return None
 
 
@@ -463,13 +464,16 @@ def _parse_hgvs(
 
     coord_type = body[0].lower()
     posedit = body[2:]
-    
-    # Extract chromosome
-    chromosome = _extract_chromosome_from_hgvs(hgvs_value)
+
+    # For genomic/protein coords use chromosome; for transcript coords use the accession itself.
+    if coord_type in {"c", "n"}:
+        ref_id: Optional[str] = _extract_accession_from_hgvs(hgvs_value)
+    else:
+        ref_id = _extract_chromosome_from_hgvs(hgvs_value)
 
     if coord_type == "p":
         start, stop, ref, alt = _parse_protein_hgvs(posedit)
-        return start, stop, ref, alt, False, False, chromosome
+        return start, stop, ref, alt, False, False, ref_id
 
     # Genomic haplotype: g.[comp1;comp2;...]
     if coord_type == "g" and posedit.startswith("[") and posedit.endswith("]"):
@@ -479,7 +483,7 @@ def _parse_hgvs(
             posedit,
             resolve_missing_ref_alleles=resolve_missing_ref_alleles,
         )
-        return start, stop, ref, alt, False, False, chromosome
+        return start, stop, ref, alt, False, False, ref_id
 
     start, stop, ref, alt = _parse_nucleotide_hgvs(posedit)
 
@@ -499,7 +503,7 @@ def _parse_hgvs(
         touches_intronic_region = _is_intronic_component(start) or _is_intronic_component(stop)
         spans_intron = _spans_intron(start, stop)
 
-    return start, stop, ref, alt, touches_intronic_region, spans_intron, chromosome
+    return start, stop, ref, alt, touches_intronic_region, spans_intron, ref_id
 
 
 def _set_or_append_fieldnames(fieldnames: list[str], col: str) -> None:
@@ -528,13 +532,13 @@ def _annotate_row(
         raw_value = row.get(base_col) or ""
         segments = raw_value.split("|") if raw_value else [""]
 
-        chromosomes, starts, stops, refs, alts = [], [], [], [], []
+        ref_ids, starts, stops, refs, alts = [], [], [], [], []
         for seg in segments:
-            start, stop, ref, alt, _, _, chromosome = _parse_hgvs(
+            start, stop, ref, alt, _, _, ref_id = _parse_hgvs(
                 seg or None,
                 resolve_missing_ref_alleles=resolve_missing_ref_alleles,
             )
-            chromosomes.append("" if chromosome is None else chromosome)
+            ref_ids.append("" if ref_id is None else ref_id)
             starts.append("" if start is None else start)
             stops.append("" if stop is None else stop)
             refs.append("" if ref is None else ref)
@@ -542,7 +546,8 @@ def _annotate_row(
                 alt = _reverse_complement(ref)
             alts.append("" if alt is None else alt)
 
-        row[f"{base_col}_chromosome"] = "|".join(chromosomes)
+        ref_id_col = f"{base_col}_transcript" if base_col == mapped_hgvs_c_col else f"{base_col}_chromosome"
+        row[ref_id_col] = "|".join(ref_ids)
         row[f"{base_col}_start"] = "|".join(starts)
         row[f"{base_col}_stop"] = "|".join(stops)
         row[f"{base_col}_ref"] = "|".join(refs)
@@ -600,7 +605,8 @@ def annotate_variants(
         fieldnames = list(reader.fieldnames)
 
         for base_col in (mapped_hgvs_g_col, mapped_hgvs_c_col, mapped_hgvs_p_col):
-            _set_or_append_fieldnames(fieldnames, f"{base_col}_chromosome")
+            ref_id_col = f"{base_col}_transcript" if base_col == mapped_hgvs_c_col else f"{base_col}_chromosome"
+            _set_or_append_fieldnames(fieldnames, ref_id_col)
             _set_or_append_fieldnames(fieldnames, f"{base_col}_start")
             _set_or_append_fieldnames(fieldnames, f"{base_col}_stop")
             _set_or_append_fieldnames(fieldnames, f"{base_col}_ref")
