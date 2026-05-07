@@ -399,7 +399,7 @@ async def _normalize_case2_haplotype_to_delins(
         return None, None
 
     row_entries = [(idx, f"c.{comp}", "", 2) for idx, comp in enumerate(components)]
-    per_component, transcript_nm = await _run_dcd_mapping_pipeline(
+    per_component, transcript_nm, _strand = await _run_dcd_mapping_pipeline(
         group_name=f"{row_label}#haplotype-components",
         target_sequence=target_sequence,
         row_entries=row_entries,
@@ -475,15 +475,16 @@ def _load_existing_results(
     dna_vrs_digest_col: str,
     protein_vrs_digest_col: str,
     clingen_allele_id_col: str,
+    strand_col: str,
     key_columns: tuple[str, ...],
 ) -> dict[
     tuple[str, ...],
-    tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
+    tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[int]],
 ]:
     """Load previously computed mapping results from one or more annotated files.
 
     Returns a dict mapping merge-key tuples to
-    ``(hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id, warnings, dna_vrs_digest, protein_vrs_digest)``.
+    ``(hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id, warnings, dna_vrs_digest, protein_vrs_digest, strand)``.
     Rows with all-empty mapped columns and no error are ignored.
     """
     if not key_columns:
@@ -491,7 +492,7 @@ def _load_existing_results(
 
     merged: dict[
         tuple[str, ...],
-        tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
+        tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[int]],
     ] = {}
 
     for file_path in existing_files:
@@ -528,6 +529,8 @@ def _load_existing_results(
                 clingen_allele_id = _normalize_merge_value(row.get(clingen_allele_id_col)) or None
                 dna_vrs_digest = _normalize_merge_value(row.get(dna_vrs_digest_col)) or None
                 protein_vrs_digest = _normalize_merge_value(row.get(protein_vrs_digest_col)) or None
+                strand_str = _normalize_merge_value(row.get(strand_col)) or None
+                strand: Optional[int] = int(strand_str) if strand_str in ("1", "-1") else None
                 if hgvs_c is None and hgvs_g is None and hgvs_p is None and error is None:
                     continue
 
@@ -535,7 +538,7 @@ def _load_existing_results(
                 if key in merged:
                     # Keep first-seen entry to ensure deterministic precedence by file order.
                     continue
-                merged[key] = (hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id, warnings, dna_vrs_digest, protein_vrs_digest)
+                merged[key] = (hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id, warnings, dna_vrs_digest, protein_vrs_digest, strand)
                 loaded_from_file += 1
 
         logger.info("Loaded %d reusable mapped rows from %s", loaded_from_file, file_path)
@@ -925,6 +928,78 @@ _GRCH38_CHR_NC: dict[str, str] = {
 _seqrepo_chr_patch_applied = False
 _dcd_clingen_patch_applied = False
 
+# ---------------------------------------------------------------------------
+# UTA strand lookup (used for case-1 reference-based variants)
+# ---------------------------------------------------------------------------
+
+_uta_strand_cache: dict[str, Optional[int]] = {}
+_uta_strand_connection: Optional[object] = None
+
+
+def _get_uta_schema_name(uta_db_url: str) -> str:
+    """Extract the UTA schema name from the database URL path (the second path component)."""
+    from urllib.parse import urlsplit  # noqa: PLC0415
+
+    path_parts = [p for p in urlsplit(uta_db_url).path.split("/") if p]
+    return path_parts[1] if len(path_parts) >= 2 else "uta_20241220"
+
+
+def _build_uta_pg_kwargs(uta_db_url: str) -> dict:
+    from urllib.parse import urlsplit  # noqa: PLC0415
+
+    parsed = urlsplit(uta_db_url)
+    path_parts = [p for p in parsed.path.split("/") if p]
+    kwargs: dict = {"dbname": path_parts[0]} if path_parts else {"dbname": "uta"}
+    if parsed.hostname:
+        kwargs["host"] = parsed.hostname
+    if parsed.port:
+        kwargs["port"] = parsed.port
+    if parsed.username:
+        kwargs["user"] = parsed.username
+    if parsed.password:
+        kwargs["password"] = parsed.password
+    return kwargs
+
+
+def _lookup_strand_from_uta(transcript_ac: str) -> Optional[int]:
+    """Return 1 (plus strand) or -1 (minus strand) for *transcript_ac* by querying UTA.
+
+    Returns None if UTA is unavailable, the transcript is not found, or the
+    lookup fails for any reason.  Results are cached indefinitely for the lifetime
+    of the process.
+    """
+    global _uta_strand_connection
+
+    if transcript_ac in _uta_strand_cache:
+        return _uta_strand_cache[transcript_ac]
+
+    uta_db_url = (os.environ.get("UTA_DB_URL") or "").strip()
+    if not uta_db_url:
+        _uta_strand_cache[transcript_ac] = None
+        return None
+
+    try:
+        import psycopg2  # type: ignore[import-untyped]  # noqa: PLC0415
+
+        if _uta_strand_connection is None:
+            _uta_strand_connection = psycopg2.connect(**_build_uta_pg_kwargs(uta_db_url))
+
+        schema = _get_uta_schema_name(uta_db_url)
+        with _uta_strand_connection.cursor() as cur:  # type: ignore[union-attr]
+            cur.execute(
+                f"SELECT DISTINCT alt_strand FROM {schema}.tx_exon_aln_v"
+                " WHERE tx_ac = %s AND alt_aln_method = 'splign' LIMIT 1",
+                (transcript_ac,),
+            )
+            row = cur.fetchone()
+            strand = int(row[0]) if row else None
+    except Exception as exc:
+        logger.debug("UTA strand lookup failed for %r: %s", transcript_ac, exc)
+        strand = None
+
+    _uta_strand_cache[transcript_ac] = strand
+    return strand
+
 
 def _patch_seqrepo_chr_lookup() -> None:
     """Monkey-patch ``SeqRepoAccess.translate_identifier`` to fall back to a
@@ -1265,8 +1340,9 @@ async def _run_dcd_mapping_pipeline(
                     )
                     merged_results: list[tuple[int, Optional[str], str, Optional[str], Optional[str]]] = []
                     selected_transcript_nm: Optional[str] = None
+                    selected_strand: Optional[int] = None
                     for orig_idx, hgvs_nt, hgvs_pro, case in row_entries:
-                        one_row_results, one_tx_nm = await _run_dcd_mapping_pipeline(
+                        one_row_results, one_tx_nm, one_strand = await _run_dcd_mapping_pipeline(
                             group_name=f"{group_name}#row{orig_idx}",
                             target_sequence=target_sequence,
                             row_entries=[(orig_idx, hgvs_nt, hgvs_pro, case)],
@@ -1276,7 +1352,9 @@ async def _run_dcd_mapping_pipeline(
                         merged_results.extend(one_row_results)
                         if selected_transcript_nm is None and one_tx_nm is not None:
                             selected_transcript_nm = one_tx_nm
-                    return merged_results, selected_transcript_nm
+                        if selected_strand is None and one_strand is not None:
+                            selected_strand = one_strand
+                    return merged_results, selected_transcript_nm, selected_strand
 
                 return _fail_all(f"Transcript selection failed: {_format_exc(retry_exc)}")
 
@@ -1286,6 +1364,9 @@ async def _run_dcd_mapping_pipeline(
         transcript_nm = getattr(transcript, "nm", None)
 
     align_result = alignment_results.get(group_name)
+    strand_value: Optional[int] = None
+    if align_result is not None and getattr(align_result, "strand", None) is not None:
+        strand_value = align_result.strand.value
     metadata_tg = metadata.target_genes[group_name]
 
     logger.info("Running VRS mapping for group %r.", group_name)
@@ -1350,7 +1431,7 @@ async def _run_dcd_mapping_pipeline(
                         row_hgvs_nt,
                         normalized_hgvs_nt,
                     )
-                    retry_rows, _ = await _run_dcd_mapping_pipeline(
+                    retry_rows, _, _retry_strand = await _run_dcd_mapping_pipeline(
                         group_name=f"{group_name}#haplotype-normalized-row{orig_idx}",
                         target_sequence=target_sequence,
                         row_entries=[(orig_idx, normalized_hgvs_nt, row_hgvs_pro, row_case)],
@@ -1376,7 +1457,7 @@ async def _run_dcd_mapping_pipeline(
 
         per_row.append((orig_idx, hgvs_assay, "", dna_digest, protein_digest))
 
-    return per_row, transcript_nm
+    return per_row, transcript_nm, strand_value
 
 
 async def _process_all_groups(
@@ -1405,7 +1486,7 @@ async def _process_all_groups(
             )
 
         row_entries = [(r[0], r[1], r[2], r[3]) for r in group_rows]
-        per_row, transcript_nm = await _run_dcd_mapping_pipeline(
+        per_row, transcript_nm, _strand = await _run_dcd_mapping_pipeline(
             group_name, target_seq, row_entries, dcd
         )
         for orig_idx, hgvs_assay, error, _dna_digest, _pro_digest in per_row:
@@ -1436,6 +1517,7 @@ def map_variants(
     mapping_warnings_col: str = "mapping_warnings",
     dna_vrs_digest_col: str = "dna_vrs_digest",
     protein_vrs_digest_col: str = "protein_vrs_digest",
+    strand_col: str = "strand",
     clingen_allele_id_col: str = "clingen_allele_id",
     skip: int = 0,
     limit: Optional[int] = None,
@@ -1519,6 +1601,7 @@ def map_variants(
         warnings: Optional[str] = None,
         dna_vrs_digest: Optional[str] = None,
         protein_vrs_digest: Optional[str] = None,
+        strand: Optional[int] = None,
     ) -> None:
         out_row = dict(row)
         out_row[mapped_hgvs_c_col] = hgvs_c or ""
@@ -1528,6 +1611,7 @@ def map_variants(
         out_row[mapping_warnings_col] = warnings or ""
         out_row[dna_vrs_digest_col] = dna_vrs_digest or ""
         out_row[protein_vrs_digest_col] = protein_vrs_digest or ""
+        out_row[strand_col] = "" if strand is None else str(strand)
         out_row[clingen_allele_id_col] = clingen_allele_id or ""
         writer.writerow(out_row)
         # Keep output visible/usable during long runs.
@@ -1563,6 +1647,7 @@ def map_variants(
             mapping_warnings_col,
             dna_vrs_digest_col,
             protein_vrs_digest_col,
+            strand_col,
             clingen_allele_id_col,
         ]:
             if col not in out_fieldnames:
@@ -1600,7 +1685,7 @@ def map_variants(
         )
         existing_results_by_key: dict[
             tuple[str, ...],
-            tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
+            tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[int]],
         ] = {}
         if merge_existing_files:
             missing_in_input = [c for c in merge_key_columns if c not in in_fieldnames]
@@ -1624,6 +1709,7 @@ def map_variants(
                     dna_vrs_digest_col=dna_vrs_digest_col,
                     protein_vrs_digest_col=protein_vrs_digest_col,
                     clingen_allele_id_col=clingen_allele_id_col,
+                    strand_col=strand_col,
                     key_columns=merge_key_columns,
                 )
                 logger.info(
@@ -1636,7 +1722,7 @@ def map_variants(
         rows_by_idx: dict[int, dict] = {}
         pending_results: dict[
             int,
-            tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]],
+            tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[int]],
         ] = {}
         pending_case1_rows: list[tuple[int, dict, str]] = []
         current_group_key: Optional[str] = None
@@ -1656,6 +1742,7 @@ def map_variants(
             warnings: Optional[str] = None,
             dna_vrs_digest: Optional[str] = None,
             protein_vrs_digest: Optional[str] = None,
+            strand: Optional[int] = None,
             group_id: Optional[str] = None,
         ) -> None:
             nonlocal n_written, n_errors, next_to_write
@@ -1673,6 +1760,7 @@ def map_variants(
                     warnings,
                     dna_vrs_digest,
                     protein_vrs_digest,
+                    strand,
                 )
                 n_written += 1
                 if error:
@@ -1683,7 +1771,7 @@ def map_variants(
             # buffer by index and emit in order. The only difference is semantic—
             # "groups" is an optimization hint that groups are contiguous.
             rows_by_idx[idx] = row
-            pending_results[idx] = (hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id, warnings, dna_vrs_digest, protein_vrs_digest)
+            pending_results[idx] = (hgvs_c, hgvs_g, hgvs_p, error, clingen_allele_id, warnings, dna_vrs_digest, protein_vrs_digest, strand)
             while next_to_write in pending_results:
                 next_row = rows_by_idx.pop(next_to_write)
                 (
@@ -1695,6 +1783,7 @@ def map_variants(
                     next_warnings,
                     next_dna_digest,
                     next_pro_digest,
+                    next_strand,
                 ) = pending_results.pop(next_to_write)
                 _write_result_row(
                     writer,
@@ -1708,6 +1797,7 @@ def map_variants(
                     next_warnings,
                     next_dna_digest,
                     next_pro_digest,
+                    next_strand,
                 )
                 n_written += 1
                 if next_error:
@@ -1741,6 +1831,10 @@ def map_variants(
                 batch_results = [_process_case1(raw_nt, dcd_for_case1) for raw_nt in raw_hgvs_nt_values]
 
             for (idx, row, _), (hgvs_c, hgvs_g, hgvs_p, err, clingen_allele_id) in zip(case1_rows, batch_results):
+                # For case-1 variants the strand can be looked up from UTA using the
+                # transcript accession in the mapped c. HGVS (e.g. NM_000049.4:c.81A>G).
+                case1_transcript = (hgvs_c or "").split(":", 1)[0].strip() if ":" in (hgvs_c or "") else ""
+                case1_strand = _lookup_strand_from_uta(case1_transcript) if case1_transcript else None
                 _record_result(
                     idx,
                     row,
@@ -1749,6 +1843,7 @@ def map_variants(
                     hgvs_p,
                     err,
                     clingen_allele_id,
+                    strand=case1_strand,
                     group_id=f"__case1_{idx}__",
                 )
 
@@ -1783,13 +1878,14 @@ def map_variants(
 
             per_row = None
             transcript_nm = None
+            strand: Optional[int] = None
             last_error = None
 
             try:
                 asyncio.set_event_loop(sequence_loop)
                 for attempt in range(1, dcd_max_retry_attempts + 1):
                     try:
-                        per_row, transcript_nm = sequence_loop.run_until_complete(
+                        per_row, transcript_nm, strand = sequence_loop.run_until_complete(
                             _run_dcd_mapping_pipeline(group_name, target_seq, row_entries, dcd_for_groups)
                         )
                         break
@@ -1810,12 +1906,14 @@ def map_variants(
                                 chunk_entries = row_entries[start_idx : start_idx + chunk_sz]
                                 chunk_name = f"{group_name}#retry{attempt}_chunk{start_idx // chunk_sz + 1}"
                                 try:
-                                    chunk_per_row, chunk_tx = sequence_loop.run_until_complete(
+                                    chunk_per_row, chunk_tx, chunk_strand = sequence_loop.run_until_complete(
                                         _run_dcd_mapping_pipeline(chunk_name, target_seq, chunk_entries, dcd_for_groups)
                                     )
                                     per_row.extend(chunk_per_row)
                                     if transcript_nm is None:
                                         transcript_nm = chunk_tx
+                                    if strand is None:
+                                        strand = chunk_strand
                                 except Exception as chunk_exc:
                                     logger.error(
                                         "Chunk %s failed: %s",
@@ -1837,18 +1935,18 @@ def map_variants(
                     fallback_error = _format_exc(last_error) if last_error is not None else "unknown error"
                     per_row = [(orig_idx, None, fallback_error, None, None) for orig_idx, _, _, _ in row_entries]
 
-                hgvs_queries = []  # list of (orig_idx, row, hgvs_assay, dna_digest, pro_digest)
+                hgvs_queries = []  # list of (orig_idx, row, hgvs_assay, dna_digest, pro_digest, strand)
                 for orig_idx, hgvs_assay, error, dna_digest, pro_digest in per_row:
                     row = group_rows_by_idx[orig_idx]
 
                     if error:
-                        _record_result(orig_idx, row, None, None, None, error, group_id=group_name)
+                        _record_result(orig_idx, row, None, None, None, error, strand=strand, group_id=group_name)
                         continue
                     if not hgvs_assay:
-                        _record_result(orig_idx, row, None, None, None, "No HGVS string produced by mapper", group_id=group_name)
+                        _record_result(orig_idx, row, None, None, None, "No HGVS string produced by mapper", strand=strand, group_id=group_name)
                         continue
 
-                    hgvs_queries.append((orig_idx, row, hgvs_assay, dna_digest, pro_digest))
+                    hgvs_queries.append((orig_idx, row, hgvs_assay, dna_digest, pro_digest, strand))
 
                 if hgvs_queries:
                     hgvs_strings = [h[2] for h in hgvs_queries]
@@ -1869,7 +1967,7 @@ def map_variants(
                         clingen_batch_elapsed,
                     )
 
-                    for orig_idx, row, hgvs_assay, dna_digest, pro_digest in hgvs_queries:
+                    for orig_idx, row, hgvs_assay, dna_digest, pro_digest, row_strand in hgvs_queries:
                         data = clingen_results.get(hgvs_assay)
                         if data is None:
                             _assay_is_protein = (
@@ -1884,6 +1982,7 @@ def map_variants(
                                 f"ClinGen returned no data for {hgvs_assay!r}",
                                 dna_vrs_digest=dna_digest,
                                 protein_vrs_digest=pro_digest,
+                                strand=row_strand,
                                 group_id=group_name,
                             )
                             continue
@@ -1902,6 +2001,7 @@ def map_variants(
                             _extract_clingen_allele_id(data),
                             dna_vrs_digest=dna_digest,
                             protein_vrs_digest=pro_digest,
+                            strand=row_strand,
                             group_id=group_name,
                         )
 
@@ -1978,7 +2078,7 @@ def map_variants(
                 if merged_result is not None:
                     if preserve_order == "groups":
                         _flush_current_group()
-                    hgvs_c, hgvs_g, hgvs_p, err, clingen_allele_id, warnings, dna_vrs_digest, protein_vrs_digest = merged_result
+                    hgvs_c, hgvs_g, hgvs_p, err, clingen_allele_id, warnings, dna_vrs_digest, protein_vrs_digest, merged_strand = merged_result
                     _record_result(
                         idx,
                         row,
@@ -1990,6 +2090,7 @@ def map_variants(
                         warnings,
                         dna_vrs_digest,
                         protein_vrs_digest,
+                        merged_strand,
                         group_id="__merged__",
                     )
                     n_merged += 1
@@ -2093,11 +2194,12 @@ def map_variants(
                     # Try to process the full group; retry with chunking on BLAT error 137
                     per_row = None
                     transcript_nm = None
+                    strand: Optional[int] = None
                     last_error = None
 
                     for attempt in range(1, dcd_max_retry_attempts + 1):
                         try:
-                            per_row, transcript_nm = loop.run_until_complete(
+                            per_row, transcript_nm, strand = loop.run_until_complete(
                                 _run_dcd_mapping_pipeline(group_name, target_seq, row_entries, dcd)
                             )
                             break  # Success; exit retry loop
@@ -2120,12 +2222,14 @@ def map_variants(
                                     chunk_entries = row_entries[start_idx : start_idx + chunk_sz]
                                     chunk_name = f"{group_name}#retry{attempt}_chunk{start_idx // chunk_sz + 1}"
                                     try:
-                                        chunk_per_row, chunk_tx = loop.run_until_complete(
+                                        chunk_per_row, chunk_tx, chunk_strand = loop.run_until_complete(
                                             _run_dcd_mapping_pipeline(chunk_name, target_seq, chunk_entries, dcd)
                                         )
                                         per_row.extend(chunk_per_row)
                                         if transcript_nm is None:
                                             transcript_nm = chunk_tx
+                                        if strand is None:
+                                            strand = chunk_strand
                                     except Exception as chunk_exc:
                                         logger.error(
                                             "Chunk %s failed: %s",
@@ -2152,18 +2256,18 @@ def map_variants(
                         per_row = [(orig_idx, None, fallback_error, None, None) for orig_idx, _, _, _ in row_entries]
 
                     # Collect all HGVS strings that need ClinGen queries
-                    hgvs_queries = []  # List of (orig_idx, row, hgvs_assay, dna_digest, pro_digest) tuples
+                    hgvs_queries = []  # List of (orig_idx, row, hgvs_assay, dna_digest, pro_digest, strand) tuples
                     for orig_idx, hgvs_assay, error, dna_digest, pro_digest in per_row:
                         row = group_rows_by_idx[orig_idx]
 
                         if error:
-                            _record_result(orig_idx, row, None, None, None, error, group_id=group_name)
+                            _record_result(orig_idx, row, None, None, None, error, strand=strand, group_id=group_name)
                             continue
                         if not hgvs_assay:
-                            _record_result(orig_idx, row, None, None, None, "No HGVS string produced by mapper", group_id=group_name)
+                            _record_result(orig_idx, row, None, None, None, "No HGVS string produced by mapper", strand=strand, group_id=group_name)
                             continue
 
-                        hgvs_queries.append((orig_idx, row, hgvs_assay, dna_digest, pro_digest))
+                        hgvs_queries.append((orig_idx, row, hgvs_assay, dna_digest, pro_digest, strand))
 
                     # Batch query ClinGen for all HGVS strings concurrently
                     if hgvs_queries:
@@ -2186,7 +2290,7 @@ def map_variants(
                         )
 
                         # Process results in the same order as queries
-                        for orig_idx, row, hgvs_assay, dna_digest, pro_digest in hgvs_queries:
+                        for orig_idx, row, hgvs_assay, dna_digest, pro_digest, row_strand in hgvs_queries:
                             data = clingen_results.get(hgvs_assay)
                             if data is None:
                                 # Preserve the assay-level HGVS even when ClinGen has no record.
@@ -2204,6 +2308,7 @@ def map_variants(
                                     f"ClinGen returned no data for {hgvs_assay!r}",
                                     dna_vrs_digest=dna_digest,
                                     protein_vrs_digest=pro_digest,
+                                    strand=row_strand,
                                     group_id=group_name,
                                 )
                                 continue
@@ -2226,6 +2331,7 @@ def map_variants(
                                 _extract_clingen_allele_id(data),
                                 dna_vrs_digest=dna_digest,
                                 protein_vrs_digest=pro_digest,
+                                strand=row_strand,
                                 group_id=group_name,
                             )
 
@@ -2273,6 +2379,7 @@ def map_variants(
                     pending_warnings,
                     pending_dna_digest,
                     pending_pro_digest,
+                    pending_strand,
                 ) = pending_results[idx]
                 _write_result_row(
                     writer,
@@ -2286,6 +2393,7 @@ def map_variants(
                     pending_warnings,
                     pending_dna_digest,
                     pending_pro_digest,
+                    pending_strand,
                 )
                 n_written += 1
                 if pending_error:
@@ -2407,6 +2515,13 @@ def map_variants(
     default="protein_vrs_digest",
     show_default=True,
     help="Output column name for protein VRS digests.",
+)
+@click.option(
+    "--strand",
+    "strand_col",
+    default="strand",
+    show_default=True,
+    help="Output column name for the chromosomal strand (1 = plus, -1 = minus).",
 )
 @click.option(
     "--clingen-allele-id",
@@ -2544,6 +2659,7 @@ def main(
     mapping_warnings_col: str,
     dna_vrs_digest_col: str,
     protein_vrs_digest_col: str,
+    strand_col: str,
     clingen_allele_id_col: str,
     skip: int,
     limit: Optional[int],
@@ -2592,6 +2708,7 @@ def main(
         mapping_warnings_col=mapping_warnings_col,
         dna_vrs_digest_col=dna_vrs_digest_col,
         protein_vrs_digest_col=protein_vrs_digest_col,
+        strand_col=strand_col,
         clingen_allele_id_col=clingen_allele_id_col,
         skip=skip,
         limit=limit,
