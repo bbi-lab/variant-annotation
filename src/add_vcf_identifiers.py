@@ -72,6 +72,7 @@ class _HgvsRefResolver:
             raise RuntimeError("UTA_DB_URL is required to resolve missing HGVS ref alleles.")
 
         hdp = hgvs.dataproviders.uta.connect(uta_db_url)
+        self._hdp = hdp
         self._parser = hgvs.parser.Parser()
         self._normalizer = hgvs.normalizer.Normalizer(hdp)
 
@@ -82,6 +83,16 @@ class _HgvsRefResolver:
         if isinstance(ref, str) and ref.strip() and ref.strip() != "?":
             return ref.strip()
         return None
+
+    def get_seq(self, accession: str, start_1based: int, stop_1based: int) -> Optional[str]:
+        """Fetch the reference sequence for a genomic range (1-based, inclusive) directly
+        from the sequence repository without any normalization."""
+        try:
+            # UTA's get_seq uses 0-based half-open intervals (like Python slices)
+            seq = self._hdp.get_seq(accession, start_1based - 1, stop_1based)
+            return seq if seq else None
+        except Exception:
+            return None
 
 
 def _get_hgvs_ref_resolver() -> Optional[_HgvsRefResolver]:
@@ -113,6 +124,19 @@ def _resolve_missing_ref_allele(hgvs_value: str) -> Optional[str]:
 
     try:
         return resolver.resolve_ref(hgvs_value)
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=5000)
+def _fetch_ref_seq(accession: str, start: int, stop: int) -> Optional[str]:
+    """Fetch the reference sequence for a 1-based inclusive genomic range directly,
+    without HGVS normalization (which would shift coordinates and return the wrong bases)."""
+    resolver = _get_hgvs_ref_resolver()
+    if resolver is None:
+        return None
+    try:
+        return resolver.get_seq(accession, start, stop)
     except Exception:
         return None
 
@@ -420,9 +444,11 @@ def _parse_genomic_haplotype(
     if has_gaps:
         if not resolve_missing_ref_alleles:
             return None, None, None, None
-        # Construct a synthetic deletion spanning the region to fetch the ref sequence via UTA.
-        hgvs_del = f"{accession}:g.{overall_start}_{overall_stop}del"
-        resolved = _resolve_missing_ref_allele(hgvs_del)
+        # Fetch the reference sequence directly using the exact coordinates.
+        # Do NOT use the HGVS normalizer here: normalizing a synthetic deletion
+        # right-shifts it to the 3' end, returning the sequence at the wrong
+        # (shifted) coordinates rather than the original positions.
+        resolved = _fetch_ref_seq(accession, overall_start, overall_stop)
         if resolved is None or len(resolved) != span_len:
             return None, None, None, None
         for i, base in enumerate(resolved):
