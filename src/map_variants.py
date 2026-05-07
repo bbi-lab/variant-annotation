@@ -1746,6 +1746,14 @@ def map_variants(
             group_id: Optional[str] = None,
         ) -> None:
             nonlocal n_written, n_errors, next_to_write
+
+            # Safety net: if every mapped output column would be blank and no error was
+            # recorded, inject a generic error so the row is never silently left with
+            # all-blank mapping columns.  This can happen when, for example, ClinGen
+            # returns a CA allele record that contains no GRCh38 coordinates and no
+            # matching transcript alleles.
+            if not (hgvs_c or hgvs_g or hgvs_p or error or dna_vrs_digest or protein_vrs_digest):
+                error = "Mapping produced no HGVS output"
             
             if preserve_order == "no":
                 _write_result_row(
