@@ -14,10 +14,12 @@ import requests
 CLINGEN_API_URL = os.environ.get("CLINGEN_API_URL", "https://reg.genome.network/allele")
 CLINGEN_MAX_RETRIES = 3
 CLINGEN_RETRY_DELAY = 2.0
+CLINGEN_503_MAX_RETRIES = 20
+CLINGEN_503_BACKOFF_CAP = 60.0  # maximum per-attempt wait (seconds)
 
 CLINGEN_CACHE_REDIS_URL_DEFAULT = "redis://redis:6379/0"
 CLINGEN_CACHE_PREFIX_DEFAULT = "clingen:v1"
-CLINGEN_CACHE_TTL_SECONDS_DEFAULT = 86400
+CLINGEN_CACHE_TTL_SECONDS_DEFAULT = 86400 * 100
 CLINGEN_CACHE_MISS_TTL_SECONDS_DEFAULT = 86400
 
 _CACHE_MISS_SENTINEL = "__MISS__"
@@ -72,6 +74,40 @@ def _cache_redis_url() -> str:
         or os.environ.get("REDIS_URL")
         or CLINGEN_CACHE_REDIS_URL_DEFAULT
     )
+
+
+def _get_with_503_retry(
+    url: str,
+    *,
+    params: Optional[dict] = None,
+    headers: Optional[dict] = None,
+    timeout: int = 30,
+    retry_delay: float = CLINGEN_RETRY_DELAY,
+    max_503_retries: int = CLINGEN_503_MAX_RETRIES,
+) -> requests.Response:
+    """Make a GET request, transparently retrying up to *max_503_retries* times
+    when the server responds with HTTP 503 (Service Unavailable).
+
+    Each retry waits ``retry_delay * 2**attempt`` seconds, capped at
+    ``CLINGEN_503_BACKOFF_CAP`` seconds, before trying again.  After all retries
+    are exhausted the final (503) response is returned so the caller can handle
+    it consistently.
+    """
+    for attempt in range(max_503_retries + 1):
+        resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+        if resp.status_code != 503:
+            return resp
+        if attempt < max_503_retries:
+            wait = min(retry_delay * (2 ** attempt), CLINGEN_503_BACKOFF_CAP)
+            logger.warning(
+                "ClinGen 503 (attempt %d/%d); retrying in %.1f s",
+                attempt + 1,
+                max_503_retries,
+                wait,
+            )
+            time.sleep(wait)
+    logger.warning("ClinGen 503 after %d retries; giving up", max_503_retries)
+    return resp  # type: ignore[return-value]  # assigned in loop above
 
 
 def _allele_cache_key(allele_id: str) -> str:
@@ -230,7 +266,10 @@ def _fetch_allele_response_by_id(
 
     for attempt in range(max_retries):
         try:
-            response = requests.get(url, timeout=30)
+            response = _get_with_503_retry(url, timeout=30, retry_delay=retry_delay)
+            if response.status_code == 503:
+                # All 503 retries exhausted inside _get_with_503_retry.
+                return None
             if response.status_code == 404:
                 _cache_set(_allele_cache_key(clingen_id), _CACHE_MISS_SENTINEL, miss=True)
                 return None
@@ -328,11 +367,12 @@ def query_clingen_by_hgvs(
 
     for attempt in range(max_retries):
         try:
-            resp = requests.get(
+            resp = _get_with_503_retry(
                 CLINGEN_API_URL,
                 params={"hgvs": hgvs},
                 timeout=30,
                 headers={"Accept": "application/json"},
+                retry_delay=retry_delay,
             )
             if resp.status_code == 200:
                 data = resp.json()
