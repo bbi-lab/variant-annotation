@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+from itertools import islice
 import logging
 import re
 from pathlib import Path
@@ -251,6 +252,8 @@ def haplotypes_to_delins(
     raw_hgvs_nt_col: str = "raw_hgvs_nt",
     target_sequence_col: str = "target_sequence",
     orig_raw_hgvs_nt_col: str = "orig_raw_hgvs_nt",
+    skip: int = 0,
+    limit: int | None = None,
 ) -> dict[str, int]:
     """Rewrite intra-codon multivariants and preserve originals in a new column."""
     in_sep = _detect_separator(input_file)
@@ -278,7 +281,10 @@ def haplotypes_to_delins(
             writer = csv.DictWriter(out_fh, fieldnames=fieldnames, delimiter=out_sep)
             writer.writeheader()
 
-            for row_idx, row in enumerate(reader, start=1):
+            for row_idx, row in enumerate(
+                    islice(reader, skip, None if limit is None else skip + limit),
+                    start=skip + 1,
+                ):
                 totals["rows"] += 1
                 raw_hgvs_nt = row.get(raw_hgvs_nt_col, "")
                 target_sequence = row.get(target_sequence_col, "")
@@ -319,6 +325,19 @@ def haplotypes_to_delins(
     type=click.IntRange(min=1),
     help="Maximum per-field character length for CSV/TSV parsing.",
 )
+@click.option(
+    "--skip",
+    default=0,
+    show_default=True,
+    type=click.IntRange(min=0),
+    help="Number of data rows to skip from the start of the input.",
+)
+@click.option(
+    "--limit",
+    default=None,
+    type=click.IntRange(min=1),
+    help="Maximum number of data rows to process after applying --skip.",
+)
 def main(
     input_file: str,
     output_file: str,
@@ -327,6 +346,8 @@ def main(
     orig_raw_hgvs_nt_col: str,
     log_level: str,
     csv_field_size_limit: int,
+    skip: int,
+    limit: int | None,
 ) -> None:
     """Rewrite intra-codon c.-haplotypes to delins in INPUT_FILE and write OUTPUT_FILE."""
     csv.field_size_limit(csv_field_size_limit)
@@ -341,6 +362,8 @@ def main(
         raw_hgvs_nt_col=raw_hgvs_nt_col,
         target_sequence_col=target_sequence_col,
         orig_raw_hgvs_nt_col=orig_raw_hgvs_nt_col,
+        skip=skip,
+        limit=limit,
     )
 
     click.echo(

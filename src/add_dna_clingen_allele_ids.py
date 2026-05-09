@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
+from itertools import islice
 import logging
 from threading import Lock
 from pathlib import Path
@@ -276,6 +277,8 @@ def add_dna_clingen_allele_ids(
     raw_hgvs_pro_col: str = "raw_hgvs_pro",
     max_retries: int = 3,
     max_workers: int = 8,
+    skip: int = 0,
+    limit: Optional[int] = None,
 ) -> None:
     """Read input table, add DNA-level ClinGen ID column, write output table.
 
@@ -335,7 +338,9 @@ def add_dna_clingen_allele_ids(
                     lookup_cache=lookup_cache,
                     cache_lock=cache_lock,
                 ): idx
-                for idx, row in enumerate(reader)
+                for idx, row in enumerate(
+                    islice(reader, skip, None if limit is None else skip + limit)
+                )
             }
 
             for fut in as_completed(futures):
@@ -426,6 +431,20 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="BYTES",
         help="Maximum per-field character length for CSV/TSV parsing (default: %(default)s).",
     )
+    p.add_argument(
+        "--skip",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Number of data rows to skip from the start of the input.",
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Maximum number of data rows to process after applying --skip.",
+    )
     return p
 
 
@@ -450,6 +469,8 @@ def main(argv: Optional[list[str]] = None) -> None:
         raw_hgvs_pro_col=args.raw_hgvs_pro_col,
         max_retries=args.max_retries,
         max_workers=args.max_workers,
+        skip=args.skip,
+        limit=args.limit,
     )
 
 

@@ -92,6 +92,8 @@ def flatten_dna_variants(
     input_file: Path,
     output_file: Path,
     dna_variant_columns: Optional[List[str]] = None,
+    skip: int = 0,
+    limit: Optional[int] = None,
 ) -> None:
     """
     Expand pipe-delimited DNA variants to one row per DNA candidate.
@@ -119,6 +121,12 @@ def flatten_dna_variants(
 
     if df.empty:
         raise ValueError("Input file is empty or has no data rows")
+
+    # Apply skip/limit before any other processing
+    if skip:
+        df = df.iloc[skip:]
+    if limit is not None:
+        df = df.iloc[:limit]
 
     # Get columns to expand
     if dna_variant_columns is None:
@@ -198,6 +206,20 @@ def main() -> int:
             "If not provided, auto-detects based on column names."
         ),
     )
+    parser.add_argument(
+        "--skip",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Number of data rows to skip from the start of the input.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Maximum number of data rows to process after applying --skip.",
+    )
 
     args = parser.parse_args()
 
@@ -206,7 +228,7 @@ def main() -> int:
         dna_cols = [c.strip() for c in args.dna_variant_columns.split(",")]
 
     try:
-        flatten_dna_variants(args.input_file, args.output_file, dna_cols)
+        flatten_dna_variants(args.input_file, args.output_file, dna_cols, skip=args.skip, limit=args.limit)
         print(f"✓ Flattened variants written to {args.output_file}")
         return 0
     except (FileNotFoundError, ValueError) as e:
