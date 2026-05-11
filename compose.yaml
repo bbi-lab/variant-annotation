@@ -59,6 +59,21 @@ services:
       - variant-annotation-clinvar-cache:/clinvar-cache
       - ${VARIANT_DATA_DIR:-./data}:/work
 
+  annotate-erepo:
+    <<: *tools-image
+    profiles:
+      - tools
+    env_file:
+      - settings/.env
+    environment:
+      EREPO_CACHE_DIR: /erepo-cache
+    entrypoint: ["python", "-m", "src.annotate_erepo"]
+    command: ["--help"]
+    volumes:
+      - .:/usr/src/app
+      - variant-annotation-erepo-cache:/erepo-cache
+      - ${VARIANT_DATA_DIR:-./data}:/work
+
   annotate-gnomad:
     <<: *tools-image
     profiles:
@@ -179,5 +194,6 @@ volumes:
   variant-annotation-redis:
   variant-annotation-seqrepo:
   variant-annotation-clinvar-cache:
+  variant-annotation-erepo-cache:
   variant-annotation-gnomad-cache:
   variant-annotation-spliceai-cache:
