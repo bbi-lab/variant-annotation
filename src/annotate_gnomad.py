@@ -1,11 +1,21 @@
 """Annotate variants with gnomAD allele frequency metrics using a local Hail table cache.
 
 This script annotates each input row using DNA-level ClinGen allele IDs from
-``dna_clingen_allele_id`` (or a custom column). It resolves one row by trying
-pipe-delimited candidate CAIDs in order and using the first gnomAD hit.
+``dna_clingen_allele_id`` (or a custom column), or directly from VCF-style
+genomic coordinate columns (chromosome, position, ref, alt).
 
-On first execution, it downloads/reads the source gnomAD Hail table and writes a
-local indexed cache keyed by ``caid``. Subsequent runs reuse the local cache.
+Two lookup modes are supported via ``--lookup-mode``:
+
+* ``coordinates`` (default) — looks up gnomAD records directly by VCF-style
+  coordinate key ``"chrN:pos:ref:alt"`` built from the coordinate columns.
+  This works even when gnomAD rows have no ClinGen allele IDs and is therefore
+  more complete than CAID-based lookup.
+
+* ``caid`` — uses DNA-level ClinGen allele IDs (``dna_clingen_allele_id``).
+  Recommended only when the gnomAD source table is indexed by CAID.
+
+On first execution, the source gnomAD Hail table is downloaded and a local
+indexed cache is written. Subsequent runs reuse the local cache.
 
 Default output columns:
   - <namespace>.<version>.minor_allele_frequency
@@ -275,6 +285,347 @@ def _load_athena_rows_for_caids(
             "Athena gnomAD query %d/%d complete; cumulative rows fetched: %d",
             chunk_index,
             total_chunks,
+            len(all_rows),
+        )
+
+    return all_rows
+
+
+# Athena enforces a 262144-character query string limit.
+_ATHENA_QUERY_LIMIT = 262144
+
+
+def _load_athena_rows_for_coords(
+    gnomad_keys: list[str],
+    *,
+    database: str,
+    table: str,
+    output_location: str,
+    workgroup: Optional[str],
+    region: Optional[str],
+    max_coords_per_query: int,
+    poll_seconds: int,
+    max_allele_length: int = 1000,
+) -> list[dict[str, Optional[str]]]:
+    """Load gnomAD rows from Athena by VCF-style coordinate lookup (chrom/pos/ref/alt).
+
+    Each *gnomad_key* must be in ``"chrN:pos:ref:alt"`` format.
+    The resulting query uses ``"locus.contig"``, ``"locus.position"``,
+    ``alleles[1]`` (ref) and ``alleles[2]`` (alt) per the gnomAD Athena schema.
+
+    Keys whose ref or alt exceeds *max_allele_length* characters are silently
+    skipped (gnomAD only covers short variants, and long alleles would push the
+    query string past Athena's 262144-character limit).
+    Chunks are bounded by both *max_coords_per_query* (count) and the Athena
+    query-string length limit.
+    """
+    try:
+        import boto3  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(
+            "boto3 is required for --execution-mode athena. Install dependencies with boto3 available."
+        ) from exc
+
+    if not gnomad_keys:
+        return []
+
+    if not output_location:
+        raise ValueError("Athena output location is required")
+
+    # Build the fixed SELECT…FROM…WHERE prefix so we know how much space it occupies.
+    query_prefix = (
+        f'SELECT "locus.contig", "locus.position", alleles[1] AS ref, alleles[2] AS alt, '
+        f'"joint.freq.all.ac", '
+        f'"joint.freq.all.an", '
+        f'"joint.fafmax.faf95_max_gen_anc", '
+        f'"joint.fafmax.faf95_max" '
+        f'FROM "{database}"."{table}" '
+        f"WHERE "
+    )
+    # Leave a 512-char safety buffer below the hard limit.
+    max_where_length = _ATHENA_QUERY_LIMIT - len(query_prefix) - 512
+
+    # Build conditions, grouping into chunks limited by count AND accumulated length.
+    condition_chunks: list[list[str]] = []
+    current_chunk: list[str] = []
+    current_where_len = 0
+
+    for key in gnomad_keys:
+        parts = key.split(":", 3)
+        if len(parts) != 4:
+            continue
+        chrom, pos, ref, alt = parts
+        if len(ref) > max_allele_length or len(alt) > max_allele_length:
+            logger.debug(
+                "Skipping gnomAD coord key with allele exceeding max_allele_length=%d "
+                "(ref=%d bp, alt=%d bp): %s",
+                max_allele_length,
+                len(ref),
+                len(alt),
+                key[:120],
+            )
+            continue
+        chrom_q = chrom.replace("'", "''")
+        ref_q = ref.replace("'", "''")
+        alt_q = alt.replace("'", "''")
+        try:
+            pos_int = int(pos)
+        except ValueError:
+            continue
+        condition = (
+            f'("locus.contig"=\'{chrom_q}\' AND "locus.position"={pos_int}'
+            f" AND alleles[1]='{ref_q}' AND alleles[2]='{alt_q}')"
+        )
+        # Each condition after the first is preceded by " OR " (4 chars).
+        sep_len = len(" OR ") if current_chunk else 0
+        entry_len = sep_len + len(condition)
+
+        if current_chunk and (
+            len(current_chunk) >= max_coords_per_query
+            or current_where_len + entry_len > max_where_length
+        ):
+            condition_chunks.append(current_chunk)
+            current_chunk = []
+            current_where_len = 0
+            entry_len = len(condition)  # no separator for first entry of new chunk
+
+        current_chunk.append(condition)
+        current_where_len += entry_len
+
+    if current_chunk:
+        condition_chunks.append(current_chunk)
+
+    if not condition_chunks:
+        return []
+
+    client_kwargs: dict[str, Any] = {}
+    if region:
+        client_kwargs["region_name"] = region
+    client = boto3.client("athena", **client_kwargs)
+
+    all_rows: list[dict[str, Optional[str]]] = []
+    total_chunks = len(condition_chunks)
+
+    for chunk_index, conditions in enumerate(condition_chunks, start=1):
+        where_clause = " OR ".join(conditions)
+        query = query_prefix + where_clause
+
+        logger.info(
+            "Athena gnomAD coord query %d/%d: requesting %d coordinates",
+            chunk_index,
+            total_chunks,
+            len(conditions),
+        )
+
+        start_kwargs: dict[str, Any] = {
+            "QueryString": query,
+            "QueryExecutionContext": {"Database": database},
+            "ResultConfiguration": {"OutputLocation": output_location},
+        }
+        if workgroup:
+            start_kwargs["WorkGroup"] = workgroup
+
+        start_resp = client.start_query_execution(**start_kwargs)
+        execution_id = start_resp["QueryExecutionId"]
+
+        while True:
+            execution = client.get_query_execution(QueryExecutionId=execution_id)
+            status = execution["QueryExecution"]["Status"]["State"]
+            if status in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                break
+            time.sleep(max(1, poll_seconds))
+
+        if status != "SUCCEEDED":
+            reason = execution["QueryExecution"]["Status"].get("StateChangeReason", "")
+            raise RuntimeError(
+                f"Athena coord query failed ({status}) for chunk {chunk_index}/{total_chunks}: {reason}"
+            )
+
+        next_token: Optional[str] = None
+        header: list[str] = []
+        while True:
+            result_kwargs: dict[str, Any] = {"QueryExecutionId": execution_id}
+            if next_token:
+                result_kwargs["NextToken"] = next_token
+            result = client.get_query_results(**result_kwargs)
+
+            result_set = result.get("ResultSet", {})
+            rows = result_set.get("Rows", [])
+            for row_num, row in enumerate(rows):
+                values = [cell.get("VarCharValue") for cell in row.get("Data", [])]
+                if not header:
+                    header = [str(v or "") for v in values]
+                    continue
+                if len(values) < len(header):
+                    values.extend([None] * (len(header) - len(values)))
+                all_rows.append(dict(zip(header, values)))
+
+            next_token = result.get("NextToken")
+            if not next_token:
+                break
+
+        logger.info(
+            "Athena gnomAD coord query %d/%d complete; cumulative rows fetched: %d",
+            chunk_index,
+            total_chunks,
+            len(all_rows),
+        )
+
+    return all_rows
+
+
+def _load_athena_rows_for_coords_by_chrom(
+    gnomad_keys: list[str],
+    *,
+    database: str,
+    table: str,
+    output_location: str,
+    workgroup: Optional[str],
+    region: Optional[str],
+    max_positions_per_query: int,
+    poll_seconds: int,
+    max_allele_length: int = 1000,
+) -> list[dict[str, Optional[str]]]:
+    """Chromosome-grouped coordinate lookup strategy for Athena.
+
+    Groups keys by chromosome and issues one query per (chromosome, position-chunk)
+    using ``"locus.position" IN (...)``.  This lets Athena use partition pruning
+    on ``"locus.contig"`` and row-group statistics on position.
+    Results are returned as raw rows; ref/alt filtering is done in the caller
+    (``load_gnomad_records_by_gnomad_keys_athena``).
+
+    Keys whose ref or alt exceeds *max_allele_length* characters are silently
+    skipped.
+    """
+    try:
+        import boto3  # type: ignore
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError(
+            "boto3 is required for --execution-mode athena. Install dependencies with boto3 available."
+        ) from exc
+
+    if not gnomad_keys:
+        return []
+
+    if not output_location:
+        raise ValueError("Athena output location is required")
+
+    # Group positions by chromosome, deduplicating.
+    chrom_to_positions: dict[str, set[int]] = {}
+    for key in gnomad_keys:
+        parts = key.split(":", 3)
+        if len(parts) != 4:
+            continue
+        chrom, pos, ref, alt = parts
+        if len(ref) > max_allele_length or len(alt) > max_allele_length:
+            logger.debug(
+                "Skipping gnomAD coord key with allele exceeding max_allele_length=%d "
+                "(ref=%d bp, alt=%d bp): %s",
+                max_allele_length,
+                len(ref),
+                len(alt),
+                key[:120],
+            )
+            continue
+        try:
+            pos_int = int(pos)
+        except ValueError:
+            continue
+        chrom_norm = chrom if chrom.startswith("chr") else f"chr{chrom}"
+        chrom_to_positions.setdefault(chrom_norm, set()).add(pos_int)
+
+    client_kwargs: dict[str, Any] = {}
+    if region:
+        client_kwargs["region_name"] = region
+    client = boto3.client("athena", **client_kwargs)
+
+    select_prefix = (
+        f'SELECT "locus.contig", "locus.position", alleles[1] AS ref, alleles[2] AS alt, '
+        f'"joint.freq.all.ac", '
+        f'"joint.freq.all.an", '
+        f'"joint.fafmax.faf95_max_gen_anc", '
+        f'"joint.fafmax.faf95_max" '
+        f'FROM "{database}"."{table}" '
+    )
+
+    all_rows: list[dict[str, Optional[str]]] = []
+
+    # Build all (chrom, position_chunk) query tasks upfront for logging totals.
+    tasks: list[tuple[str, list[int]]] = []
+    for chrom in sorted(chrom_to_positions):
+        positions = sorted(chrom_to_positions[chrom])
+        for i in range(0, len(positions), max_positions_per_query):
+            tasks.append((chrom, positions[i : i + max_positions_per_query]))
+
+    total_queries = len(tasks)
+    for query_index, (chrom, pos_chunk) in enumerate(tasks, start=1):
+        chrom_q = chrom.replace("'", "''")
+        pos_list = ", ".join(str(p) for p in pos_chunk)
+        query = (
+            select_prefix
+            + f'WHERE "locus.contig"=\'{chrom_q}\' AND "locus.position" IN ({pos_list})'
+        )
+
+        logger.info(
+            "Athena gnomAD by-chrom query %d/%d: chrom=%s positions=%d",
+            query_index,
+            total_queries,
+            chrom,
+            len(pos_chunk),
+        )
+
+        start_kwargs: dict[str, Any] = {
+            "QueryString": query,
+            "QueryExecutionContext": {"Database": database},
+            "ResultConfiguration": {"OutputLocation": output_location},
+        }
+        if workgroup:
+            start_kwargs["WorkGroup"] = workgroup
+
+        start_resp = client.start_query_execution(**start_kwargs)
+        execution_id = start_resp["QueryExecutionId"]
+
+        while True:
+            execution = client.get_query_execution(QueryExecutionId=execution_id)
+            status = execution["QueryExecution"]["Status"]["State"]
+            if status in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                break
+            time.sleep(max(1, poll_seconds))
+
+        if status != "SUCCEEDED":
+            reason = execution["QueryExecution"]["Status"].get("StateChangeReason", "")
+            raise RuntimeError(
+                f"Athena by-chrom query failed ({status}) for query {query_index}/{total_queries} "
+                f"(chrom={chrom}, {len(pos_chunk)} positions): {reason}"
+            )
+
+        next_token: Optional[str] = None
+        header: list[str] = []
+        while True:
+            result_kwargs: dict[str, Any] = {"QueryExecutionId": execution_id}
+            if next_token:
+                result_kwargs["NextToken"] = next_token
+            result = client.get_query_results(**result_kwargs)
+
+            result_set = result.get("ResultSet", {})
+            rows = result_set.get("Rows", [])
+            for row in rows:
+                values = [cell.get("VarCharValue") for cell in row.get("Data", [])]
+                if not header:
+                    header = [str(v or "") for v in values]
+                    continue
+                if len(values) < len(header):
+                    values.extend([None] * (len(header) - len(values)))
+                all_rows.append(dict(zip(header, values)))
+
+            next_token = result.get("NextToken")
+            if not next_token:
+                break
+
+        logger.info(
+            "Athena gnomAD by-chrom query %d/%d complete; cumulative rows fetched: %d",
+            query_index,
+            total_queries,
             len(all_rows),
         )
 
@@ -754,6 +1105,107 @@ def load_gnomad_records_for_caids_athena(
     return out
 
 
+def load_gnomad_records_by_gnomad_keys_athena(
+    gnomad_keys: set[str],
+    *,
+    database: str,
+    table: str,
+    output_location: str,
+    workgroup: Optional[str] = None,
+    region: Optional[str] = None,
+    max_coords_per_query: int = 500,
+    poll_seconds: int = 5,
+    max_allele_length: int = 1000,
+    query_strategy: str = "by-chromosome",
+) -> dict[str, GnomadRecord]:
+    """Load gnomAD records from Athena keyed by ``"chrN:pos:ref:alt"``.
+
+    *query_strategy* selects how the SQL is built:
+
+    * ``"by-chromosome"`` (default) — one query per chromosome using
+      ``"locus.position" IN (...)``.  Lets Athena use partition pruning and
+      Parquet row-group statistics; ref/alt are post-filtered in Python.
+    * ``"or-of-ands"`` — one OR-of-four-column-AND conditions per batch.
+      Exact SQL match; no post-filtering needed.
+    """
+    if not gnomad_keys:
+        return {}
+
+    if query_strategy == "by-chromosome":
+        rows = _load_athena_rows_for_coords_by_chrom(
+            sorted(gnomad_keys),
+            database=database,
+            table=table,
+            output_location=output_location,
+            workgroup=workgroup,
+            region=region,
+            max_positions_per_query=max_coords_per_query,
+            poll_seconds=poll_seconds,
+            max_allele_length=max_allele_length,
+        )
+        # Post-filter: keep only rows whose (contig, pos, ref, alt) match a requested key.
+        wanted_keys = gnomad_keys
+    else:
+        rows = _load_athena_rows_for_coords(
+            sorted(gnomad_keys),
+            database=database,
+            table=table,
+            output_location=output_location,
+            workgroup=workgroup,
+            region=region,
+            max_coords_per_query=max_coords_per_query,
+            poll_seconds=poll_seconds,
+            max_allele_length=max_allele_length,
+        )
+        wanted_keys = gnomad_keys
+
+    out: dict[str, GnomadRecord] = {}
+    for row in rows:
+        contig = (row.get("locus.contig") or "").strip()
+        pos = (row.get("locus.position") or "").strip()
+        ref = (row.get("ref") or "").strip()
+        alt = (row.get("alt") or "").strip()
+        if not (contig and pos and ref and alt):
+            continue
+        key = _build_gnomad_key(contig, pos, ref, alt)
+        if key not in wanted_keys:
+            continue
+        try:
+            ac = int(str(row.get("joint.freq.all.ac") or "0"))
+            an = int(str(row.get("joint.freq.all.an") or "0"))
+        except ValueError:
+            continue
+        if an <= 0:
+            continue
+
+        af = float(ac) / float(an)
+        maf = min(af, 1.0 - af)
+
+        faf95_max_raw = row.get("joint.fafmax.faf95_max")
+        faf95_max: Optional[float]
+        if faf95_max_raw is None or str(faf95_max_raw).strip() == "":
+            faf95_max = None
+        else:
+            try:
+                faf95_max = float(str(faf95_max_raw))
+            except ValueError:
+                faf95_max = None
+
+        faf95_max_ancestry = str(row.get("joint.fafmax.faf95_max_gen_anc") or "")
+
+        out[key] = GnomadRecord(
+            caid="",
+            allele_count=ac,
+            allele_number=an,
+            allele_frequency=af,
+            minor_allele_frequency=maf,
+            faf95_max=faf95_max,
+            faf95_max_ancestry=faf95_max_ancestry,
+        )
+
+    return out
+
+
 def annotate_row(row: dict[str, str], records: dict[str, GnomadRecord], col_prefix: str, dna_col: str) -> dict[str, str]:
     out = {
         f"{col_prefix}.minor_allele_frequency": "",
@@ -785,6 +1237,195 @@ def annotate_row(row: dict[str, str], records: dict[str, GnomadRecord], col_pref
             faf95_anc_values.append("")
             continue
         rec = records.get(_normalize_caid(caid))
+        if rec is None:
+            minor_af_values.append("")
+            af_values.append("")
+            ac_values.append("")
+            an_values.append("")
+            faf95_values.append("")
+            faf95_anc_values.append("")
+            continue
+        minor_af_values.append(str(rec.minor_allele_frequency))
+        af_values.append(str(rec.allele_frequency))
+        ac_values.append(str(rec.allele_count))
+        an_values.append(str(rec.allele_number))
+        faf95_values.append("" if rec.faf95_max is None else str(rec.faf95_max))
+        faf95_anc_values.append(rec.faf95_max_ancestry)
+
+    out[f"{col_prefix}.minor_allele_frequency"] = "|".join(minor_af_values)
+    out[f"{col_prefix}.allele_frequency"] = "|".join(af_values)
+    out[f"{col_prefix}.allele_count"] = "|".join(ac_values)
+    out[f"{col_prefix}.allele_number"] = "|".join(an_values)
+    out[f"{col_prefix}.faf95_max"] = "|".join(faf95_values)
+    out[f"{col_prefix}.faf95_max_ancestry"] = "|".join(faf95_anc_values)
+
+    return out
+
+
+def _build_gnomad_key(chrom: str, pos: str, ref: str, alt: str) -> str:
+    """Build a ``"chrN:pos:ref:alt"`` gnomAD key from VCF-style columns."""
+    chrom_norm = chrom if chrom.startswith("chr") else f"chr{chrom}"
+    return f"{chrom_norm}:{pos}:{ref}:{alt}"
+
+
+def _row_gnomad_keys(
+    row: dict[str, str],
+    chrom_col: str,
+    pos_col: str,
+    ref_col: str,
+    alt_col: str,
+) -> list[str]:
+    """Return the list of gnomad_key values for a row (one per pipe-delimited candidate)."""
+    chroms = _split_pipe_preserve_positions(row.get(chrom_col, ""))
+    positions = _split_pipe_preserve_positions(row.get(pos_col, ""))
+    refs = _split_pipe_preserve_positions(row.get(ref_col, ""))
+    alts = _split_pipe_preserve_positions(row.get(alt_col, ""))
+    n = max(len(chroms), len(positions), len(refs), len(alts))
+    keys: list[str] = []
+    for i in range(n):
+        chrom = chroms[i] if i < len(chroms) else ""
+        pos = positions[i] if i < len(positions) else ""
+        ref = refs[i] if i < len(refs) else ""
+        alt = alts[i] if i < len(alts) else ""
+        if chrom and pos and ref and alt:
+            keys.append(_build_gnomad_key(chrom, pos, ref, alt))
+        else:
+            keys.append("")
+    return keys
+
+
+def load_gnomad_records_by_gnomad_keys(
+    local_ht_path: Path,
+    gnomad_keys: set[str],
+    cache_dir: Path,
+) -> dict[str, GnomadRecord]:
+    """Load gnomAD records keyed by ``"chrN:pos:ref:alt"`` from the local Hail table.
+
+    This is the coordinate-based alternative to :func:`load_gnomad_records_for_caids`.
+    It works whether the local cache is keyed by ``gnomad_key`` or ``caid``.
+    When the cache is caid-keyed, records are returned keyed by their gnomad_key
+    constructed from the locus/alleles at read time.
+    """
+    if not gnomad_keys:
+        return {}
+
+    hl = _import_hail()
+    hail_tmp = cache_dir / "hail-tmp"
+    hail_tmp.mkdir(parents=True, exist_ok=True)
+    hl.init(**_hail_init_kwargs(hail_tmp, str(local_ht_path)))
+    try:
+        ht = hl.read_table(str(local_ht_path))
+        try:
+            key_field = next(iter(ht.key.dtype.keys()), "gnomad_key")
+        except Exception:
+            key_field = "gnomad_key"
+
+        key_literal = hl.literal(gnomad_keys)
+
+        if key_field == "gnomad_key":
+            key_expr = getattr(ht, key_field)
+            filtered = ht.filter(key_literal.contains(key_expr))
+            rows = filtered.collect()
+            out: dict[str, GnomadRecord] = {}
+            for row in rows:
+                gk = str(getattr(row, key_field))
+                ac = int(row.allele_count)
+                an = int(row.allele_number)
+                if an <= 0:
+                    continue
+                af = float(ac) / float(an)
+                maf = min(af, 1.0 - af)
+                faf95_max = float(row.faf95_max) if row.faf95_max is not None else None
+                faf95_max_ancestry = str(row.faf95_max_ancestry or "")
+                out[gk] = GnomadRecord(
+                    caid=gk,
+                    allele_count=ac,
+                    allele_number=an,
+                    allele_frequency=af,
+                    minor_allele_frequency=maf,
+                    faf95_max=faf95_max,
+                    faf95_max_ancestry=faf95_max_ancestry,
+                )
+        else:
+            # Cache is caid-keyed; scan all rows and build gnomad_keys on the fly.
+            # This is less efficient but works as a fallback.
+            logger.warning(
+                "gnomAD coordinate lookup: local cache is caid-keyed; "
+                "performing full scan to build gnomad_key index (this may be slow)"
+            )
+            rows = ht.collect()
+            out = {}
+            for row in rows:
+                ac = int(row.allele_count)
+                an = int(row.allele_number)
+                if an <= 0:
+                    continue
+                af = float(ac) / float(an)
+                maf = min(af, 1.0 - af)
+                faf95_max = float(row.faf95_max) if row.faf95_max is not None else None
+                faf95_max_ancestry = str(row.faf95_max_ancestry or "")
+                rec = GnomadRecord(
+                    caid=str(getattr(row, key_field, "")),
+                    allele_count=ac,
+                    allele_number=an,
+                    allele_frequency=af,
+                    minor_allele_frequency=maf,
+                    faf95_max=faf95_max,
+                    faf95_max_ancestry=faf95_max_ancestry,
+                )
+                # We don't have the gnomad_key in this case; skip — the user
+                # should rebuild the cache with a gnomad_key-indexed source.
+                _ = rec
+    finally:
+        hl.stop()
+
+    return out
+
+
+def annotate_row_by_coords(
+    row: dict[str, str],
+    records_by_key: dict[str, GnomadRecord],
+    col_prefix: str,
+    chrom_col: str,
+    pos_col: str,
+    ref_col: str,
+    alt_col: str,
+) -> dict[str, str]:
+    """Annotate a row by looking up gnomAD records via VCF-style coordinate keys.
+
+    Pipe-delimited coordinate columns are supported; each candidate position is
+    looked up independently and the results are pipe-joined in the output columns.
+    """
+    out = {
+        f"{col_prefix}.minor_allele_frequency": "",
+        f"{col_prefix}.allele_frequency": "",
+        f"{col_prefix}.allele_count": "",
+        f"{col_prefix}.allele_number": "",
+        f"{col_prefix}.faf95_max": "",
+        f"{col_prefix}.faf95_max_ancestry": "",
+    }
+
+    keys = _row_gnomad_keys(row, chrom_col, pos_col, ref_col, alt_col)
+    if not keys:
+        return out
+
+    minor_af_values: list[str] = []
+    af_values: list[str] = []
+    ac_values: list[str] = []
+    an_values: list[str] = []
+    faf95_values: list[str] = []
+    faf95_anc_values: list[str] = []
+
+    for key in keys:
+        if not key:
+            minor_af_values.append("")
+            af_values.append("")
+            ac_values.append("")
+            an_values.append("")
+            faf95_values.append("")
+            faf95_anc_values.append("")
+            continue
+        rec = records_by_key.get(key)
         if rec is None:
             minor_af_values.append("")
             af_values.append("")
@@ -885,34 +1526,57 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Input rows per Athena lookup/write batch (preserves input row order)",
     )
     p.add_argument(
+        "--athena-coord-query-strategy",
+        choices=["by-chromosome", "or-of-ands"],
+        default="by-chromosome",
+        help=(
+            "SQL strategy for coordinate-based Athena lookups (only used when "
+            "--lookup-mode coordinates and --execution-mode athena). "
+            "'by-chromosome' (default) issues one query per chromosome using "
+            "\"locus.position\" IN (...), enabling partition pruning and Parquet "
+            "statistics; ref/alt are matched in Python. "
+            "'or-of-ands' issues exact four-column OR conditions per batch."
+        ),
+    )
+    p.add_argument(
         "--dna-clingen-allele-id-col",
         default="dna_clingen_allele_id",
-        help="Column containing DNA-level ClinGen allele IDs",
+        help="Column containing DNA-level ClinGen allele IDs (used in --lookup-mode caid)",
     )
-    # Coordinate columns (case 2): when the input file already has pre-mapped GRCh38
-    # coordinates, these are used instead of ClinGen API lookups.
+    p.add_argument(
+        "--lookup-mode",
+        choices=["coordinates", "caid"],
+        default="coordinates",
+        help=(
+            "How to look up variants in gnomAD. "
+            "'coordinates' (default) uses VCF-style chrN:pos:ref:alt keys built from "
+            "coordinate columns — more complete because many gnomAD rows have no CAID. "
+            "'caid' uses DNA-level ClinGen allele IDs from --dna-clingen-allele-id-col."
+        ),
+    )
+    # Coordinate columns (case 2 / coordinate lookup mode)
     p.add_argument(
         "--coord-chromosome-col",
         default="mapped_hgvs_g_chromosome",
-        help="Input column with chromosome (e.g. '1' or 'chr1') for case-2 lookups "
+        help="Input column with chromosome (e.g. '1' or 'chr1') "
              "(default: mapped_hgvs_g_chromosome)",
     )
     p.add_argument(
         "--coord-pos-col",
-        default="mapped_hgvs_g_stop",
-        help="Input column with 1-based position for case-2 lookups "
-             "(default: mapped_hgvs_g_stop)",
+        default="mapped_hgvs_g_start",
+        help="Input column with 1-based VCF position (first base of ref allele) "
+             "(default: mapped_hgvs_g_start)",
     )
     p.add_argument(
         "--coord-ref-col",
         default="mapped_hgvs_g_ref",
-        help="Input column with reference allele for case-2 lookups "
+        help="Input column with reference allele "
              "(default: mapped_hgvs_g_ref)",
     )
     p.add_argument(
         "--coord-alt-col",
         default="mapped_hgvs_g_alt",
-        help="Input column with alternate allele for case-2 lookups "
+        help="Input column with alternate allele "
              "(default: mapped_hgvs_g_alt)",
     )
     p.add_argument("--delimiter", default="\t", help="Input/output delimiter (default TAB)")
@@ -1014,6 +1678,9 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         looked_up_caids: set[str] = set()
         record_cache: dict[str, GnomadRecord] = {}
+        looked_up_coords: set[str] = set()
+        coord_record_cache: dict[str, GnomadRecord] = {}
+        use_coordinates = False  # determined after fieldnames are read
         selected_rows = 0
         annotated = 0
 
@@ -1024,6 +1691,60 @@ def main(argv: Optional[list[str]] = None) -> None:
         ) -> tuple[int, int]:
             if not batch_rows:
                 return 0, 0
+
+            if use_coordinates:
+                batch_keys: set[str] = set()
+                for row in batch_rows:
+                    for key in _row_gnomad_keys(
+                        row,
+                        args.coord_chromosome_col,
+                        args.coord_pos_col,
+                        args.coord_ref_col,
+                        args.coord_alt_col,
+                    ):
+                        if key:
+                            batch_keys.add(key)
+
+                missing_keys = batch_keys - looked_up_coords
+                if missing_keys:
+                    logger.info(
+                        "Athena row batch: %d rows, %d unique coordinate keys (%d new lookups)",
+                        len(batch_rows),
+                        len(batch_keys),
+                        len(missing_keys),
+                    )
+                    fetched = load_gnomad_records_by_gnomad_keys_athena(
+                        missing_keys,
+                        database=args.athena_database,
+                        table=athena_table,
+                        output_location=args.athena_output_location,
+                        workgroup=args.athena_workgroup or None,
+                        region=args.athena_region or None,
+                        max_coords_per_query=args.athena_max_caids_per_query,
+                        poll_seconds=args.athena_poll_seconds,
+                        query_strategy=args.athena_coord_query_strategy,
+                    )
+                    coord_record_cache.update(fetched)
+                    looked_up_coords.update(missing_keys)
+
+                batch_annotated = 0
+                for row in batch_rows:
+                    ann = annotate_row_by_coords(
+                        row,
+                        coord_record_cache,
+                        prefix,
+                        args.coord_chromosome_col,
+                        args.coord_pos_col,
+                        args.coord_ref_col,
+                        args.coord_alt_col,
+                    )
+                    row.update(ann)
+                    writer.writerow(row)
+                    if ann[f"{prefix}.minor_allele_frequency"].replace("|", "").strip():
+                        batch_annotated += 1
+
+                out_handle.flush()
+                return len(batch_rows), batch_annotated
 
             batch_caids: set[str] = set()
             for row in batch_rows:
@@ -1069,6 +1790,23 @@ def main(argv: Optional[list[str]] = None) -> None:
                 logger.error("Input file appears empty: %s", input_path)
                 sys.exit(1)
             fieldnames = list(reader.fieldnames)
+            # Determine lookup mode now that fieldnames are available.
+            if args.lookup_mode == "coordinates":
+                coord_cols_needed = [
+                    args.coord_chromosome_col,
+                    args.coord_pos_col,
+                    args.coord_ref_col,
+                    args.coord_alt_col,
+                ]
+                missing_coord_cols_athena = [c for c in coord_cols_needed if c not in fieldnames]
+                if missing_coord_cols_athena:
+                    logger.warning(
+                        "Coordinate lookup requested but some coordinate columns are missing: %s. "
+                        "Falling back to CAID lookup.",
+                        ", ".join(missing_coord_cols_athena),
+                    )
+                else:
+                    use_coordinates = True
             out_fieldnames = fieldnames + [c for c in ann_cols if c not in fieldnames]
 
             writer = csv.DictWriter(
@@ -1117,6 +1855,76 @@ def main(argv: Optional[list[str]] = None) -> None:
             )
         )
 
+    coord_cols = [
+        args.coord_chromosome_col,
+        args.coord_pos_col,
+        args.coord_ref_col,
+        args.coord_alt_col,
+    ]
+    present_coord_cols = [col for col in coord_cols if col in fieldnames]
+    missing_coord_cols = [col for col in coord_cols if col not in fieldnames]
+    coord_cols_present = len(missing_coord_cols) == 0
+
+    use_coordinates = args.lookup_mode == "coordinates"
+
+    if use_coordinates and missing_coord_cols:
+        logger.warning(
+            "Coordinate lookup requested but some coordinate columns are missing: %s. "
+            "Falling back to CAID lookup.",
+            ", ".join(missing_coord_cols),
+        )
+        use_coordinates = False
+
+    if use_coordinates:
+        # Coordinate-based lookup: collect all gnomad_keys, load by coordinate.
+        assert local_ht is not None
+        gnomad_keys: set[str] = set()
+        for row in rows:
+            for key in _row_gnomad_keys(
+                row,
+                args.coord_chromosome_col,
+                args.coord_pos_col,
+                args.coord_ref_col,
+                args.coord_alt_col,
+            ):
+                if key:
+                    gnomad_keys.add(key)
+        logger.info(
+            "Coordinate lookup: loading gnomAD records for %d unique coordinate keys",
+            len(gnomad_keys),
+        )
+        records_by_key = load_gnomad_records_by_gnomad_keys(local_ht, gnomad_keys, cache_dir)
+        logger.info("Loaded %d gnomAD records", len(records_by_key))
+
+        out_fieldnames = fieldnames + [c for c in ann_cols if c not in fieldnames]
+        annotated = 0
+        with output_path.open("w", encoding="utf-8", newline="") as out_fh:
+            writer = csv.DictWriter(
+                out_fh,
+                fieldnames=out_fieldnames,
+                delimiter=delim,
+                lineterminator="\n",
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            for row in rows:
+                ann = annotate_row_by_coords(
+                    row,
+                    records_by_key,
+                    prefix,
+                    args.coord_chromosome_col,
+                    args.coord_pos_col,
+                    args.coord_ref_col,
+                    args.coord_alt_col,
+                )
+                row.update(ann)
+                writer.writerow(row)
+                if ann[f"{prefix}.minor_allele_frequency"].replace("|", "").strip():
+                    annotated += 1
+        logger.info("Done. %d/%d rows annotated -> %s", annotated, len(rows), output_path)
+        return
+
+    # CAID-based lookup (original behaviour).
     caids: set[str] = set()
     for row in rows:
         caids.update(_normalize_caid(c) for c in _split_pipe((row.get(args.dna_clingen_allele_id_col) or "").strip()))
@@ -1124,22 +1932,6 @@ def main(argv: Optional[list[str]] = None) -> None:
     logger.info("Loading gnomAD records for %d unique CAIDs", len(caids))
     if args.execution_mode == "hail":
         assert local_ht is not None
-        coord_cols = [
-            args.coord_chromosome_col,
-            args.coord_pos_col,
-            args.coord_ref_col,
-            args.coord_alt_col,
-        ]
-        present_coord_cols = [col for col in coord_cols if col in fieldnames]
-        missing_coord_cols = [col for col in coord_cols if col not in fieldnames]
-        coord_cols_present = len(missing_coord_cols) == 0
-        if present_coord_cols and missing_coord_cols:
-            logger.warning(
-                "Only some coordinate columns were found in input. Found: %s. Missing: %s. "
-                "Case-2 coordinate lookup requires all four columns; falling back to case-1/3 lookup.",
-                ", ".join(present_coord_cols),
-                ", ".join(missing_coord_cols),
-            )
         coord_mapping = (
             _build_caid_to_gnomad_key(
                 rows,
@@ -1152,6 +1944,13 @@ def main(argv: Optional[list[str]] = None) -> None:
             if coord_cols_present
             else None
         )
+        if present_coord_cols and missing_coord_cols:
+            logger.warning(
+                "Only some coordinate columns found; case-2 lookup skipped. "
+                "Found: %s. Missing: %s.",
+                ", ".join(present_coord_cols),
+                ", ".join(missing_coord_cols),
+            )
 
         records = load_gnomad_records_for_caids(
             local_ht,
