@@ -141,6 +141,73 @@ def _fetch_ref_seq(accession: str, start: int, stop: int) -> Optional[str]:
         return None
 
 
+def _apply_genomic_vcf_anchor(
+    hgvs_str: Optional[str],
+    start: Optional[str],
+    stop: Optional[str],
+    ref: Optional[str],
+    alt: Optional[str],
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """Re-encode a genomic deletion to follow strict VCF convention.
+
+    VCF requires that the first base of *ref* is the unchanged "anchor"
+    nucleotide immediately before the deletion, and *alt* contains only that
+    anchor.  For a deletion of bases B₁…Bₙ starting at position N:
+
+        start → N-1  (position of the anchor)
+        stop  → N + n - 1  (unchanged, last deleted position)
+        ref   → anchor + B₁…Bₙ
+        alt   → anchor
+
+    If the anchor nucleotide cannot be obtained from the reference sequence
+    (UTA unavailable or position 1), the original values are returned unchanged.
+
+    This transformation is applied **only to genomic (g.) HGVS strings** with
+    a blank alt (i.e. pure deletions, not delins variants).
+    """
+    if alt != "" or not start or not hgvs_str:
+        return start, stop, ref, alt
+
+    # Only apply to genomic HGVS (coord_type == "g")
+    text = (hgvs_str or "").strip()
+    if ":" not in text:
+        return start, stop, ref, alt
+    body = text.split(":", 1)[1].strip()
+    if len(body) < 2 or body[1] != "." or body[0].lower() != "g":
+        return start, stop, ref, alt
+
+    try:
+        start_int = int(start)
+    except (ValueError, TypeError):
+        return start, stop, ref, alt
+
+    if start_int <= 1:
+        return start, stop, ref, alt
+
+    accession = _extract_accession_from_hgvs(hgvs_str)
+    if not accession:
+        return start, stop, ref, alt
+
+    anchor_pos = start_int - 1
+
+    if ref:
+        # Deleted bases are known; only need to fetch the anchor.
+        anchor = _fetch_ref_seq(accession, anchor_pos, anchor_pos)
+        if anchor is None:
+            return start, stop, ref, alt
+        return str(anchor_pos), stop, anchor + ref, anchor
+    else:
+        # Deleted bases are unknown; fetch anchor + deleted region together.
+        try:
+            stop_int = int(stop) if stop else start_int
+        except (ValueError, TypeError):
+            return start, stop, ref, alt
+        full_seq = _fetch_ref_seq(accession, anchor_pos, stop_int)
+        if not full_seq:
+            return start, stop, ref, alt
+        return str(anchor_pos), stop, full_seq, full_seq[0]
+
+
 def _detect_separator(file_path: str) -> str:
     return "\t" if Path(file_path).suffix.lower() in (".tsv", ".txt") else ","
 
@@ -557,6 +624,7 @@ def _annotate_row(
     for base_col in (mapped_hgvs_g_col, mapped_hgvs_c_col, mapped_hgvs_p_col):
         raw_value = row.get(base_col) or ""
         segments = raw_value.split("|") if raw_value else [""]
+        is_genomic = base_col == mapped_hgvs_g_col
 
         ref_ids, starts, stops, refs, alts = [], [], [], [], []
         for seg in segments:
@@ -565,11 +633,13 @@ def _annotate_row(
                 resolve_missing_ref_alleles=resolve_missing_ref_alleles,
             )
             ref_ids.append("" if ref_id is None else ref_id)
+            if alt == "inv" and ref:
+                alt = _reverse_complement(ref)
+            if is_genomic:
+                start, stop, ref, alt = _apply_genomic_vcf_anchor(seg or None, start, stop, ref, alt)
             starts.append("" if start is None else start)
             stops.append("" if stop is None else stop)
             refs.append("" if ref is None else ref)
-            if alt == "inv" and ref:
-                alt = _reverse_complement(ref)
             alts.append("" if alt is None else alt)
 
         ref_id_col = f"{base_col}_transcript" if base_col == mapped_hgvs_c_col else f"{base_col}_chromosome"

@@ -33,7 +33,7 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 import psycopg2  # type: ignore[import-untyped]
-from src.add_vcf_identifiers import _parse_hgvs, _reverse_complement
+from src.add_vcf_identifiers import _apply_genomic_vcf_anchor, _parse_hgvs, _reverse_complement
 
 load_dotenv()
 
@@ -305,6 +305,7 @@ def _derive_joined_hgvs_fields(
     joined_hgvs: str,
     *,
     resolve_missing_ref_alleles: bool,
+    is_genomic: bool = False,
 ) -> tuple[str, str, str, str, str, str, str, str]:
     candidates = _split_hgvs_candidates(joined_hgvs)
     if not candidates:
@@ -337,11 +338,13 @@ def _derive_joined_hgvs_fields(
                 resolve_missing_ref_alleles=resolve_missing_ref_alleles,
             )
         
+        if alt == "inv" and ref:
+            alt = _reverse_complement(ref)
+        if is_genomic:
+            start, stop, ref, alt = _apply_genomic_vcf_anchor(candidate, start, stop, ref, alt)
         starts.append(start or "")
         stops.append(stop or "")
         refs.append(ref or "")
-        if alt == "inv" and ref:
-            alt = _reverse_complement(ref)
         alts.append(alt or "")
         touches_intronic.append("true" if touches_intronic_region else "false")
         spans_intron.append("true" if spans_intronic_region else "false")
@@ -383,6 +386,7 @@ def _populate_derived_hgvs_columns(
     g_start, g_stop, g_ref, g_alt, _, _, g_chromosome, g_warnings = _derive_joined_hgvs_fields(
         row.get(mapped_hgvs_g_col, ""),
         resolve_missing_ref_alleles=resolve_missing_ref_alleles,
+        is_genomic=True,
     )
     c_start, c_stop, c_ref, c_alt, touches_intronic_region, spans_intron, c_transcript, c_warnings = _derive_joined_hgvs_fields(
         row.get(mapped_hgvs_c_col, ""),
