@@ -91,6 +91,18 @@ services:
       - variant-annotation-spliceai-cache:/spliceai-cache
       - ${VARIANT_DATA_DIR:-./data}:/work
 
+  annotate-vep:
+    <<: *tools-image
+    profiles:
+      - tools
+    env_file:
+      - settings/.env
+    entrypoint: ["python", "-m", "src.annotate_vep"]
+    command: ["--help"]
+    volumes:
+      - .:/usr/src/app
+      - ${VARIANT_DATA_DIR:-./data}:/work
+
   flatten-dna-variants:
     <<: *tools-image
     profiles:
