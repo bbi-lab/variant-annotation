@@ -11,6 +11,7 @@ Commands:
   filter-rows     <input-file> <output-file> [row filter options]
   replace-rows    <output-file> <input-file>... [replace options]
   merge-columns   <base-file> <extra-file> <output-file> [merge options]
+  rename-columns  <input-file> <output-file> [rename options]
   reorder-columns <input-file> <output-file> --column-order <cols>
 
 Examples:
@@ -19,6 +20,7 @@ Examples:
   src/scripts/run_utilities.sh filter-rows in.tsv out.tsv --value-col a,b --match any
   src/scripts/run_utilities.sh replace-rows replaced.tsv base.tsv patch.tsv --key-col id
   src/scripts/run_utilities.sh merge-columns base.tsv extra.tsv merged.tsv --key-col id --add-col score
+  src/scripts/run_utilities.sh rename-columns in.tsv out.tsv --keep-col old_name:new_name --reorder
   src/scripts/run_utilities.sh reorder-columns in.tsv out.tsv --column-order id,gene,value
 
 Notes:
@@ -56,7 +58,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ $# -lt 1 ]]; then
-  echo "error: missing command (expected: filter-columns, filter-rows, replace-rows, merge-columns, reorder-columns, or compare-columns)" >&2
+  echo "error: missing command (expected: filter-columns, filter-rows, replace-rows, merge-columns, rename-columns, reorder-columns, or compare-columns)" >&2
   exit 2
 fi
 
@@ -202,9 +204,9 @@ case "$command_name" in
     fi
     ;;
 
-  reorder-columns)
+  rename-columns|reorder-columns)
     if [[ $# -lt 2 ]]; then
-      echo "error: reorder-columns requires <input-file> <output-file>" >&2
+      echo "error: $command_name requires <input-file> <output-file>" >&2
       exit 2
     fi
     input_path="$1"
@@ -227,7 +229,7 @@ case "$command_name" in
     ;;
 
   *)
-    echo "error: unknown command '$command_name' (expected: filter-columns, filter-rows, replace-rows, merge-columns, reorder-columns, or compare-columns)" >&2
+    echo "error: unknown command '$command_name' (expected: filter-columns, filter-rows, replace-rows, merge-columns, rename-columns, reorder-columns, or compare-columns)" >&2
     exit 2
     ;;
 esac

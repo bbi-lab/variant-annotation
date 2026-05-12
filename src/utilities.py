@@ -16,12 +16,13 @@ Available commands:
 
 from __future__ import annotations
 
+import csv
 from typing import Optional
 
 import click
 
 from src.compare_columns import compare_columns
-from src.filter_columns import filter_columns
+from src.filter_columns import filter_columns, rename_columns, _parse_keep_col_args
 from src.filter_rows import filter_rows
 from src.merge_columns import merge_columns, _parse_add_col_args, _parse_key_col_args
 from src.reorder_columns import reorder_columns
@@ -74,13 +75,22 @@ def main() -> None:
         "for example: --omit-col x,y"
     ),
 )
+@click.option(
+    "--csv-field-size-limit",
+    default=csv.field_size_limit(),
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Maximum per-field character length for CSV/TSV parsing.",
+)
 def filter_columns_cmd(
     input_file: str,
     output_file: str,
     keep_cols_raw: tuple[str, ...],
     omit_cols_raw: tuple[str, ...],
+    csv_field_size_limit: int,
 ) -> None:
     """Filter columns in INPUT_FILE and write OUTPUT_FILE."""
+    csv.field_size_limit(csv_field_size_limit)
     keep_cols = _split_csv_args(keep_cols_raw)
     omit_cols = _split_csv_args(omit_cols_raw)
     try:
@@ -110,16 +120,25 @@ def filter_columns_cmd(
         "for example: --key-col gene --key-col variant or --key-col gene,variant"
     ),
 )
+@click.option(
+    "--csv-field-size-limit",
+    default=csv.field_size_limit(),
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Maximum per-field character length for CSV/TSV parsing.",
+)
 def replace_rows_cmd(
     output_file: str,
     input_files: tuple[str, ...],
     key_cols_raw: tuple[str, ...],
+    csv_field_size_limit: int,
 ) -> None:
     """Replace rows from INPUT_FILES into OUTPUT_FILE using composite keys.
 
     Later files override matching keys from earlier files. New keys from later
     files are appended.
     """
+    csv.field_size_limit(csv_field_size_limit)
     key_columns = _split_csv_args(key_cols_raw)
     try:
         n_rows = replace_rows(
@@ -177,6 +196,13 @@ def replace_rows_cmd(
         "Defaults to the first (active) sheet."
     ),
 )
+@click.option(
+    "--csv-field-size-limit",
+    default=csv.field_size_limit(),
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Maximum per-field character length for CSV/TSV parsing.",
+)
 def merge_columns_cmd(
     base_file: str,
     extra_file: str,
@@ -185,8 +211,10 @@ def merge_columns_cmd(
     add_cols_raw: tuple[str, ...],
     add_all_cols_from_extra: bool,
     extra_worksheet: str | None,
+    csv_field_size_limit: int,
 ) -> None:
     """Left-join BASE_FILE with EXTRA_FILE and write OUTPUT_FILE."""
+    csv.field_size_limit(csv_field_size_limit)
     key_columns, extra_key_columns = _parse_key_col_args(key_cols_raw)
     add_columns, column_renames = _parse_add_col_args(add_cols_raw)
 
@@ -240,12 +268,20 @@ def merge_columns_cmd(
         "Only applies in keep mode."
     ),
 )
+@click.option(
+    "--csv-field-size-limit",
+    default=csv.field_size_limit(),
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Maximum per-field character length for CSV/TSV parsing.",
+)
 def rename_columns_cmd(
     input_file: str,
     output_file: str,
     keep_cols_raw: tuple[str, ...],
     omit_cols_raw: tuple[str, ...],
     reorder: bool,
+    csv_field_size_limit: int,
 ) -> None:
     """Keep/omit and optionally rename columns in INPUT_FILE, writing OUTPUT_FILE.
 
@@ -256,6 +292,7 @@ def rename_columns_cmd(
     In omit mode (--omit-col), all columns except the listed ones are written,
     names unchanged.
     """
+    csv.field_size_limit(csv_field_size_limit)
     keep_specs = _parse_keep_col_args(keep_cols_raw)
     omit_cols = _split_csv_args(omit_cols_raw)
     try:
@@ -286,12 +323,21 @@ def rename_columns_cmd(
         "for example: --column-order a,b,c"
     ),
 )
+@click.option(
+    "--csv-field-size-limit",
+    default=csv.field_size_limit(),
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Maximum per-field character length for CSV/TSV parsing.",
+)
 def reorder_columns_cmd(
     input_file: str,
     output_file: str,
     column_order_raw: tuple[str, ...],
+    csv_field_size_limit: int,
 ) -> None:
     """Reorder columns in INPUT_FILE and write OUTPUT_FILE."""
+    csv.field_size_limit(csv_field_size_limit)
     column_order = _split_csv_args(column_order_raw)
     try:
         n_rows = reorder_columns(
@@ -343,6 +389,13 @@ def reorder_columns_cmd(
     type=int,
     help="Maximum number of data rows to examine. Examines all rows when omitted.",
 )
+@click.option(
+    "--csv-field-size-limit",
+    default=csv.field_size_limit(),
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Maximum per-field character length for CSV/TSV parsing.",
+)
 def compare_columns_cmd(
     input_file: str,
     cols_a_raw: tuple[str, ...],
@@ -350,6 +403,7 @@ def compare_columns_cmd(
     output_file: Optional[str],
     skip: int,
     limit: Optional[int],
+    csv_field_size_limit: int,
 ) -> None:
     """Find rows where paired column values differ.
 
@@ -357,6 +411,7 @@ def compare_columns_cmd(
     (by position). Rows with at least one differing pair are written to
     --output (or stdout) with a "differences" column listing the mismatched pairs.
     """
+    csv.field_size_limit(csv_field_size_limit)
     if len(cols_a_raw) != len(cols_b_raw):
         raise click.ClickException(
             f"--col-a and --col-b must have the same number of entries "
@@ -406,14 +461,23 @@ def compare_columns_cmd(
     show_default=True,
     help="Whether selected columns should be non-empty or blank.",
 )
+@click.option(
+    "--csv-field-size-limit",
+    default=csv.field_size_limit(),
+    show_default=True,
+    type=click.IntRange(min=1),
+    help="Maximum per-field character length for CSV/TSV parsing.",
+)
 def filter_rows_cmd(
     input_file: str,
     output_file: str,
     value_cols_raw: tuple[str, ...],
     match_mode: str,
     value_state: str,
+    csv_field_size_limit: int,
 ) -> None:
     """Filter rows in INPUT_FILE and write OUTPUT_FILE."""
+    csv.field_size_limit(csv_field_size_limit)
     value_columns = _split_csv_args(value_cols_raw)
     match_mode = match_mode.lower()
     value_state = value_state.lower()
