@@ -8,21 +8,24 @@ Usage: src/scripts/run_annotate_missense_scores.sh <input-file> <output-file> [a
 Examples:
   src/scripts/run_annotate_missense_scores.sh variants.tsv annotated.tsv \
     --revel-file /path/to/revel_hg38.tsv.gz \
-    --alphamissense-file /path/to/AlphaMissense_hg38.tsv.gz
+    --alphamissense-file /path/to/AlphaMissense_hg38.tsv.gz \
+    --dbnsfp-file /path/to/dbNSFP5.3.1a_grch38.gz
 
   # Using environment variables for file paths:
   export REVEL_FILE=/path/to/revel_hg38.tsv.gz
   export ALPHAMISSENSE_FILE=/path/to/AlphaMissense_hg38.tsv.gz
+  export DBNSFP_FILE=/path/to/dbNSFP5.3.1a_grch38.gz
   src/scripts/run_annotate_missense_scores.sh variants.tsv annotated.tsv
 
 Notes:
   - Input/output paths are interpreted relative to /work in the container.
   - By default /work maps to ./data on the host.
   - Override mount directory with VARIANT_DATA_DIR=/absolute/path.
-  - Score files (--revel-file, --alphamissense-file) are passed directly; if they
-    are inside ./data they will be accessible under /work in the container.
+  - Score files (--revel-file, --alphamissense-file, --dbnsfp-file) are passed
+    directly; if they are inside ./data they will be accessible under /work.
   - Requires tabix (htslib) in the container image.
-  - At least one of --revel-file or --alphamissense-file must be provided.
+  - At least one of --revel-file, --alphamissense-file, or --dbnsfp-file must
+    be provided.
   - Images are reused by default for fast runs.
   - Add --rebuild-image to force rebuilding the image.
   - Add --no-build-cache with --rebuild-image for a clean rebuild.
@@ -31,6 +34,10 @@ Data file preparation:
   AlphaMissense (index must be generated locally):
     wget https://storage.googleapis.com/dm_alphamissense/AlphaMissense_hg38.tsv.gz
     tabix -s 1 -b 2 -e 2 AlphaMissense_hg38.tsv.gz
+
+  dbNSFP (GRCh38 variant file; .tbi is available pre-built):
+    wget https://dist.genos.us/academic/e55b09/dbNSFP5.3.1a_grch38.gz
+    wget https://dist.genos.us/academic/e55b09/dbNSFP5.3.1a_grch38.gz.tbi
 
   REVEL (requires one-time preparation):
     wget https://rothsj06.dmz.hpc.mssm.edu/revel-v1.3_all_chromosomes.zip

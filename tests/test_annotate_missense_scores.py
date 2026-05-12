@@ -13,6 +13,8 @@ from src.annotate_missense_scores import (
     _snv_from_hgvs_g,
     _lookup_revel,
     _lookup_alphamissense,
+    _get_dbnsfp_col_indices,
+    _lookup_mutpred2,
     annotate_row,
     NC_TO_CHROM_GRCH38,
 )
@@ -136,6 +138,143 @@ def test_lookup_revel_tries_chr_prefix(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# _get_dbnsfp_col_indices
+# ---------------------------------------------------------------------------
+
+_DBNSFP_HEADER = (
+    "#chr\tpos(1-based)\tref\talt\taaref\taaalt\trs_dbSNP\t"
+    "MutPred2_score\tMutPred2_rankscore\tMutPred2_protID"
+)
+
+
+def test_get_dbnsfp_col_indices_parses_header(tmp_path):
+    """Column names mapped to correct 0-based indices."""
+    dummy = tmp_path / "db.gz"
+    dummy.touch()
+
+    # Clear module-level cache so the mock is actually called.
+    mod._dbnsfp_col_index_cache.clear()
+
+    fake_proc = type("P", (), {"stdout": _DBNSFP_HEADER + "\n", "returncode": 0})()
+    with patch("subprocess.run", return_value=fake_proc):
+        idx = _get_dbnsfp_col_indices(dummy)
+
+    assert idx["chr"] == 0
+    assert idx["pos(1-based)"] == 1
+    assert idx["ref"] == 2
+    assert idx["alt"] == 3
+    assert idx["MutPred2_score"] == 7
+
+
+def test_get_dbnsfp_col_indices_cached(tmp_path):
+    """Second call returns cached value without calling subprocess."""
+    dummy = tmp_path / "db2.gz"
+    dummy.touch()
+    mod._dbnsfp_col_index_cache.clear()
+
+    fake_proc = type("P", (), {"stdout": _DBNSFP_HEADER + "\n", "returncode": 0})()
+    with patch("subprocess.run", return_value=fake_proc) as mock_run:
+        _get_dbnsfp_col_indices(dummy)
+        _get_dbnsfp_col_indices(dummy)  # second call
+        assert mock_run.call_count == 1  # subprocess called only once
+
+
+def test_get_dbnsfp_col_indices_no_header_raises(tmp_path):
+    dummy = tmp_path / "db3.gz"
+    dummy.touch()
+    mod._dbnsfp_col_index_cache.clear()
+
+    fake_proc = type("P", (), {"stdout": "", "returncode": 0})()
+    with patch("subprocess.run", return_value=fake_proc):
+        with pytest.raises(ValueError, match="No header line"):
+            _get_dbnsfp_col_indices(dummy)
+
+
+# ---------------------------------------------------------------------------
+# _lookup_mutpred2
+# ---------------------------------------------------------------------------
+
+_DBNSFP_IDX = {
+    "chr": 0,
+    "pos(1-based)": 1,
+    "ref": 2,
+    "alt": 3,
+    "MutPred2_score": 4,
+}
+
+
+def _dbnsfp_line(chrom, pos, ref, alt, score):
+    return f"{chrom}\t{pos}\t{ref}\t{alt}\t{score}"
+
+
+def test_lookup_mutpred2_found(tmp_path):
+    dummy = tmp_path / "db.gz"
+    dummy.touch()
+    cache: dict = {}
+    mod._dbnsfp_col_index_cache[str(dummy)] = _DBNSFP_IDX
+
+    with patch.object(mod, "_run_tabix", return_value=[_dbnsfp_line("1", 69094, "T", "A", "0.6700")]):
+        result = _lookup_mutpred2(dummy, "1", 69094, "T", "A", cache)
+
+    assert result == "0.6700"
+
+
+def test_lookup_mutpred2_not_found(tmp_path):
+    dummy = tmp_path / "db.gz"
+    dummy.touch()
+    cache: dict = {}
+    mod._dbnsfp_col_index_cache[str(dummy)] = _DBNSFP_IDX
+
+    with patch.object(mod, "_run_tabix", return_value=[]):
+        result = _lookup_mutpred2(dummy, "1", 69094, "T", "A", cache)
+
+    assert result is None
+
+
+def test_lookup_mutpred2_semicolon_max(tmp_path):
+    """Multiple transcript scores (semicolon-separated) → take max."""
+    dummy = tmp_path / "db.gz"
+    dummy.touch()
+    cache: dict = {}
+    mod._dbnsfp_col_index_cache[str(dummy)] = _DBNSFP_IDX
+
+    line = _dbnsfp_line("1", 69094, "T", "A", "0.3100;0.8900;0.1200")
+    with patch.object(mod, "_run_tabix", return_value=[line]):
+        result = _lookup_mutpred2(dummy, "1", 69094, "T", "A", cache)
+
+    assert result == "0.8900"
+
+
+def test_lookup_mutpred2_dot_is_missing(tmp_path):
+    """Periods and 'NA' are treated as no score."""
+    dummy = tmp_path / "db.gz"
+    dummy.touch()
+    cache: dict = {}
+    mod._dbnsfp_col_index_cache[str(dummy)] = _DBNSFP_IDX
+
+    line = _dbnsfp_line("1", 69094, "T", "A", ".")
+    with patch.object(mod, "_run_tabix", return_value=[line]):
+        result = _lookup_mutpred2(dummy, "1", 69094, "T", "A", cache)
+
+    assert result is None
+
+
+def test_lookup_mutpred2_uses_cache(tmp_path):
+    dummy = tmp_path / "db.gz"
+    dummy.touch()
+    cache: dict = {}
+    mod._dbnsfp_col_index_cache[str(dummy)] = _DBNSFP_IDX
+
+    with patch.object(mod, "_run_tabix", return_value=[_dbnsfp_line("1", 69094, "T", "A", "0.5000")]):
+        _lookup_mutpred2(dummy, "1", 69094, "T", "A", cache)
+
+    with patch.object(mod, "_run_tabix", side_effect=AssertionError("should not call tabix")):
+        result = _lookup_mutpred2(dummy, "1", 69094, "T", "A", cache)
+
+    assert result == "0.5000"
+
+
+# ---------------------------------------------------------------------------
 # _lookup_alphamissense
 # ---------------------------------------------------------------------------
 
@@ -190,16 +329,22 @@ def test_lookup_alphamissense_takes_max_pathogenicity(tmp_path):
 def test_annotate_row_both_scores(tmp_path):
     revel_path = tmp_path / "revel.tsv.gz"
     am_path = tmp_path / "am.tsv.gz"
+    dbnsfp_path = tmp_path / "db.tsv.gz"
     revel_path.touch()
     am_path.touch()
+    dbnsfp_path.touch()
+    mod._dbnsfp_col_index_cache[str(dbnsfp_path)] = _DBNSFP_IDX
 
     row = {"id": "v1", "mapped_hgvs_g": "NC_000001.11:g.69094T>A"}
     revel_cache: dict = {}
     am_cache: dict = {}
+    mutpred2_cache: dict = {}
 
     def fake_tabix(path: Path, chrom: str, pos: int) -> list[str]:
         if "revel" in str(path):
             return ["1\t69094\tT\tA\t0.5500"]
+        if "db" in str(path):
+            return [_dbnsfp_line("1", 69094, "T", "A", "0.7200")]
         return ["chr1\t69094\tT\tA\thg38\tQ\tT\tI1K\t0.8200\tlikely_pathogenic"]
 
     with patch.object(mod, "_run_tabix", side_effect=fake_tabix):
@@ -209,13 +354,87 @@ def test_annotate_row_both_scores(tmp_path):
             mapped_hgvs_g_col="mapped_hgvs_g",
             revel_path=revel_path,
             alphamissense_path=am_path,
+            dbnsfp_path=dbnsfp_path,
             revel_cache=revel_cache,
             am_cache=am_cache,
+            mutpred2_cache=mutpred2_cache,
         )
 
     assert ann["revel.score"] == "0.5500"
     assert ann["alphamissense.pathogenicity"] == "0.8200"
     assert ann["alphamissense.class"] == "likely_pathogenic"
+    assert ann["mutpred2.score"] == "0.7200"
+
+
+def test_annotate_row_with_dbnsfp_only(tmp_path):
+    """dbnsfp_path without revel/am → only mutpred2.score in output (single value)."""
+    dbnsfp_path = tmp_path / "db.tsv.gz"
+    dbnsfp_path.touch()
+    mod._dbnsfp_col_index_cache[str(dbnsfp_path)] = _DBNSFP_IDX
+
+    row = {"mapped_hgvs_g": "NC_000001.11:g.69094T>A"}
+
+    with patch.object(mod, "_run_tabix", return_value=[_dbnsfp_line("1", 69094, "T", "A", "0.6300")]):
+        ann = annotate_row(
+            row,
+            nc_to_chrom=NC_TO_CHROM_GRCH38,
+            mapped_hgvs_g_col="mapped_hgvs_g",
+            revel_path=None,
+            alphamissense_path=None,
+            dbnsfp_path=dbnsfp_path,
+            revel_cache={},
+            am_cache={},
+        )
+
+    assert "mutpred2.score" in ann
+    assert ann["mutpred2.score"] == "0.6300"
+    assert "revel.score" not in ann
+
+
+def test_annotate_row_mutpred2_single_score_across_candidates(tmp_path):
+    """Pipe-delimited candidates → MutPred2 emits one score (protein model).
+
+    Candidates are different DNA spellings of the same amino acid change, so
+    mutpred2.score must be a plain string, not pipe-delimited.
+    """
+    revel_path = tmp_path / "revel.tsv.gz"
+    dbnsfp_path = tmp_path / "db.tsv.gz"
+    revel_path.touch()
+    dbnsfp_path.touch()
+    mod._dbnsfp_col_index_cache[str(dbnsfp_path)] = _DBNSFP_IDX
+
+    # Two reverse-translation candidates for the same protein change.
+    row = {"mapped_hgvs_g": "NC_000001.11:g.69094T>A|NC_000001.11:g.69094T>C"}
+
+    def fake_tabix(path: Path, chrom: str, pos: int) -> list[str]:
+        if "revel" in str(path):
+            return [
+                "1\t69094\tT\tA\t0.5500",
+                "1\t69094\tT\tC\t0.3300",
+            ]
+        # dbNSFP: first candidate has score 0.6700, second has 0.8100.
+        return [
+            _dbnsfp_line("1", 69094, "T", "A", "0.6700"),
+            _dbnsfp_line("1", 69094, "T", "C", "0.8100"),
+        ]
+
+    with patch.object(mod, "_run_tabix", side_effect=fake_tabix):
+        ann = annotate_row(
+            row,
+            nc_to_chrom=NC_TO_CHROM_GRCH38,
+            mapped_hgvs_g_col="mapped_hgvs_g",
+            revel_path=revel_path,
+            alphamissense_path=None,
+            dbnsfp_path=dbnsfp_path,
+            revel_cache={},
+            am_cache={},
+        )
+
+    # REVEL is DNA-level → pipe-aligned.
+    assert ann["revel.score"] == "0.5500|0.3300"
+    # MutPred2 is protein-level → single best score, no pipe.
+    assert "|" not in ann["mutpred2.score"]
+    assert ann["mutpred2.score"] == "0.8100"
 
 
 def test_annotate_row_non_snv_empty(tmp_path):
@@ -240,7 +459,6 @@ def test_annotate_row_non_snv_empty(tmp_path):
     assert ann["revel.score"] == ""
 
 
-def test_annotate_row_pipe_aligned(tmp_path):
     """Pipe-delimited HGVS → pipe-delimited output aligned to positions."""
     revel_path = tmp_path / "revel.tsv.gz"
     revel_path.touch()
@@ -293,7 +511,6 @@ def test_annotate_row_empty_hgvs(tmp_path):
         )
 
     assert ann["revel.score"] == ""
-
 
 # ---------------------------------------------------------------------------
 # main() integration

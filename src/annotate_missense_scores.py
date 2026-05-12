@@ -15,24 +15,25 @@ Supported scores (hg38 / GRCh38 only):
     Range:  0–1 (higher = more likely pathogenic)
     Scope:  missense SNVs only
 
-At least one of --revel-file or --alphamissense-file is required.
+  MutPred2 (via dbNSFP)
+  --dbnsfp-file dbNSFP5.3.1a_grch38.gz
+    Source: https://sites.google.com/site/jpopgen/dbNSFP
+    The file and its .tbi index are available pre-built (see run script for URLs).
+    Range:  0–1 (higher = more likely pathogenic)
+    Scope:  missense SNVs only; returns max score across transcripts
 
-MutPred2 is NOT included here because it has no pre-computed genome-wide lookup
-table (it requires running a local neural-network model on protein-level amino
-acid substitutions).  Two practical alternatives:
-
-  * Run MutPred2 locally (http://mutpred.mutdb.org/) on protein variants
-    extracted from your dataset and join the results via merge-columns.
-  * Use dbNSFP v4 (https://sites.google.com/site/jpopgen/dbNSFP), a
-    comprehensive database that includes pre-computed MutPred2, REVEL,
-    AlphaMissense, and 50+ other predictors in a single tabix-indexed file.
+At least one of --revel-file, --alphamissense-file, or --dbnsfp-file is required.
 
 
 Data file preparation
 ---------------------
 
-AlphaMissense is already bgzipped and tabix-indexed as downloaded; no
-preparation needed.
+AlphaMissense is already bgzipped; generate the tabix index locally::
+
+    tabix -s 1 -b 2 -e 2 AlphaMissense_hg38.tsv.gz
+
+dbNSFP GRCh38 variant file and its .tbi index are available pre-built
+(download both the .gz and .tbi).
 
 For REVEL, download revel_with_transcript_ids.csv.zip from the link above,
 unzip it, then run::
@@ -55,9 +56,12 @@ Output columns
   revel.score                — REVEL score string (empty for non-SNV / non-missense)
   alphamissense.pathogenicity — AlphaMissense pathogenicity score (0–1)
   alphamissense.class        — likely_benign / ambiguous / likely_pathogenic
+  mutpred2.score             — MutPred2 score from dbNSFP (single value per row; protein-level model)
 
-For rows with pipe-delimited genomic HGVS values the output columns are
-pipe-aligned to match the input candidate positions.
+For rows with pipe-delimited genomic HGVS values the REVEL and AlphaMissense
+columns are pipe-aligned to match the input candidate positions.  MutPred2 is a
+protein-level model, so all reverse-translation candidates encode the same amino
+acid substitution; a single score (the maximum across candidates) is emitted.
 """
 
 from __future__ import annotations
@@ -105,6 +109,10 @@ NC_TO_CHROM_GRCH38: dict[str, str] = {
 
 REVEL_COLS = ["revel.score"]
 ALPHAMISSENSE_COLS = ["alphamissense.pathogenicity", "alphamissense.class"]
+DBNSFP_COLS = ["mutpred2.score"]
+
+# Module-level cache so the dbNSFP header is read at most once per file path.
+_dbnsfp_col_index_cache: dict[str, dict[str, int]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +168,40 @@ def _snv_from_hgvs_g(
     return chrom, int(m.group(2)), ref, alt
 
 
+def _get_dbnsfp_col_indices(path: Path) -> dict[str, int]:
+    """Return column-name → 0-based-index mapping from the dbNSFP header.
+
+    Uses ``tabix -H`` to retrieve the header without scanning the entire file.
+    Result is cached on *path* so subsequent calls are instantaneous.
+    """
+    key = str(path)
+    if key in _dbnsfp_col_index_cache:
+        return _dbnsfp_col_index_cache[key]
+
+    proc = subprocess.run(
+        ["tabix", "-H", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    header_line: Optional[str] = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("#"):
+            header_line = line
+            break
+
+    if header_line is None:
+        raise ValueError(
+            f"No header line found in {path} via 'tabix -H'. "
+            "Ensure the file is tabix-indexed and has a '#'-prefixed header."
+        )
+
+    col_names = header_line.lstrip("#").split("\t")
+    result = {name.strip(): i for i, name in enumerate(col_names)}
+    _dbnsfp_col_index_cache[key] = result
+    return result
+
+
 def _split_pipe(value: str) -> list[str]:
     raw = value or ""
     if "|" not in raw:
@@ -170,6 +212,92 @@ def _split_pipe(value: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Per-tool lookups
 # ---------------------------------------------------------------------------
+
+
+def _lookup_mutpred2(
+    path: Path,
+    chrom: str,
+    pos: int,
+    ref: str,
+    alt: str,
+    cache: dict[tuple[str, int, str, str], Optional[str]],
+) -> Optional[str]:
+    """Return the maximum MutPred2 score string for an SNV from dbNSFP, or ``None``.
+
+    dbNSFP stores multiple scores per allele (one per protein/transcript),
+    semicolon-separated.  A period ``"."`` indicates no score for that entry.
+    We return the maximum non-null score across all entries.
+
+    Expected dbNSFP column names (resolved dynamically from the file header):
+      chr, pos(1-based), ref, alt, MutPred2_score
+    """
+    key = (chrom, pos, ref, alt)
+    if key in cache:
+        return cache[key]
+
+    try:
+        col_idx = _get_dbnsfp_col_indices(path)
+    except ValueError as exc:
+        logger.warning("Cannot read dbNSFP header: %s", exc)
+        cache[key] = None
+        return None
+
+    chr_col = col_idx.get("chr")
+    pos_col = col_idx.get("pos(1-based)")
+    ref_col = col_idx.get("ref")
+    alt_col = col_idx.get("alt")
+    score_col = col_idx.get("MutPred2_score")
+
+    missing = [
+        name
+        for name, idx in [
+            ("chr", chr_col),
+            ("pos(1-based)", pos_col),
+            ("ref", ref_col),
+            ("alt", alt_col),
+            ("MutPred2_score", score_col),
+        ]
+        if idx is None
+    ]
+    if missing:
+        logger.warning(
+            "dbNSFP column(s) not found: %s. "
+            "Verify that --dbnsfp-file is a dbNSFP GRCh38 variant file.",
+            ", ".join(missing),
+        )
+        cache[key] = None
+        return None
+
+    best: Optional[float] = None
+    for chrom_try in _chrom_candidates(chrom):
+        lines = _run_tabix(path, chrom_try, pos)
+        for line in lines:
+            fields = line.split("\t")
+            try:
+                if int(fields[pos_col]) != pos:  # type: ignore[index]
+                    continue
+            except (ValueError, IndexError):
+                continue
+            if fields[ref_col].upper() != ref or fields[alt_col].upper() != alt:  # type: ignore[index]
+                continue
+            if score_col >= len(fields):  # type: ignore[operator]
+                continue
+            for part in fields[score_col].split(";"):  # type: ignore[index]
+                part = part.strip()
+                if part in (".", "", "NA"):
+                    continue
+                try:
+                    score = float(part)
+                except ValueError:
+                    continue
+                if best is None or score > best:
+                    best = score
+        if best is not None:
+            break
+
+    result = f"{best:.4f}" if best is not None else None
+    cache[key] = result
+    return result
 
 def _lookup_revel(
     path: Path,
@@ -285,8 +413,10 @@ def annotate_row(
     mapped_hgvs_g_col: str,
     revel_path: Optional[Path],
     alphamissense_path: Optional[Path],
+    dbnsfp_path: Optional[Path] = None,
     revel_cache: dict[tuple[str, int, str, str], Optional[str]],
     am_cache: dict[tuple[str, int, str, str], Optional[tuple[str, str]]],
+    mutpred2_cache: Optional[dict[tuple[str, int, str, str], Optional[str]]] = None,
 ) -> dict[str, str]:
     """Return annotation columns for a single row.
 
@@ -299,6 +429,13 @@ def annotate_row(
     revel_vals: list[str] = []
     am_path_vals: list[str] = []
     am_class_vals: list[str] = []
+    mutpred2_vals: list[str] = []
+
+    # Use a local throwaway cache if the caller didn't supply one (preserves
+    # backward-compatibility; cross-row deduplication requires a real dict).
+    _mp2_cache: dict[tuple[str, int, str, str], Optional[str]] = (
+        mutpred2_cache if mutpred2_cache is not None else {}
+    )
 
     for hgvs in candidates:
         snv = _snv_from_hgvs_g(hgvs, nc_to_chrom) if hgvs else None
@@ -323,6 +460,13 @@ def annotate_row(
             am_path_vals.append("")
             am_class_vals.append("")
 
+        if snv is not None and dbnsfp_path is not None:
+            chrom, pos, ref, alt = snv
+            m = _lookup_mutpred2(dbnsfp_path, chrom, pos, ref, alt, _mp2_cache)
+            if m is not None:
+                mutpred2_vals.append(m)
+        # (non-SNV candidates are simply skipped for the protein-level score)
+
     sep = "|" if len(candidates) > 1 else ""
     out: dict[str, str] = {}
     if revel_path is not None:
@@ -330,6 +474,14 @@ def annotate_row(
     if alphamissense_path is not None:
         out["alphamissense.pathogenicity"] = sep.join(am_path_vals)
         out["alphamissense.class"] = sep.join(am_class_vals)
+    if dbnsfp_path is not None:
+        # MutPred2 is protein-level: all candidates encode the same amino acid
+        # substitution, so emit the single best score across candidates.
+        if mutpred2_vals:
+            best_mp2 = max(mutpred2_vals, key=float)
+        else:
+            best_mp2 = ""
+        out["mutpred2.score"] = best_mp2
     return out
 
 
@@ -363,6 +515,17 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help=(
             "bgzipped, tabix-indexed AlphaMissense TSV (AlphaMissense_hg38.tsv.gz). "
             "Defaults to ALPHAMISSENSE_FILE env var."
+        ),
+    )
+    p.add_argument(
+        "--dbnsfp-file",
+        default=os.environ.get("DBNSFP_FILE"),
+        metavar="PATH",
+        help=(
+            "bgzipped, tabix-indexed dbNSFP GRCh38 variant file "
+            "(e.g. dbNSFP5.3.1a_grch38.gz). "
+            "Used to annotate MutPred2_score. "
+            "Defaults to DBNSFP_FILE env var."
         ),
     )
     p.add_argument(
@@ -408,10 +571,12 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     revel_path = Path(args.revel_file) if args.revel_file else None
     am_path = Path(args.alphamissense_file) if args.alphamissense_file else None
+    dbnsfp_path = Path(args.dbnsfp_file) if args.dbnsfp_file else None
 
-    if revel_path is None and am_path is None:
+    if revel_path is None and am_path is None and dbnsfp_path is None:
         logger.error(
-            "At least one of --revel-file or --alphamissense-file must be provided."
+            "At least one of --revel-file, --alphamissense-file, or --dbnsfp-file "
+            "must be provided."
         )
         raise SystemExit(1)
 
@@ -420,6 +585,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         raise SystemExit(1)
     if am_path is not None and not am_path.exists():
         logger.error("AlphaMissense file not found: %s", am_path)
+        raise SystemExit(1)
+    if dbnsfp_path is not None and not dbnsfp_path.exists():
+        logger.error("dbNSFP file not found: %s", dbnsfp_path)
         raise SystemExit(1)
 
     # Check that tabix is available.
@@ -436,13 +604,17 @@ def main(argv: Optional[list[str]] = None) -> None:
         ann_cols.extend(REVEL_COLS)
     if am_path is not None:
         ann_cols.extend(ALPHAMISSENSE_COLS)
+    if dbnsfp_path is not None:
+        ann_cols.extend(DBNSFP_COLS)
 
     revel_cache: dict[tuple[str, int, str, str], Optional[str]] = {}
     am_cache: dict[tuple[str, int, str, str], Optional[tuple[str, str]]] = {}
+    mutpred2_cache: dict[tuple[str, int, str, str], Optional[str]] = {}
 
     processed = 0
     scored_revel = 0
     scored_am = 0
+    scored_mutpred2 = 0
     started = time.monotonic()
 
     with input_path.open("r", encoding="utf-8", newline="") as in_fh, \
@@ -477,8 +649,10 @@ def main(argv: Optional[list[str]] = None) -> None:
                 mapped_hgvs_g_col=args.mapped_hgvs_g_col,
                 revel_path=revel_path,
                 alphamissense_path=am_path,
+                dbnsfp_path=dbnsfp_path,
                 revel_cache=revel_cache,
                 am_cache=am_cache,
+                mutpred2_cache=mutpred2_cache,
             )
             row.update(ann)
             writer.writerow(row)
@@ -488,6 +662,8 @@ def main(argv: Optional[list[str]] = None) -> None:
                 scored_revel += 1
             if am_path is not None and row.get("alphamissense.pathogenicity"):
                 scored_am += 1
+            if dbnsfp_path is not None and row.get("mutpred2.score"):
+                scored_mutpred2 += 1
 
             if processed % 1000 == 0:
                 elapsed = max(time.monotonic() - started, 1e-9)
@@ -507,6 +683,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         logger.info(
             "AlphaMissense: %d/%d rows scored (cache: %d unique SNVs queried)",
             scored_am, processed, len(am_cache),
+        )
+    if dbnsfp_path is not None:
+        logger.info(
+            "MutPred2 (dbNSFP): %d/%d rows scored (cache: %d unique SNVs queried)",
+            scored_mutpred2, processed, len(mutpred2_cache),
         )
     logger.info(
         "Done. %d rows written to %s (%.1f rows/s)",
