@@ -26,6 +26,7 @@ All pipeline scripts and services run in Docker. The development environment is 
 - **annotate-clinvar**: Annotates with ClinVar clinical significance
 - **annotate-gnomad**: Annotates with gnomAD allele frequencies
 - **annotate-spliceai**: Annotates with SpliceAI splice-impact scores
+- **annotate-vep**: Annotates with VEP mutational consequence
 - **flatten-dna-variants**: Flattens multi-candidate DNA variants to one row per variant
 
 **Data and dependency services** (always running):
@@ -197,7 +198,9 @@ Input variants
     ↓
 [7] annotate_spliceai (optional) ──→ SpliceAI delta scores
     ↓
-[8] flatten_dna_variants (optional) ──→ flattened DNA-only variants
+[8] annotate_vep (optional) ──→ VEP mutational consequence
+  ↓
+[9] flatten_dna_variants (optional) ──→ flattened DNA-only variants
     ↓
 Output: one row per DNA variant (or fully annotated variants)
 ```
@@ -412,7 +415,28 @@ src/scripts/run_annotate_spliceai.sh output_clinvar.tsv output_spliceai.tsv \
 - `spliceai.max_delta_score` is `max(DS_AG, DS_AL, DS_DG, DS_DL)` for each candidate.
 - Precomputed files can have coverage limitations (for example, missing classes of indels).
 
-### Step 8: Flatten DNA Variants (Optional)
+### Step 8: Annotate with VEP Mutational Consequence (Optional)
+
+**Purpose:** Add a mutational consequence term from Ensembl VEP for each DNA variant row.
+
+**Input columns:** `mapped_hgvs_g` (from step 1 or step 2)
+
+**Output columns:** `vep.mutational_consequence`, `vep.access_date`, `vep.error`
+
+**Command:**
+```bash
+src/scripts/run_annotate_vep.sh annotated.tsv annotated_vep.tsv
+```
+
+**Notes:**
+- Uses Ensembl REST API endpoints `/vep/human/hgvs` and `/variant_recoder/human`.
+- For multi-candidate rows, each candidate is checked independently.
+- If all resolved candidates agree, `vep.mutational_consequence` contains one value.
+- If resolved candidates disagree, `vep.mutational_consequence` is blank and `vep.error` contains a pipe-delimited consequence list aligned to DNA candidates.
+- If a candidate does not return from VEP, it is treated as matching the shared row consequence when all other resolved candidates agree.
+- Output rows are streamed in input order and support `--skip` / `--limit`.
+
+### Step 9: Flatten DNA Variants (Optional)
 
 **Purpose:** For annotated variant files with multi-candidate DNA variants (from reverse translation), produce a flattened output where each DNA candidate has its own row. This is useful when you want one row per DNA variant instead of pipe-delimited lists.
 
@@ -481,10 +505,13 @@ src/scripts/run_annotate_spliceai.sh variants_final.tsv variants_spliceai.tsv \
   --mode precomputed \
   --precomputed-snv-vcf spliceai_scores.masked.snv.hg38.vcf.gz \
   --precomputed-indel-vcf spliceai_scores.masked.indel.hg38.vcf.gz
-```
+
+# Annotate with VEP mutational consequence (optional)
+src/scripts/run_annotate_vep.sh variants_spliceai.tsv variants_vep.tsv
 
 # Flatten multi-candidate variants to one row per DNA variant (optional)
-src/scripts/run_flatten_dna_variants.sh variants_spliceai.tsv variants_dna_only.tsv
+src/scripts/run_flatten_dna_variants.sh variants_vep.tsv variants_dna_only.tsv
+```
 
 ### Data Volume Management
 
@@ -511,6 +538,10 @@ services:
   annotate-spliceai:
     volumes:
       - variant-annotation-spliceai-cache:/spliceai-cache
+
+  annotate-vep:
+    volumes:
+      - ${VARIANT_DATA_DIR:-./data}:/work
 ```
 
 This ensures caches survive container restarts and are shared across runs.
