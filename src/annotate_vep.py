@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from itertools import islice
 import logging
@@ -157,19 +158,41 @@ def _vep_lookup_batch(
     return out
 
 
+def _run_batches_concurrent(
+    hgvs_list: list[str],
+    *,
+    api_url: str,
+    timeout_seconds: int,
+    batch_size: int,
+    max_workers: int,
+) -> dict[str, Optional[str]]:
+    """Submit all VEP batches concurrently and merge results."""
+    batches = [hgvs_list[i : i + batch_size] for i in range(0, len(hgvs_list), batch_size)]
+    result: dict[str, Optional[str]] = {}
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as pool:
+        futures = {
+            pool.submit(_vep_lookup_batch, batch, api_url=api_url, timeout_seconds=timeout_seconds): batch
+            for batch in batches
+        }
+        for fut in as_completed(futures):
+            result.update(fut.result())
+    return result
+
+
 def get_functional_consequence(
     hgvs_strings: list[str],
     *,
     api_url: str,
     timeout_seconds: int,
     batch_size: int,
+    max_workers: int = 1,
 ) -> dict[str, Optional[str]]:
     """Return HGVS -> most severe VEP consequence with recoder fallback.
 
     Mirrors MaveDB worker behavior:
-    1) VEP lookup for input HGVS
+    1) VEP lookup for input HGVS (batches run concurrently when max_workers > 1)
     2) For unresolved entries, Variant Recoder to genomic HGVS
-    3) VEP lookup for recoded genomic HGVS
+    3) VEP lookup for recoded genomic HGVS (also concurrent)
     4) Choose the most severe consequence by fixed priority order
     """
     result: dict[str, Optional[str]] = {}
@@ -179,10 +202,15 @@ def get_functional_consequence(
     # Preserve caller order while de-duplicating.
     unique_hgvs = list(dict.fromkeys(hgvs_strings))
 
-    for i in range(0, len(unique_hgvs), batch_size):
-        batch = unique_hgvs[i : i + batch_size]
-        batch_result = _vep_lookup_batch(batch, api_url=api_url, timeout_seconds=timeout_seconds)
-        result.update(batch_result)
+    result.update(
+        _run_batches_concurrent(
+            unique_hgvs,
+            api_url=api_url,
+            timeout_seconds=timeout_seconds,
+            batch_size=batch_size,
+            max_workers=max_workers,
+        )
+    )
 
     missing_hgvs = [h for h in unique_hgvs if h not in result]
     if not missing_hgvs:
@@ -198,10 +226,16 @@ def get_functional_consequence(
         all_recoded_hgvs.extend(recoded.get(input_hgvs, []))
 
     recoded_results: dict[str, Optional[str]] = {}
-    for i in range(0, len(all_recoded_hgvs), batch_size):
-        batch = all_recoded_hgvs[i : i + batch_size]
-        batch_result = _vep_lookup_batch(batch, api_url=api_url, timeout_seconds=timeout_seconds)
-        recoded_results.update(batch_result)
+    if all_recoded_hgvs:
+        recoded_results.update(
+            _run_batches_concurrent(
+                all_recoded_hgvs,
+                api_url=api_url,
+                timeout_seconds=timeout_seconds,
+                batch_size=batch_size,
+                max_workers=max_workers,
+            )
+        )
 
     for input_hgvs, recoded_hgvs_list in recoded.items():
         consequences = [recoded_results.get(recoded_hgvs) for recoded_hgvs in recoded_hgvs_list]
@@ -293,8 +327,14 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--vep-batch-size",
         type=int,
-        default=int(os.environ.get("VEP_BATCH_SIZE", "200")),
-        help="Number of HGVS values per VEP/recoder request batch (default: 200)",
+        default=int(os.environ.get("VEP_BATCH_SIZE", "500")),
+        help="Number of HGVS values per VEP/recoder request batch (default: 500)",
+    )
+    p.add_argument(
+        "--vep-workers",
+        type=int,
+        default=int(os.environ.get("VEP_WORKERS", "8")),
+        help="Number of concurrent VEP batch requests (default: 8)",
     )
     p.add_argument(
         "--row-batch-size",
@@ -340,6 +380,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         sys.exit(1)
     if args.vep_batch_size < 1:
         logger.error("--vep-batch-size must be >= 1, got: %d", args.vep_batch_size)
+        sys.exit(1)
+    if args.vep_workers < 1:
+        logger.error("--vep-workers must be >= 1, got: %d", args.vep_workers)
         sys.exit(1)
     if args.row_batch_size < 1:
         logger.error("--row-batch-size must be >= 1, got: %d", args.row_batch_size)
@@ -407,6 +450,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 api_url=args.vep_api_url,
                 timeout_seconds=args.vep_timeout_seconds,
                 vep_batch_size=args.vep_batch_size,
+                vep_workers=args.vep_workers,
             )
             batch_selected, batch_resolved, batch_discrepancies = _batch_stats(
                 batch_rows,
@@ -430,6 +474,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 api_url=args.vep_api_url,
                 timeout_seconds=args.vep_timeout_seconds,
                 vep_batch_size=args.vep_batch_size,
+                vep_workers=args.vep_workers,
             )
             batch_selected, batch_resolved, batch_discrepancies = _batch_stats(
                 batch_rows,
@@ -461,6 +506,7 @@ def _process_batch(
     api_url: str,
     timeout_seconds: int,
     vep_batch_size: int,
+    vep_workers: int = 1,
 ) -> None:
     batch_hgvs: list[str] = []
     for row in rows:
@@ -474,6 +520,7 @@ def _process_batch(
             api_url=api_url,
             timeout_seconds=timeout_seconds,
             batch_size=vep_batch_size,
+            max_workers=vep_workers,
         )
         consequence_cache.update(looked_up)
 

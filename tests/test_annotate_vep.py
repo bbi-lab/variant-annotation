@@ -118,7 +118,7 @@ def test_main_applies_skip_and_limit(tmp_path, monkeypatch):
         writer.writerow({"variant_urn": "v2", "mapped_hgvs_g": "NC_000001.11:g.2C>G"})
         writer.writerow({"variant_urn": "v3", "mapped_hgvs_g": "NC_000001.11:g.3G>A"})
 
-    def fake_get_functional_consequence(hgvs_strings, *, api_url, timeout_seconds, batch_size):
+    def fake_get_functional_consequence(hgvs_strings, *, api_url, timeout_seconds, batch_size, max_workers=1):
         return {
             hgvs: "missense_variant" if hgvs.endswith("2C>G") else "synonymous_variant"
             for hgvs in dict.fromkeys(hgvs_strings)
