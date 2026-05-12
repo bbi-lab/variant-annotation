@@ -23,7 +23,7 @@ import click
 from src.compare_columns import compare_columns
 from src.filter_columns import filter_columns
 from src.filter_rows import filter_rows
-from src.merge_columns import merge_columns
+from src.merge_columns import merge_columns, _parse_add_col_args, _parse_key_col_args
 from src.reorder_columns import reorder_columns
 from src.replace_rows import replace_rows
 
@@ -142,19 +142,23 @@ def replace_rows_cmd(
     "key_cols_raw",
     multiple=True,
     required=True,
-    metavar="COLUMN",
+    metavar="BASE_COL[:EXTRA_COL]",
     help=(
-        "Key column(s) for join identity. May be repeated and/or comma-separated, "
-        "for example: --key-col gene --key-col variant or --key-col gene,variant"
+        "Key column(s) for join identity. May be repeated and/or comma-separated. "
+        "Use BASE_COL:EXTRA_COL when the column has different names in the two files "
+        "(e.g. --key-col 'dataset_name:Dataset Name'). "
+        "Plain names mean the same column is used on both sides."
     ),
 )
 @click.option(
     "--add-col",
     "add_cols_raw",
     multiple=True,
-    metavar="COLUMN",
+    metavar="COLUMN[:OUTPUT_NAME]",
     help=(
         "Column(s) to add from extra file. May be repeated and/or comma-separated. "
+        "Use SRC:DEST to rename a column in the output "
+        "(e.g. --add-col 'Detects Splicing Variants?:splice_measure'). "
         "If omitted, all new non-key columns from extra are added."
     ),
 )
@@ -163,6 +167,16 @@ def replace_rows_cmd(
     is_flag=True,
     help="Add all non-key columns from extra that are not already in base.",
 )
+@click.option(
+    "--extra-worksheet",
+    default=None,
+    metavar="NAME_OR_INDEX",
+    help=(
+        "Worksheet to read when EXTRA_FILE is an Excel workbook (.xlsx/.xls). "
+        "Accepts a sheet name or a 1-based integer index. "
+        "Defaults to the first (active) sheet."
+    ),
+)
 def merge_columns_cmd(
     base_file: str,
     extra_file: str,
@@ -170,10 +184,11 @@ def merge_columns_cmd(
     key_cols_raw: tuple[str, ...],
     add_cols_raw: tuple[str, ...],
     add_all_cols_from_extra: bool,
+    extra_worksheet: str | None,
 ) -> None:
     """Left-join BASE_FILE with EXTRA_FILE and write OUTPUT_FILE."""
-    key_columns = _split_csv_args(key_cols_raw)
-    add_columns = _split_csv_args(add_cols_raw)
+    key_columns, extra_key_columns = _parse_key_col_args(key_cols_raw)
+    add_columns, column_renames = _parse_add_col_args(add_cols_raw)
 
     try:
         n_rows = merge_columns(
@@ -183,6 +198,73 @@ def merge_columns_cmd(
             key_columns=key_columns,
             add_columns=add_columns,
             add_all_cols_from_extra=add_all_cols_from_extra,
+            column_renames=column_renames,
+            extra_worksheet=extra_worksheet,
+            extra_key_columns=extra_key_columns,
+        )
+    except (ValueError, ImportError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"Wrote {n_rows} row(s) to {output_file}")
+
+
+@main.command("rename-columns")
+@click.argument("input_file")
+@click.argument("output_file")
+@click.option(
+    "--keep-col",
+    "keep_cols_raw",
+    multiple=True,
+    metavar="SRC[:DEST]",
+    help=(
+        "Column to keep, optionally renaming it. May be repeated and/or comma-separated. "
+        "Use SRC:DEST to rename (e.g. --keep-col 'old_name:new_name'). "
+        "Mutually exclusive with --omit-col."
+    ),
+)
+@click.option(
+    "--omit-col",
+    "omit_cols_raw",
+    multiple=True,
+    metavar="COLUMN",
+    help=(
+        "Column to omit, keeping all others unchanged. May be repeated and/or "
+        "comma-separated. Mutually exclusive with --keep-col."
+    ),
+)
+@click.option(
+    "--reorder",
+    is_flag=True,
+    help=(
+        "Output columns in the order given by --keep-col rather than input file order. "
+        "Only applies in keep mode."
+    ),
+)
+def rename_columns_cmd(
+    input_file: str,
+    output_file: str,
+    keep_cols_raw: tuple[str, ...],
+    omit_cols_raw: tuple[str, ...],
+    reorder: bool,
+) -> None:
+    """Keep/omit and optionally rename columns in INPUT_FILE, writing OUTPUT_FILE.
+
+    In keep mode (--keep-col), only the listed columns are written.  Use
+    SRC:DEST syntax to rename a column at the same time.  Pass --reorder to
+    output columns in the order given by --keep-col.
+
+    In omit mode (--omit-col), all columns except the listed ones are written,
+    names unchanged.
+    """
+    keep_specs = _parse_keep_col_args(keep_cols_raw)
+    omit_cols = _split_csv_args(omit_cols_raw)
+    try:
+        n_rows = rename_columns(
+            input_file=input_file,
+            output_file=output_file,
+            keep_specs=keep_specs,
+            omit_cols=omit_cols,
+            reorder=reorder,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
