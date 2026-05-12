@@ -118,6 +118,18 @@ services:
       - .:/usr/src/app
       - ${VARIANT_DATA_DIR:-./data}:/work
 
+  annotate-missense-scores:
+    <<: *tools-image
+    profiles:
+      - tools
+    env_file:
+      - settings/.env
+    entrypoint: ["python", "-m", "src.annotate_missense_scores"]
+    command: ["--help"]
+    volumes:
+      - .:/usr/src/app
+      - ${VARIANT_DATA_DIR:-./data}:/work
+
   flatten-dna-variants:
     <<: *tools-image
     profiles:
