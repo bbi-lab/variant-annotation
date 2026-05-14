@@ -249,12 +249,21 @@ def get_functional_consequence(
     return result
 
 
+def _get_hgvs_for_row(row: dict[str, str], hgvs_cols: list[str]) -> str:
+    """Return the first non-blank HGVS value from the priority-ordered column list."""
+    for col in hgvs_cols:
+        val = (row.get(col) or "").strip()
+        if val:
+            return val
+    return ""
+
+
 def annotate_row(
     row: dict[str, str],
     consequence_cache: dict[str, Optional[str]],
     *,
     col_prefix: str,
-    mapped_hgvs_g_col: str,
+    hgvs_cols: list[str],
     access_date: str,
 ) -> dict[str, str]:
     consequence_col = f"{col_prefix}.mutational_consequence"
@@ -267,7 +276,7 @@ def annotate_row(
         error_col: "",
     }
 
-    candidates = _split_pipe_preserve_positions((row.get(mapped_hgvs_g_col) or "").strip())
+    candidates = _split_pipe_preserve_positions(_get_hgvs_for_row(row, hgvs_cols))
     if not candidates or all(c == "" for c in candidates):
         return out
 
@@ -315,9 +324,14 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Namespace for output columns (default: vep)",
     )
     p.add_argument(
-        "--mapped-hgvs-g-col",
-        default="mapped_hgvs_g",
-        help="Input column containing genomic HGVS values (default: mapped_hgvs_g)",
+        "--hgvs-cols",
+        default="mapped_hgvs_c,mapped_hgvs_g,mapped_hgvs_p",
+        metavar="COLS",
+        help=(
+            "Comma-separated list of columns to try for HGVS input, in priority order. "
+            "The first non-blank value found is used for each row. "
+            "(default: mapped_hgvs_c,mapped_hgvs_g,mapped_hgvs_p)"
+        ),
     )
     p.add_argument(
         "--vep-api-url",
@@ -364,6 +378,16 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         metavar="BYTES",
         help="Maximum per-field character length for CSV/TSV parsing (default: %(default)s).",
     )
+    p.add_argument(
+        "--keep-existing",
+        action="store_true",
+        default=False,
+        help=(
+            "Preserve rows that already have a non-empty annotation value and only "
+            "annotate rows with a blank consequence column. Reports how many rows "
+            "were newly annotated."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -395,6 +419,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     input_path = Path(args.input_file)
     output_path = Path(args.output_file)
 
+    hgvs_cols = [c.strip() for c in args.hgvs_cols.split(",") if c.strip()]
+    if not hgvs_cols:
+        logger.error("--hgvs-cols must contain at least one column name")
+        sys.exit(1)
+
     prefix = args.vep_namespace
     access_date = date.today().isoformat()
     ann_cols = [
@@ -404,8 +433,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     ]
 
     consequence_cache: dict[str, Optional[str]] = {}
-    selected_rows = 0
-    resolved_rows = 0
+    total_rows = 0
+    kept_rows = 0
+    newly_resolved_rows = 0
     discrepancy_rows = 0
 
     with input_path.open("r", encoding="utf-8", newline="") as in_fh, output_path.open(
@@ -439,56 +469,51 @@ def main(argv: Optional[list[str]] = None) -> None:
             if len(batch_rows) < args.row_batch_size:
                 continue
 
-            _process_batch(
+            batch_total, batch_kept, batch_resolved, batch_discrepancies = _process_batch(
                 batch_rows,
                 writer,
                 out_fh,
                 consequence_cache,
-                mapped_hgvs_g_col=args.mapped_hgvs_g_col,
+                hgvs_cols=hgvs_cols,
                 col_prefix=prefix,
                 access_date=access_date,
                 api_url=args.vep_api_url,
                 timeout_seconds=args.vep_timeout_seconds,
                 vep_batch_size=args.vep_batch_size,
                 vep_workers=args.vep_workers,
+                keep_existing=args.keep_existing,
             )
-            batch_selected, batch_resolved, batch_discrepancies = _batch_stats(
-                batch_rows,
-                consequence_cache,
-                mapped_hgvs_g_col=args.mapped_hgvs_g_col,
-            )
-            selected_rows += batch_selected
-            resolved_rows += batch_resolved
+            total_rows += batch_total
+            kept_rows += batch_kept
+            newly_resolved_rows += batch_resolved
             discrepancy_rows += batch_discrepancies
             batch_rows = []
 
         if batch_rows:
-            _process_batch(
+            batch_total, batch_kept, batch_resolved, batch_discrepancies = _process_batch(
                 batch_rows,
                 writer,
                 out_fh,
                 consequence_cache,
-                mapped_hgvs_g_col=args.mapped_hgvs_g_col,
+                hgvs_cols=hgvs_cols,
                 col_prefix=prefix,
                 access_date=access_date,
                 api_url=args.vep_api_url,
                 timeout_seconds=args.vep_timeout_seconds,
                 vep_batch_size=args.vep_batch_size,
                 vep_workers=args.vep_workers,
+                keep_existing=args.keep_existing,
             )
-            batch_selected, batch_resolved, batch_discrepancies = _batch_stats(
-                batch_rows,
-                consequence_cache,
-                mapped_hgvs_g_col=args.mapped_hgvs_g_col,
-            )
-            selected_rows += batch_selected
-            resolved_rows += batch_resolved
+            total_rows += batch_total
+            kept_rows += batch_kept
+            newly_resolved_rows += batch_resolved
             discrepancy_rows += batch_discrepancies
 
     logger.info(
-        "Done. %d rows processed; %d rows resolved; %d discrepancy rows -> %s",
-        selected_rows,
-        resolved_rows,
+        "Done. %d rows processed; %d kept (existing); %d rows newly annotated; %d discrepancy rows -> %s",
+        total_rows,
+        kept_rows,
+        newly_resolved_rows,
         discrepancy_rows,
         output_path,
     )
@@ -500,17 +525,29 @@ def _process_batch(
     out_fh: TextIO,
     consequence_cache: dict[str, Optional[str]],
     *,
-    mapped_hgvs_g_col: str,
+    hgvs_cols: list[str],
     col_prefix: str,
     access_date: str,
     api_url: str,
     timeout_seconds: int,
     vep_batch_size: int,
     vep_workers: int = 1,
-) -> None:
+    keep_existing: bool = False,
+) -> tuple[int, int, int, int]:
+    """Process a batch of rows.
+
+    Returns ``(total, kept, newly_resolved, discrepancies)``.
+    *kept* is the number of rows whose existing annotation was preserved
+    (only non-zero when *keep_existing* is True).
+    """
+    consequence_col = f"{col_prefix}.mutational_consequence"
+    error_col = f"{col_prefix}.error"
+
     batch_hgvs: list[str] = []
     for row in rows:
-        for hgvs in _split_pipe_preserve_positions((row.get(mapped_hgvs_g_col) or "").strip()):
+        if keep_existing and (row.get(consequence_col) or "").strip():
+            continue
+        for hgvs in _split_pipe_preserve_positions(_get_hgvs_for_row(row, hgvs_cols)):
             if hgvs and hgvs not in consequence_cache:
                 batch_hgvs.append(hgvs)
 
@@ -524,40 +561,30 @@ def _process_batch(
         )
         consequence_cache.update(looked_up)
 
+    kept = 0
+    newly_resolved = 0
+    discrepancies = 0
     for row in rows:
+        if keep_existing and (row.get(consequence_col) or "").strip():
+            kept += 1
+            writer.writerow(row)
+            continue
         ann = annotate_row(
             row,
             consequence_cache,
             col_prefix=col_prefix,
-            mapped_hgvs_g_col=mapped_hgvs_g_col,
+            hgvs_cols=hgvs_cols,
             access_date=access_date,
         )
         row.update(ann)
         writer.writerow(row)
+        if ann[consequence_col]:
+            newly_resolved += 1
+        elif ann[error_col]:
+            discrepancies += 1
 
     out_fh.flush()
-
-
-def _batch_stats(
-    rows: list[dict[str, str]],
-    consequence_cache: dict[str, Optional[str]],
-    *,
-    mapped_hgvs_g_col: str,
-) -> tuple[int, int, int]:
-    resolved = 0
-    discrepancies = 0
-    for row in rows:
-        candidates = _split_pipe_preserve_positions((row.get(mapped_hgvs_g_col) or "").strip())
-        known = {
-            str(consequence_cache.get(hgvs))
-            for hgvs in candidates
-            if hgvs and consequence_cache.get(hgvs)
-        }
-        if len(known) == 1:
-            resolved += 1
-        elif len(known) > 1:
-            discrepancies += 1
-    return len(rows), resolved, discrepancies
+    return len(rows), kept, newly_resolved, discrepancies
 
 
 if __name__ == "__main__":
