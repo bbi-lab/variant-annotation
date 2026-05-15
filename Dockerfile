@@ -53,6 +53,30 @@ RUN pip install -e '.[dev,gnomad,mapping,tests]'
 # require CPU features (AVX/AVX2/FMA) unavailable via emulation.
 RUN pip install --upgrade "polars[rtcompat]<1.38.0"
 
+# Download Hadoop cloud-storage JARs for Hail's --execution-mode hail path.
+# spark.jars is processed after the JVM starts, which is too late for Hadoop's
+# FileSystem service-loader (used by S3AFileSystem, GoogleHadoopFileSystem, etc.).
+# Copying into PySpark's jars/ directory ensures the JARs are on the initial
+# JVM classpath that PySpark constructs before starting SparkContext.
+ARG HADOOP_VERSION=3.3.4
+ARG AWS_SDK_VERSION=1.12.262
+ARG GCS_CONNECTOR_VERSION=hadoop3-2.2.11
+RUN mkdir -p /opt/hail-jars && \
+    wget -q -O /opt/hail-jars/hadoop-aws-${HADOOP_VERSION}.jar \
+        "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_VERSION}/hadoop-aws-${HADOOP_VERSION}.jar" && \
+    wget -q -O /opt/hail-jars/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar \
+        "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_VERSION}/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar" && \
+    wget -q -O /opt/hail-jars/gcs-connector-${GCS_CONNECTOR_VERSION}-shaded.jar \
+        "https://repo1.maven.org/maven2/com/google/cloud/bigdataoss/gcs-connector/${GCS_CONNECTOR_VERSION}/gcs-connector-${GCS_CONNECTOR_VERSION}-shaded.jar" && \
+    python -c "\
+import pyspark, shutil, glob, os; \
+jars_dir = os.path.join(os.path.dirname(pyspark.__file__), 'jars'); \
+[shutil.copy(j, jars_dir) for j in glob.glob('/opt/hail-jars/*.jar')]; \
+print('Copied JARs to', jars_dir)"
+
+ENV HAIL_SPARK_JARS=/opt/hail-jars/hadoop-aws-3.3.4.jar,/opt/hail-jars/aws-java-sdk-bundle-1.12.262.jar
+ENV HAIL_GCS_CONNECTOR_JAR=/opt/hail-jars/gcs-connector-hadoop3-2.2.11-shaded.jar
+
 # Legacy comments from https://github.com/VariantEffect/dcd_mapping2
 # install gene normalizer with pg dependencies. TODO: can the pg dependencies be specified in pyproject.toml?
 # RUN pip install 'gene-normalizer[pg]'
