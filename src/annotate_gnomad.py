@@ -93,15 +93,43 @@ def _is_gs_uri(uri: str) -> bool:
 
 
 def _hail_init_kwargs(tmp_dir: Path, source_uri: str) -> dict[str, Any]:
+    # SPARK_LOCAL_PARALLELISM controls how many Spark tasks run concurrently
+    # (the N in "local[N]").  Stage 2 (writing the local Hail table) requires
+    # each concurrent task to open shuffle blocks from all 9,796 GCS-partition
+    # map outputs simultaneously.  With local[*] on a 16-core machine that is
+    # ~156,000 concurrent file reads on the Docker volume's virtiofs layer,
+    # which reliably deadlocks the JVM.  Limiting to a small value (e.g. 4)
+    # reduces concurrent file I/O to a manageable level while still allowing
+    # reasonable parallel GCS reads in stage 1.
     kwargs: dict[str, Any] = {
         "tmp_dir": str(tmp_dir),
         "quiet": True,
         "idempotent": True,
     }
+    # Redirect Spark shuffle/spill data to the same directory tree as the
+    # Hail tmp dir.  By default Spark writes to /tmp on the container overlay
+    # filesystem, which is limited to the Docker image layer size (~440 GB
+    # shared with the OS).  Pointing spark.local.dir at the mounted cache
+    # volume keeps shuffle data off the overlay layer and prevents disk-full
+    # hangs during the table write stage.
+    spark_local_dir = os.environ.get("SPARK_LOCAL_DIR", str(tmp_dir)).strip()
+    # spark.network.timeout: marks an executor as lost (and retries its tasks)
+    # if no heartbeat is received within this window.  Without this, Spark will
+    # wait indefinitely for a stalled task, causing the driver to hang forever
+    # even though no work is being done.  600s is generous enough not to fire
+    # during normal GCS latency spikes.
+    network_timeout = os.environ.get("SPARK_NETWORK_TIMEOUT", "600s").strip()
+    base_spark_conf: dict[str, Any] = {
+        "spark.local.dir": spark_local_dir,
+        "spark.network.timeout": network_timeout,
+        "spark.executor.heartbeatInterval": "60s",
+    }
     if not _is_gs_uri(source_uri):
+        kwargs["spark_conf"] = base_spark_conf
         return kwargs
 
     spark_conf = {
+        **base_spark_conf,
         "spark.hadoop.fs.gs.impl": "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFileSystem",
         "spark.hadoop.fs.AbstractFileSystem.gs.impl": "com.google.cloud.hadoop.fs.gcs.GoogleHadoopFS",
     }
@@ -751,12 +779,18 @@ def ensure_local_gnomad_ht(
     source_ht_uri: str,
     overwrite: bool = False,
     progress_every_seconds: int = 300,
+    gene_symbols: Optional[set[str]] = None,
 ) -> Path:
     """Download and cache a local gnomAD Hail table.
 
     The local table is keyed by ``caid`` when the source table contains that
     field (case 1), or by a ``"chrN:pos:ref:alt"`` string (``gnomad_key``) when it
     does not (cases 2 & 3).
+
+    If *gene_symbols* is provided, only rows whose
+    ``vep.worst_csq_by_gene_canonical`` contains at least one matching gene
+    symbol are retained.  Requires ``overwrite=True`` (or a cache miss) to take
+    effect; an existing cache is not re-filtered.
     """
     hl = _import_hail()
 
@@ -768,6 +802,20 @@ def ensure_local_gnomad_ht(
 
     hail_tmp = cache_dir / "hail-tmp"
     hail_tmp.mkdir(parents=True, exist_ok=True)
+    if overwrite and hail_tmp.exists():
+        # Purge stale Spark shuffle data from previous (failed) runs.  Each
+        # run accumulates ~26 GiB of blockmgr data; leaving it on disk wastes
+        # space and can confuse the new Spark application.
+        import shutil as _shutil
+        for _item in list(hail_tmp.iterdir()):
+            try:
+                if _item.is_dir():
+                    _shutil.rmtree(_item)
+                else:
+                    _item.unlink()
+            except Exception as _exc:
+                logger.warning("Could not remove stale hail-tmp entry %s: %s", _item, _exc)
+        logger.info("Cleaned up stale shuffle data from: %s", hail_tmp)
     progress_logger = _CachePrepProgressLogger(cache_dir, ht_path, progress_every_seconds)
 
     logger.info("Initializing Hail and loading source table: %s", source_ht_uri)
@@ -781,7 +829,80 @@ def ensure_local_gnomad_ht(
         except Exception as exc:
             _raise_actionable_hail_error(source_ht_uri, exc)
 
+        # Optionally restrict to rows associated with specific gene symbols.
+        if gene_symbols:
+            if _has_path(source_ht.row.dtype, ["vep", "worst_csq_by_gene_canonical"]):
+                gene_literal = hl.literal(gene_symbols)
+                logger.info(
+                    "Filtering gnomAD source table to %d gene symbol(s): %s",
+                    len(gene_symbols),
+                    ", ".join(sorted(gene_symbols)),
+                )
+                source_ht = source_ht.filter(
+                    source_ht.vep.worst_csq_by_gene_canonical.any(
+                        lambda csq: gene_literal.contains(csq.gene_symbol)
+                    )
+                )
+            else:
+                logger.warning(
+                    "--genes specified but vep.worst_csq_by_gene_canonical not found "
+                    "in the source table; gene filter skipped"
+                )
+
         progress_logger.set_stage("preparing local cache projection")
+
+        # Filter to PASS variants only (gnomAD QC).  Variants with a non-empty
+        # filters set failed one or more QC steps (e.g. AC0, AS_VQSR) and
+        # should not be used for frequency annotation.
+        #
+        # Schema varies by gnomAD table:
+        #   - Older/browser tables: top-level "filters" set<str>
+        #   - v4.1 joint sites table: "exome.filters" and "genome.filters"
+        #
+        # The filters field can be either:
+        #   - set<str>: empty set means PASS
+        #   - bool:     False means PASS (no filters applied)
+        #
+        # For the joint table we keep variants that passed QC in at least one
+        # callset (exome OR genome PASS).  A missing filters field (variant
+        # absent from that callset) does not count as PASS.
+        def _is_pass_expr(expr: Any) -> Any:
+            """True when a filters field indicates the variant passed QC."""
+            import hail as _hl
+            if expr.dtype == _hl.tbool:
+                return ~expr  # False = no filters applied = PASS
+            return _hl.len(expr) == 0  # empty set<str> = PASS
+
+        _filters_for_qc = _choose_expr(source_ht, [["filters"]])
+        _exome_filters_for_qc = _choose_expr(source_ht, [["exome", "filters"]])
+        _genome_filters_for_qc = _choose_expr(source_ht, [["genome", "filters"]])
+
+        if _filters_for_qc is not None:
+            source_ht = source_ht.filter(hl.is_defined(_filters_for_qc) & _is_pass_expr(_filters_for_qc))
+            logger.info("Applied gnomAD QC filter: retaining only PASS variants (top-level filters field)")
+        elif _exome_filters_for_qc is not None or _genome_filters_for_qc is not None:
+            # Keep variants where at least one callset has a PASS filters field.
+            # Missing filters (callset absent for this variant) does not count as PASS.
+            _exome_pass = (
+                hl.is_defined(_exome_filters_for_qc) & _is_pass_expr(_exome_filters_for_qc)
+                if _exome_filters_for_qc is not None
+                else hl.bool(False)
+            )
+            _genome_pass = (
+                hl.is_defined(_genome_filters_for_qc) & _is_pass_expr(_genome_filters_for_qc)
+                if _genome_filters_for_qc is not None
+                else hl.bool(False)
+            )
+            source_ht = source_ht.filter(_exome_pass | _genome_pass)
+            logger.info(
+                "Applied gnomAD QC filter: retaining variants that passed in at least one callset "
+                "(exome.filters or genome.filters is PASS)"
+            )
+        else:
+            logger.warning(
+                "gnomAD source table has no 'filters', 'exome.filters', or 'genome.filters' field; "
+                "QC filter not applied — all variants will be included"
+            )
 
         # Resolve allele counts across known gnomAD schema variants:
         # - joint v4.1 sites HT: joint.freq[0].AC / .AN
@@ -833,6 +954,37 @@ def ensure_local_gnomad_ht(
             [["joint", "fafmax", "faf95_max"], ["fafmax", "faf95_max"]],
         )
 
+        # Helper: convert a Hail set<str> expression to a pipe-delimited string.
+        def _set_to_pipe_str(expr: Any) -> Any:
+            return hl.if_else(
+                hl.is_defined(expr) & (hl.len(expr) > 0),
+                hl.delimit(hl.sorted(hl.array(expr)), "|"),
+                hl.str(""),
+            )
+
+        filters_expr = _choose_expr(source_ht, [["filters"]])
+        exome_filters_expr = _choose_expr(source_ht, [["exome", "filters"]])
+        genome_filters_expr = _choose_expr(source_ht, [["genome", "filters"]])
+
+        vep_gene_symbols_expr: Optional[Any] = None
+        if _has_path(source_ht.row.dtype, ["vep", "worst_csq_by_gene_canonical"]):
+            try:
+                vep_gene_symbols_expr = hl.delimit(
+                    hl.sorted(
+                        hl.array(hl.set(
+                            source_ht.vep.worst_csq_by_gene_canonical.map(
+                                lambda csq: csq.gene_symbol
+                            )
+                        ))
+                    ),
+                    "|",
+                )
+            except Exception:
+                logger.debug(
+                    "Could not build vep.worst_csq_by_gene_canonical.gene_symbol expression",
+                    exc_info=True,
+                )
+
         common_select: dict[str, Any] = dict(
             allele_count=hl.int64(ac_expr),
             allele_number=hl.int64(an_expr),
@@ -844,6 +996,10 @@ def ensure_local_gnomad_ht(
             faf95_max=hl.if_else(hl.is_defined(faf_max_expr), hl.float64(faf_max_expr), hl.missing(hl.tfloat64))
             if faf_max_expr is not None
             else hl.missing(hl.tfloat64),
+            filters=_set_to_pipe_str(filters_expr) if filters_expr is not None else hl.str(""),
+            exome_filters=_set_to_pipe_str(exome_filters_expr) if exome_filters_expr is not None else hl.str(""),
+            genome_filters=_set_to_pipe_str(genome_filters_expr) if genome_filters_expr is not None else hl.str(""),
+            vep_gene_symbols=vep_gene_symbols_expr if vep_gene_symbols_expr is not None else hl.str(""),
         )
 
         caid_expr = _choose_expr(source_ht, [["caid"], ["CAID"]])
@@ -1035,6 +1191,10 @@ def load_gnomad_records_for_caids(
             minor_allele_frequency=maf,
             faf95_max=faf95_max,
             faf95_max_ancestry=faf95_max_ancestry,
+            filters=str(getattr(row, "filters", "") or ""),
+            exome_filters=str(getattr(row, "exome_filters", "") or ""),
+            genome_filters=str(getattr(row, "genome_filters", "") or ""),
+            gene_symbols=str(getattr(row, "vep_gene_symbols", "") or ""),
         )
     return out
 
@@ -1603,6 +1763,17 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         metavar="BYTES",
         help="Maximum per-field character length for CSV/TSV parsing (default: %(default)s).",
     )
+    p.add_argument(
+        "--genes",
+        default=None,
+        metavar="GENE[,GENE...]",
+        help=(
+            "Comma-separated gene symbols.  When downloading or rebuilding the local gnomAD "
+            "cache (requires --refresh-cache or a cache miss), only rows whose "
+            "vep.worst_csq_by_gene_canonical contains at least one matching gene symbol are "
+            "retained, significantly reducing cache size for targeted analyses."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -1623,13 +1794,25 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     local_ht: Optional[Path] = None
     cache_dir = Path(args.cache_dir)
+    gene_symbols: Optional[set[str]] = None
+    if getattr(args, "genes", None):
+        gene_symbols = {g.strip() for g in args.genes.split(",") if g.strip()}
     if args.execution_mode == "hail":
+        if gene_symbols and not args.refresh_cache:
+            ht_path_check = _local_ht_path(cache_dir, args.gnomad_version)
+            if ht_path_check.exists():
+                logger.warning(
+                    "--genes was specified but the gnomAD cache already exists at %s. "
+                    "Add --refresh-cache to rebuild it with the gene filter applied.",
+                    ht_path_check,
+                )
         local_ht = ensure_local_gnomad_ht(
             cache_dir,
             version=args.gnomad_version,
             source_ht_uri=args.gnomad_ht_uri,
             overwrite=args.refresh_cache,
             progress_every_seconds=args.cache_progress_every_seconds,
+            gene_symbols=gene_symbols,
         )
 
         if args.download_only:

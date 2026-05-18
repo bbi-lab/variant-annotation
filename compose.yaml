@@ -82,6 +82,18 @@ services:
       - settings/.env
     environment:
       GNOMAD_CACHE_DIR: /gnomad-cache
+      # Give Spark's driver JVM 24 GB heap (--driver-memory) and limit
+      # concurrency to 4 threads (--master local[4]).
+      # --master must be set here in PYSPARK_SUBMIT_ARGS rather than via
+      # hl.init(local=...) because PySpark's shell creates the SparkContext
+      # before Hail initialises; hl.init(idempotent=True) then reuses that
+      # context and ignores the local= kwarg entirely.
+      # local[4] limits concurrent stage-2 write tasks to 4, reducing
+      # simultaneous file opens on the Docker volume from ~156K to ~39K and
+      # preventing the JVM deadlock seen with local[*].
+      PYSPARK_SUBMIT_ARGS: "--driver-memory 24g --master local[1] pyspark-shell"
+      SPARK_LOCAL_PARALLELISM: "1"
+    shm_size: '2gb'
     entrypoint: ["python", "-m", "src.annotate_gnomad"]
     command: ["--help"]
     volumes:

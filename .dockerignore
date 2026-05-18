@@ -30,3 +30,9 @@ spliceai_scores.masked.indel.hg38.vcf.gz.tbi
 
 # Nested project data not needed in this image build
 mavedb-api
+
+# Other data files
+*.gz
+*.gz.tbi
+*.csv
+*.zip
