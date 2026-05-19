@@ -33,7 +33,7 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 import psycopg2  # type: ignore[import-untyped]
-from src.add_vcf_identifiers import _apply_genomic_vcf_anchor, _parse_hgvs, _reverse_complement
+from src.add_vcf_identifiers import _apply_vcf_anchor, _parse_hgvs, _reverse_complement
 
 load_dotenv()
 
@@ -340,8 +340,7 @@ def _derive_joined_hgvs_fields(
         
         if alt == "inv" and ref:
             alt = _reverse_complement(ref)
-        if is_genomic:
-            start, stop, ref, alt = _apply_genomic_vcf_anchor(candidate, start, stop, ref, alt)
+        start, stop, ref, alt = _apply_vcf_anchor(candidate, start, stop, ref, alt)
         starts.append(start or "")
         stops.append(stop or "")
         refs.append(ref or "")
