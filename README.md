@@ -312,7 +312,7 @@ src/scripts/run_annotate_clinvar.sh output_parsed.tsv output_clinvar.tsv \
 
 **Input columns:** `dna_clingen_allele_id` (from step 3)
 
-**Output columns:** `gnomad.<VERSION>.minor_allele_frequency`, `.allele_frequency`, `.allele_count`, `.allele_number`, `.faf95_max`, `.faf95_max_ancestry`
+**Output columns:** `gnomad.<VERSION>.minor_allele_frequency`, `.allele_frequency`, `.allele_count`, `.allele_number`, `.faf95_max`, `.faf95_max_ancestry`, `.filters`, `.exome_filters`, `.genome_filters`, `.gene_symbols`
 
 **Command:**
 ```bash
@@ -328,6 +328,22 @@ src/scripts/run_annotate_gnomad.sh output_clinvar.tsv output_final.tsv \
     --cache-dir ./gnomad_cache \
     --download-only
 ```
+
+**QC filtering at annotation time:**
+
+Two flags control whether variants that failed gnomAD QC are included in the output.
+Both flags treat a missing gnomAD match as "no annotation" (columns left empty) regardless of setting.
+
+| Flag | Semantics |
+|------|-----------|
+| `--require-pass` | Exclude variants whose gnomAD **combined** `filters` field is non-empty (i.e. the variant failed at least one QC filter across all callsets). Equivalent to `FILTER == PASS` in a joint VCF. |
+| `--callset-pass-filter none` _(default)_ | No callset-level filtering; all matched records are annotated. |
+| `--callset-pass-filter any` | Only annotate variants that passed QC in **at least one** callset (`exome_filters` or `genome_filters` is empty). |
+| `--callset-pass-filter all` | Only annotate variants that passed QC in **both** callsets (`exome_filters` and `genome_filters` are both empty). |
+
+`--require-pass` and `--callset-pass-filter` can be combined; a variant must satisfy both criteria to receive annotation.
+
+`--callset-pass-filter any/all` requires per-callset filter data in the gnomAD cache (i.e. the source Hail table must have separate `exome.filters` / `genome.filters` fields, as in the gnomAD v4.1 joint sites table). An error is raised if the cache was built from a table without those fields; in that case use `--require-pass` instead.
 
 **Notes (Hail mode):**
 - Requires Java runtime and Hail library (installed via `gnomad` extra)
@@ -975,6 +991,10 @@ TP53	CA123456|CA123457||	Pathogenic	0.00234	0.00234	1547
 | `gnomad.<VERSION>.allele_number` | int | Total alleles in cohort (2× sample count) |
 | `gnomad.<VERSION>.faf95_max` | float | Filtering allele frequency (95% CI max) |
 | `gnomad.<VERSION>.faf95_max_ancestry` | string | Ancestry group with highest FAF95 |
+| `gnomad.<VERSION>.filters` | string | Pipe-delimited combined QC filter flags (empty = PASS) |
+| `gnomad.<VERSION>.exome_filters` | string | Pipe-delimited exome-callset QC filter flags (empty = PASS or not in exome callset) |
+| `gnomad.<VERSION>.genome_filters` | string | Pipe-delimited genome-callset QC filter flags (empty = PASS or not in genome callset) |
+| `gnomad.<VERSION>.gene_symbols` | string | Pipe-delimited VEP gene symbols overlapping the variant |
 
 (Default version is `v4.1`; customize with `--gnomad-version` flag)
 
