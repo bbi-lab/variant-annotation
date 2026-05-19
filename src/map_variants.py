@@ -618,6 +618,22 @@ def _extract_clingen_allele_id(data: dict) -> Optional[str]:
     return None
 
 
+def _is_protein_hgvs(hgvs: Optional[str]) -> bool:
+    """Return True only if *hgvs* is a genuine protein-level (``p.``) HGVS string.
+
+    ClinGen occasionally places non-coding (``n.``) or transcript (``c.``) HGVS
+    strings in the protein-effect field for noncoding variants.  This guard
+    ensures those are never written to ``mapped_hgvs_p``.
+    """
+    if not hgvs:
+        return False
+    colon_idx = hgvs.find(":")
+    if colon_idx < 0:
+        return False
+    body = hgvs[colon_idx + 1:].lstrip()
+    return len(body) >= 2 and body[1] == "." and body[0].lower() == "p"
+
+
 def _extract_hgvs_ca(
     data: dict, transcript_accession: Optional[str]
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -650,14 +666,18 @@ def _extract_hgvs_ca(
             if hgvs_c:
                 pe = allele.get("proteinEffect")
                 if pe:
-                    hgvs_p = pe.get("hgvs")
+                    candidate = pe.get("hgvs")
+                    if _is_protein_hgvs(candidate):
+                        hgvs_p = candidate
                 break
         else:
             # No specific transcript requested – use MANE if available.
             mane = allele.get("MANE")
             if mane:
                 hgvs_c = mane.get("nucleotide", {}).get("RefSeq", {}).get("hgvs")
-                hgvs_p = mane.get("protein", {}).get("RefSeq", {}).get("hgvs")
+                candidate_p = mane.get("protein", {}).get("RefSeq", {}).get("hgvs")
+                if _is_protein_hgvs(candidate_p):
+                    hgvs_p = candidate_p
                 break
 
     return hgvs_g, hgvs_c, hgvs_p
@@ -667,7 +687,7 @@ def _extract_hgvs_pa(data: dict) -> tuple[Optional[str], Optional[str], Optional
     """Extract (None, None, hgvs_p) from a ClinGen PA (protein allele) response."""
     for allele in data.get("aminoAcidAlleles", []):
         for h in allele.get("hgvs", []):
-            if h:
+            if h and _is_protein_hgvs(h):
                 return None, None, h
     return None, None, None
 
