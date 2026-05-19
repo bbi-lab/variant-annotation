@@ -72,6 +72,10 @@ class GnomadRecord:
     minor_allele_frequency: float
     faf95_max: Optional[float]
     faf95_max_ancestry: str
+    filters: str = ""
+    exome_filters: str = ""
+    genome_filters: str = ""
+    gene_symbols: str = ""
 
 
 def _import_hail():
@@ -1366,7 +1370,14 @@ def load_gnomad_records_by_gnomad_keys_athena(
     return out
 
 
-def annotate_row(row: dict[str, str], records: dict[str, GnomadRecord], col_prefix: str, dna_col: str) -> dict[str, str]:
+def annotate_row(
+    row: dict[str, str],
+    records: dict[str, GnomadRecord],
+    col_prefix: str,
+    dna_col: str,
+    *,
+    require_pass: bool = False,
+) -> dict[str, str]:
     out = {
         f"{col_prefix}.minor_allele_frequency": "",
         f"{col_prefix}.allele_frequency": "",
@@ -1374,6 +1385,10 @@ def annotate_row(row: dict[str, str], records: dict[str, GnomadRecord], col_pref
         f"{col_prefix}.allele_number": "",
         f"{col_prefix}.faf95_max": "",
         f"{col_prefix}.faf95_max_ancestry": "",
+        f"{col_prefix}.filters": "",
+        f"{col_prefix}.exome_filters": "",
+        f"{col_prefix}.genome_filters": "",
+        f"{col_prefix}.gene_symbols": "",
     }
 
     caids = _split_pipe_preserve_positions((row.get(dna_col) or "").strip())
@@ -1386,6 +1401,10 @@ def annotate_row(row: dict[str, str], records: dict[str, GnomadRecord], col_pref
     an_values: list[str] = []
     faf95_values: list[str] = []
     faf95_anc_values: list[str] = []
+    filters_values: list[str] = []
+    exome_filters_values: list[str] = []
+    genome_filters_values: list[str] = []
+    gene_symbols_values: list[str] = []
 
     for caid in caids:
         if not caid:
@@ -1395,15 +1414,23 @@ def annotate_row(row: dict[str, str], records: dict[str, GnomadRecord], col_pref
             an_values.append("")
             faf95_values.append("")
             faf95_anc_values.append("")
+            filters_values.append("")
+            exome_filters_values.append("")
+            genome_filters_values.append("")
+            gene_symbols_values.append("")
             continue
         rec = records.get(_normalize_caid(caid))
-        if rec is None:
+        if rec is None or (require_pass and rec.filters):
             minor_af_values.append("")
             af_values.append("")
             ac_values.append("")
             an_values.append("")
             faf95_values.append("")
             faf95_anc_values.append("")
+            filters_values.append("")
+            exome_filters_values.append("")
+            genome_filters_values.append("")
+            gene_symbols_values.append("")
             continue
         minor_af_values.append(str(rec.minor_allele_frequency))
         af_values.append(str(rec.allele_frequency))
@@ -1411,6 +1438,10 @@ def annotate_row(row: dict[str, str], records: dict[str, GnomadRecord], col_pref
         an_values.append(str(rec.allele_number))
         faf95_values.append("" if rec.faf95_max is None else str(rec.faf95_max))
         faf95_anc_values.append(rec.faf95_max_ancestry)
+        filters_values.append(rec.filters)
+        exome_filters_values.append(rec.exome_filters)
+        genome_filters_values.append(rec.genome_filters)
+        gene_symbols_values.append(rec.gene_symbols)
 
     out[f"{col_prefix}.minor_allele_frequency"] = "|".join(minor_af_values)
     out[f"{col_prefix}.allele_frequency"] = "|".join(af_values)
@@ -1418,6 +1449,10 @@ def annotate_row(row: dict[str, str], records: dict[str, GnomadRecord], col_pref
     out[f"{col_prefix}.allele_number"] = "|".join(an_values)
     out[f"{col_prefix}.faf95_max"] = "|".join(faf95_values)
     out[f"{col_prefix}.faf95_max_ancestry"] = "|".join(faf95_anc_values)
+    out[f"{col_prefix}.filters"] = "|".join(filters_values)
+    out[f"{col_prefix}.exome_filters"] = "|".join(exome_filters_values)
+    out[f"{col_prefix}.genome_filters"] = "|".join(genome_filters_values)
+    out[f"{col_prefix}.gene_symbols"] = "|".join(gene_symbols_values)
 
     return out
 
@@ -1505,6 +1540,10 @@ def load_gnomad_records_by_gnomad_keys(
                     minor_allele_frequency=maf,
                     faf95_max=faf95_max,
                     faf95_max_ancestry=faf95_max_ancestry,
+                    filters=str(getattr(row, "filters", "") or ""),
+                    exome_filters=str(getattr(row, "exome_filters", "") or ""),
+                    genome_filters=str(getattr(row, "genome_filters", "") or ""),
+                    gene_symbols=str(getattr(row, "vep_gene_symbols", "") or ""),
                 )
         else:
             # Cache is caid-keyed; scan all rows and build gnomad_keys on the fly.
@@ -1532,6 +1571,10 @@ def load_gnomad_records_by_gnomad_keys(
                     minor_allele_frequency=maf,
                     faf95_max=faf95_max,
                     faf95_max_ancestry=faf95_max_ancestry,
+                    filters=str(getattr(row, "filters", "") or ""),
+                    exome_filters=str(getattr(row, "exome_filters", "") or ""),
+                    genome_filters=str(getattr(row, "genome_filters", "") or ""),
+                    gene_symbols=str(getattr(row, "vep_gene_symbols", "") or ""),
                 )
                 # We don't have the gnomad_key in this case; skip — the user
                 # should rebuild the cache with a gnomad_key-indexed source.
@@ -1563,6 +1606,10 @@ def annotate_row_by_coords(
         f"{col_prefix}.allele_number": "",
         f"{col_prefix}.faf95_max": "",
         f"{col_prefix}.faf95_max_ancestry": "",
+        f"{col_prefix}.filters": "",
+        f"{col_prefix}.exome_filters": "",
+        f"{col_prefix}.genome_filters": "",
+        f"{col_prefix}.gene_symbols": "",
     }
 
     keys = _row_gnomad_keys(row, chrom_col, pos_col, ref_col, alt_col)
@@ -1575,6 +1622,10 @@ def annotate_row_by_coords(
     an_values: list[str] = []
     faf95_values: list[str] = []
     faf95_anc_values: list[str] = []
+    filters_values: list[str] = []
+    exome_filters_values: list[str] = []
+    genome_filters_values: list[str] = []
+    gene_symbols_values: list[str] = []
 
     for key in keys:
         if not key:
@@ -1584,15 +1635,23 @@ def annotate_row_by_coords(
             an_values.append("")
             faf95_values.append("")
             faf95_anc_values.append("")
+            filters_values.append("")
+            exome_filters_values.append("")
+            genome_filters_values.append("")
+            gene_symbols_values.append("")
             continue
         rec = records_by_key.get(key)
-        if rec is None:
+        if rec is None or (require_pass and rec.filters):
             minor_af_values.append("")
             af_values.append("")
             ac_values.append("")
             an_values.append("")
             faf95_values.append("")
             faf95_anc_values.append("")
+            filters_values.append("")
+            exome_filters_values.append("")
+            genome_filters_values.append("")
+            gene_symbols_values.append("")
             continue
         minor_af_values.append(str(rec.minor_allele_frequency))
         af_values.append(str(rec.allele_frequency))
@@ -1600,6 +1659,10 @@ def annotate_row_by_coords(
         an_values.append(str(rec.allele_number))
         faf95_values.append("" if rec.faf95_max is None else str(rec.faf95_max))
         faf95_anc_values.append(rec.faf95_max_ancestry)
+        filters_values.append(rec.filters)
+        exome_filters_values.append(rec.exome_filters)
+        genome_filters_values.append(rec.genome_filters)
+        gene_symbols_values.append(rec.gene_symbols)
 
     out[f"{col_prefix}.minor_allele_frequency"] = "|".join(minor_af_values)
     out[f"{col_prefix}.allele_frequency"] = "|".join(af_values)
@@ -1607,6 +1670,10 @@ def annotate_row_by_coords(
     out[f"{col_prefix}.allele_number"] = "|".join(an_values)
     out[f"{col_prefix}.faf95_max"] = "|".join(faf95_values)
     out[f"{col_prefix}.faf95_max_ancestry"] = "|".join(faf95_anc_values)
+    out[f"{col_prefix}.filters"] = "|".join(filters_values)
+    out[f"{col_prefix}.exome_filters"] = "|".join(exome_filters_values)
+    out[f"{col_prefix}.genome_filters"] = "|".join(genome_filters_values)
+    out[f"{col_prefix}.gene_symbols"] = "|".join(gene_symbols_values)
 
     return out
 
@@ -1764,6 +1831,15 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Maximum per-field character length for CSV/TSV parsing (default: %(default)s).",
     )
     p.add_argument(
+        "--require-pass",
+        action="store_true",
+        help=(
+            "Exclude variants from annotation output if their gnomAD combined filter set "
+            "is non-empty (i.e. the variant did not pass all gnomAD quality filters). "
+            "Has no effect for variants not present in gnomAD."
+        ),
+    )
+    p.add_argument(
         "--genes",
         default=None,
         metavar="GENE[,GENE...]",
@@ -1849,6 +1925,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         f"{prefix}.allele_number",
         f"{prefix}.faf95_max",
         f"{prefix}.faf95_max_ancestry",
+        f"{prefix}.filters",
+        f"{prefix}.exome_filters",
+        f"{prefix}.genome_filters",
+        f"{prefix}.gene_symbols",
     ]
 
     if args.execution_mode == "athena":
@@ -1920,6 +2000,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                         args.coord_pos_col,
                         args.coord_ref_col,
                         args.coord_alt_col,
+                        require_pass=args.require_pass,
                     )
                     row.update(ann)
                     writer.writerow(row)
@@ -1956,7 +2037,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
             batch_annotated = 0
             for row in batch_rows:
-                ann = annotate_row(row, record_cache, prefix, args.dna_clingen_allele_id_col)
+                ann = annotate_row(row, record_cache, prefix, args.dna_clingen_allele_id_col, require_pass=args.require_pass)
                 row.update(ann)
                 writer.writerow(row)
                 if ann[f"{prefix}.minor_allele_frequency"].replace("|", "").strip():
@@ -2099,6 +2180,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                     args.coord_pos_col,
                     args.coord_ref_col,
                     args.coord_alt_col,
+                    require_pass=args.require_pass,
                 )
                 row.update(ann)
                 writer.writerow(row)
@@ -2165,7 +2247,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         writer = csv.DictWriter(out_fh, fieldnames=out_fieldnames, delimiter=delim, lineterminator="\n", extrasaction="ignore")
         writer.writeheader()
         for row in rows:
-            ann = annotate_row(row, records, prefix, args.dna_clingen_allele_id_col)
+            ann = annotate_row(row, records, prefix, args.dna_clingen_allele_id_col, require_pass=args.require_pass)
             row.update(ann)
             writer.writerow(row)
             if ann[f"{prefix}.minor_allele_frequency"].replace("|", "").strip():
