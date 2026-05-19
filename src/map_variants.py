@@ -1244,7 +1244,7 @@ async def _run_dcd_mapping_pipeline(
     allow_row_fallback: bool = True,
     precomputed_align_result=None,
     precomputed_transcript=None,
-) -> tuple[list[tuple[int, Optional[str], str]], Optional[str]]:
+) -> tuple[list[tuple[int, Optional[str], str]], Optional[str], Optional[int]]:
     """Run the full dcd_mapping pipeline for one group of rows sharing a target sequence.
 
     Builds a synthetic ``ScoresetMetadata``, runs BLAT alignment, selects transcripts,
@@ -1262,12 +1262,13 @@ async def _run_dcd_mapping_pipeline(
         dcd: Dict of imported dcd_mapping symbols from ``_try_import_dcd_mapping``.
 
     Returns:
-        A 2-tuple of:
+        A 3-tuple of:
         - A list of ``(orig_idx, hgvs_assay_level, error, dna_vrs_digest,
           protein_vrs_digest)`` per row. *hgvs_assay_level* is the post-mapped HGVS
           string; *error* is an empty string on success. Exactly one of the two
           digest fields will be populated per row (or both None on error).
         - The NM_ transcript accession selected by dcd_mapping, or None if unavailable.
+        - The strand value (1 or -1) from the alignment result, or None if unavailable.
     """
     ScoresetMetadata = dcd["ScoresetMetadata"]
     TargetGene = dcd["TargetGene"]
@@ -1282,7 +1283,7 @@ async def _run_dcd_mapping_pipeline(
     annotate = dcd["annotate"]
 
     def _fail_all(error: str):
-        return [(orig_idx, None, error, None, None) for orig_idx, _, _, _ in row_entries], None
+        return [(orig_idx, None, error, None, None) for orig_idx, _, _, _ in row_entries], None, None
 
     seq_type = (
         TargetSequenceType.DNA if _is_dna_sequence(target_sequence) else TargetSequenceType.PROTEIN
