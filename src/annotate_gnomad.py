@@ -855,59 +855,6 @@ def ensure_local_gnomad_ht(
 
         progress_logger.set_stage("preparing local cache projection")
 
-        # Filter to PASS variants only (gnomAD QC).  Variants with a non-empty
-        # filters set failed one or more QC steps (e.g. AC0, AS_VQSR) and
-        # should not be used for frequency annotation.
-        #
-        # Schema varies by gnomAD table:
-        #   - Older/browser tables: top-level "filters" set<str>
-        #   - v4.1 joint sites table: "exome.filters" and "genome.filters"
-        #
-        # The filters field can be either:
-        #   - set<str>: empty set means PASS
-        #   - bool:     False means PASS (no filters applied)
-        #
-        # For the joint table we keep variants that passed QC in at least one
-        # callset (exome OR genome PASS).  A missing filters field (variant
-        # absent from that callset) does not count as PASS.
-        def _is_pass_expr(expr: Any) -> Any:
-            """True when a filters field indicates the variant passed QC."""
-            import hail as _hl
-            if expr.dtype == _hl.tbool:
-                return ~expr  # False = no filters applied = PASS
-            return _hl.len(expr) == 0  # empty set<str> = PASS
-
-        _filters_for_qc = _choose_expr(source_ht, [["filters"]])
-        _exome_filters_for_qc = _choose_expr(source_ht, [["exome", "filters"]])
-        _genome_filters_for_qc = _choose_expr(source_ht, [["genome", "filters"]])
-
-        if _filters_for_qc is not None:
-            source_ht = source_ht.filter(hl.is_defined(_filters_for_qc) & _is_pass_expr(_filters_for_qc))
-            logger.info("Applied gnomAD QC filter: retaining only PASS variants (top-level filters field)")
-        elif _exome_filters_for_qc is not None or _genome_filters_for_qc is not None:
-            # Keep variants where at least one callset has a PASS filters field.
-            # Missing filters (callset absent for this variant) does not count as PASS.
-            _exome_pass = (
-                hl.is_defined(_exome_filters_for_qc) & _is_pass_expr(_exome_filters_for_qc)
-                if _exome_filters_for_qc is not None
-                else hl.bool(False)
-            )
-            _genome_pass = (
-                hl.is_defined(_genome_filters_for_qc) & _is_pass_expr(_genome_filters_for_qc)
-                if _genome_filters_for_qc is not None
-                else hl.bool(False)
-            )
-            source_ht = source_ht.filter(_exome_pass | _genome_pass)
-            logger.info(
-                "Applied gnomAD QC filter: retaining variants that passed in at least one callset "
-                "(exome.filters or genome.filters is PASS)"
-            )
-        else:
-            logger.warning(
-                "gnomAD source table has no 'filters', 'exome.filters', or 'genome.filters' field; "
-                "QC filter not applied — all variants will be included"
-            )
-
         # Resolve allele counts across known gnomAD schema variants:
         # - joint v4.1 sites HT: joint.freq[0].AC / .AN
         # - browser v4.1.1 sites HT: joint.freq.all.ac / .an
@@ -967,8 +914,14 @@ def ensure_local_gnomad_ht(
             )
 
         filters_expr = _choose_expr(source_ht, [["filters"]])
-        exome_filters_expr = _choose_expr(source_ht, [["exome", "filters"]])
-        genome_filters_expr = _choose_expr(source_ht, [["genome", "filters"]])
+        # gnomAD v4.1 joint sites table uses plural field names: "exomes" / "genomes".
+        # Older and browser tables use the singular form.
+        exome_filters_expr = _choose_expr(
+            source_ht, [["exomes", "filters"], ["exome", "filters"]]
+        )
+        genome_filters_expr = _choose_expr(
+            source_ht, [["genomes", "filters"], ["genome", "filters"]]
+        )
 
         vep_gene_symbols_expr: Optional[Any] = None
         if _has_path(source_ht.row.dtype, ["vep", "worst_csq_by_gene_canonical"]):
@@ -1370,6 +1323,62 @@ def load_gnomad_records_by_gnomad_keys_athena(
     return out
 
 
+def _record_passes_callset_filter(rec: GnomadRecord, callset_pass_filter: str) -> bool:
+    """Return True when *rec* satisfies *callset_pass_filter*.
+
+    Choices:
+      ``"none"``  — always True (no callset filtering).
+      ``"any"``   — True when the variant passed QC in at least one callset
+                   (exome OR genome filters field is empty).
+      ``"all"``   — True when the variant passed QC in both callsets
+                   (exome AND genome filters fields are both empty).
+
+    An empty ``exome_filters`` or ``genome_filters`` string means the variant
+    either passed QC in that callset or was not called in it.  Non-empty means
+    at least one QC filter was applied (e.g. ``"AC0"``, ``"AS_VQSR"``).  Use
+    ``--require-pass`` in addition to filter on the combined ``filters`` field.
+    """
+    if callset_pass_filter == "none":
+        return True
+    exome_pass = rec.exome_filters == ""
+    genome_pass = rec.genome_filters == ""
+    if callset_pass_filter == "any":
+        return exome_pass or genome_pass
+    if callset_pass_filter == "all":
+        return exome_pass and genome_pass
+    return True
+
+
+def _validate_callset_pass_filter(
+    records: dict[str, GnomadRecord],
+    callset_pass_filter: str,
+) -> None:
+    """Raise ValueError if *callset_pass_filter* cannot be applied to *records*.
+
+    Raises when ``any`` or ``all`` is requested but no record in the loaded
+    batch has any callset-level filter data — which indicates the gnomAD cache
+    was built from a table without per-callset ``exome.filters`` /
+    ``genome.filters`` fields.  In that case the caller should use
+    ``--require-pass`` (which operates on the combined ``filters`` field)
+    instead.
+    """
+    if callset_pass_filter == "none" or not records:
+        return
+    has_callset_data = any(
+        rec.exome_filters or rec.genome_filters for rec in records.values()
+    )
+    if not has_callset_data:
+        raise ValueError(
+            f"--callset-pass-filter {callset_pass_filter!r} was requested but none of the "
+            "loaded gnomAD records have per-callset filter data "
+            "(exome_filters and genome_filters are both empty for every record). "
+            "The gnomAD cache may have been built from a table without separate "
+            "exome/genome callset fields.  Use --require-pass to filter on the "
+            "combined 'filters' field instead, or rebuild the cache from a "
+            "joint gnomAD sites table that contains exome.filters / genome.filters."
+        )
+
+
 def annotate_row(
     row: dict[str, str],
     records: dict[str, GnomadRecord],
@@ -1377,6 +1386,7 @@ def annotate_row(
     dna_col: str,
     *,
     require_pass: bool = False,
+    callset_pass_filter: str = "none",
 ) -> dict[str, str]:
     out = {
         f"{col_prefix}.minor_allele_frequency": "",
@@ -1420,7 +1430,7 @@ def annotate_row(
             gene_symbols_values.append("")
             continue
         rec = records.get(_normalize_caid(caid))
-        if rec is None or (require_pass and rec.filters):
+        if rec is None or (require_pass and rec.filters) or not _record_passes_callset_filter(rec, callset_pass_filter):
             minor_af_values.append("")
             af_values.append("")
             ac_values.append("")
@@ -1593,6 +1603,9 @@ def annotate_row_by_coords(
     pos_col: str,
     ref_col: str,
     alt_col: str,
+    *,
+    require_pass: bool = False,
+    callset_pass_filter: str = "none",
 ) -> dict[str, str]:
     """Annotate a row by looking up gnomAD records via VCF-style coordinate keys.
 
@@ -1641,7 +1654,7 @@ def annotate_row_by_coords(
             gene_symbols_values.append("")
             continue
         rec = records_by_key.get(key)
-        if rec is None or (require_pass and rec.filters):
+        if rec is None or (require_pass and rec.filters) or not _record_passes_callset_filter(rec, callset_pass_filter):
             minor_af_values.append("")
             af_values.append("")
             ac_values.append("")
@@ -1840,6 +1853,21 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--callset-pass-filter",
+        choices=["none", "any", "all"],
+        default="none",
+        help=(
+            "Per-callset QC filter applied at annotation time (default: none). "
+            "'none': accept all matched gnomAD records. "
+            "'any': only annotate variants that passed QC in at least one callset "
+            "(exome OR genome filters field is empty). "
+            "'all': only annotate variants that passed QC in both callsets "
+            "(exome AND genome filters fields are both empty). "
+            "Raises an error if the gnomAD cache was built from a table without "
+            "per-callset exome/genome filter fields; use --require-pass for those tables."
+        ),
+    )
+    p.add_argument(
         "--genes",
         default=None,
         metavar="GENE[,GENE...]",
@@ -2001,6 +2029,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                         args.coord_ref_col,
                         args.coord_alt_col,
                         require_pass=args.require_pass,
+                        callset_pass_filter=args.callset_pass_filter,
                     )
                     row.update(ann)
                     writer.writerow(row)
@@ -2037,7 +2066,7 @@ def main(argv: Optional[list[str]] = None) -> None:
 
             batch_annotated = 0
             for row in batch_rows:
-                ann = annotate_row(row, record_cache, prefix, args.dna_clingen_allele_id_col, require_pass=args.require_pass)
+                ann = annotate_row(row, record_cache, prefix, args.dna_clingen_allele_id_col, require_pass=args.require_pass, callset_pass_filter=args.callset_pass_filter)
                 row.update(ann)
                 writer.writerow(row)
                 if ann[f"{prefix}.minor_allele_frequency"].replace("|", "").strip():
@@ -2159,6 +2188,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         )
         records_by_key = load_gnomad_records_by_gnomad_keys(local_ht, gnomad_keys, cache_dir)
         logger.info("Loaded %d gnomAD records", len(records_by_key))
+        _validate_callset_pass_filter(records_by_key, args.callset_pass_filter)
 
         out_fieldnames = fieldnames + [c for c in ann_cols if c not in fieldnames]
         annotated = 0
@@ -2181,6 +2211,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                     args.coord_ref_col,
                     args.coord_alt_col,
                     require_pass=args.require_pass,
+                    callset_pass_filter=args.callset_pass_filter,
                 )
                 row.update(ann)
                 writer.writerow(row)
@@ -2241,13 +2272,15 @@ def main(argv: Optional[list[str]] = None) -> None:
             poll_seconds=args.athena_poll_seconds,
         )
 
+    _validate_callset_pass_filter(records, args.callset_pass_filter)
+
     out_fieldnames = fieldnames + [c for c in ann_cols if c not in fieldnames]
     annotated = 0
     with output_path.open("w", encoding="utf-8", newline="") as out_fh:
         writer = csv.DictWriter(out_fh, fieldnames=out_fieldnames, delimiter=delim, lineterminator="\n", extrasaction="ignore")
         writer.writeheader()
         for row in rows:
-            ann = annotate_row(row, records, prefix, args.dna_clingen_allele_id_col, require_pass=args.require_pass)
+            ann = annotate_row(row, records, prefix, args.dna_clingen_allele_id_col, require_pass=args.require_pass, callset_pass_filter=args.callset_pass_filter)
             row.update(ann)
             writer.writerow(row)
             if ann[f"{prefix}.minor_allele_frequency"].replace("|", "").strip():
