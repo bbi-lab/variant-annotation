@@ -49,13 +49,32 @@ def get_dna_variant_columns(df: pd.DataFrame) -> List[str]:
     dna_cols = [
         "mapped_hgvs_g",
         "mapped_hgvs_c",
-        "dna_clingen_allele_id",
+        "reverse_translation_warnings",
+        "mapped_hgvs_g_chromosome",
+        "mapped_hgvs_g_start",
+        "mapped_hgvs_g_stop",
+        "mapped_hgvs_g_ref",
+        "mapped_hgvs_g_alt",
+        "mapped_hgvs_c_transcript",
+        "mapped_hgvs_c_start",
+        "mapped_hgvs_c_stop",
+        "mapped_hgvs_c_ref",
+        "mapped_hgvs_c_alt",
         "touches_intronic_region",
         "spans_intron",
+        "dna_clingen_allele_id",
     ]
 
     # Annotation prefixes that get pipe-delimited for multi-candidate rows
-    annotation_prefixes = ("spliceai.", "clinvar.", "gnomad.")
+    annotation_prefixes = (
+        "alphamissense.",
+        "clingen_evidence_repository.",
+        "clinvar.",
+        "gnomad.",
+        "mutpred2.",
+        "spliceai.",
+        "revel."
+    )
 
     # Add any columns with annotation prefixes
     for col in df.columns:
@@ -63,9 +82,9 @@ def get_dna_variant_columns(df: pd.DataFrame) -> List[str]:
             dna_cols.append(col)
     
     # Add parsed position/allele columns (mapped_hgvs_*_start, etc.)
-    for col in df.columns:
-        if col.startswith("mapped_hgvs_") and col.endswith(("_start", "_stop", "_ref", "_alt")):
-            dna_cols.append(col)
+    # for col in df.columns:
+    #     if col.startswith("mapped_hgvs_") and col.endswith(("_start", "_stop", "_ref", "_alt")):
+    #         dna_cols.append(col)
 
     # Return only columns that actually exist in the DataFrame
     return [c for c in dna_cols if c in df.columns]
