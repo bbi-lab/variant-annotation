@@ -34,7 +34,7 @@ gnomad = [
     "hail",
 ]
 mapping = [
-    "dcd-mapping @ git+https://github.com/VariantEffect/dcd_mapping2.git@mavedb-main",
+    "dcd-mapping @ git+https://github.com/VariantEffect/dcd_mapping2.git@v2026.1.2",
 ]
 publish = [
     "build",
