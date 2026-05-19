@@ -178,6 +178,22 @@ services:
       - .:/usr/src/app
       - ${VARIANT_DATA_DIR:-./data}:/work
 
+  compare-cvfg-datasets:
+    <<: *tools-image
+    profiles:
+      - tools
+    depends_on:
+      - seqrepo
+      - uta
+    env_file:
+      - settings/.env
+    entrypoint: ["python", "-m", "src.compare_cvfg_datasets"]
+    command: ["--help"]
+    volumes:
+      - .:/usr/src/app
+      - variant-annotation-seqrepo:/usr/local/share/seqrepo
+      - ${VARIANT_DATA_DIR:-./data}:/work
+
   cdot:
     build:
       context: https://github.com/VariantEffect/cdot_rest.git
