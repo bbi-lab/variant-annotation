@@ -96,6 +96,31 @@ ENSEMBL_REST_URL = "https://rest.ensembl.org"
 PROGRESS_EVERY_ROWS = 1000
 
 
+class _NoTracebackFilter(logging.Filter):
+    """Strip stack traces from WARNING- and ERROR-level records.
+
+    Third-party libraries such as dcd_mapping log *expected* per-variant
+    failures (e.g. "Cannot process variant … not fully contained") via
+    ``logger.exception()`` or ``logger.warning(exc_info=True)``.  The message
+    text is useful; the accompanying stack trace is noise.  This filter
+    removes ``exc_info`` / ``exc_text`` for any record below CRITICAL, leaving
+    CRITICAL and above untouched so genuine crashes are still fully logged.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        if record.levelno < logging.CRITICAL:
+            record.exc_info = None
+            record.exc_text = None
+        return True
+
+
+def _suppress_third_party_tracebacks() -> None:
+    """Attach :class:`_NoTracebackFilter` to known noisy third-party loggers."""
+    filt = _NoTracebackFilter()
+    for name in ("dcd_mapping",):
+        logging.getLogger(name).addFilter(filt)
+
+
 # ---------------------------------------------------------------------------
 # File / format utilities
 # ---------------------------------------------------------------------------
@@ -2721,6 +2746,7 @@ def main(
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
         stream=sys.stderr,
     )
+    _suppress_third_party_tracebacks()
     csv.field_size_limit(csv_field_size_limit)
     map_variants(
         input_file=input_file,
