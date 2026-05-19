@@ -94,6 +94,33 @@ class _HgvsRefResolver:
         except Exception:
             return None
 
+    def get_cds_start_i(self, tx_ac: str) -> Optional[int]:
+        """Return the 0-based interbase CDS start position in the transcript sequence.
+
+        This is the number of nucleotides in the 5\u2019 UTR: c.1 is at transcript
+        position ``cds_start_i + 1`` (1-based).
+        """
+        try:
+            mapping_options = self._hdp.get_tx_mapping_options(tx_ac)
+            if not mapping_options:
+                return None
+            opt = mapping_options[0]
+            # Rows may be named tuples or plain tuples: (tx_ac, alt_ac, alt_aln_method)
+            alt_ac = opt[1]
+            alt_aln_method = opt[2]
+            tx_info = self._hdp.get_tx_info(tx_ac, alt_ac, alt_aln_method)
+            if tx_info is None:
+                return None
+            cds_start = getattr(tx_info, "cds_start_i", None)
+            if cds_start is None and hasattr(tx_info, "__getitem__"):
+                try:
+                    cds_start = tx_info["cds_start_i"]
+                except (KeyError, TypeError):
+                    pass
+            return int(cds_start) if cds_start is not None else None
+        except Exception:
+            return None
+
 
 def _get_hgvs_ref_resolver() -> Optional[_HgvsRefResolver]:
     global _HGVS_RESOLVER_UNAVAILABLE_LOGGED
@@ -141,71 +168,145 @@ def _fetch_ref_seq(accession: str, start: int, stop: int) -> Optional[str]:
         return None
 
 
-def _apply_genomic_vcf_anchor(
+@lru_cache(maxsize=1000)
+def _get_cds_start_i(accession: str) -> Optional[int]:
+    """Return the 0-based interbase CDS start position in the transcript sequence.
+
+    ``c.1`` is at transcript position ``cds_start_i + 1`` (1-based).  Returns
+    ``None`` when UTA is unavailable or the accession is not found.
+    """
+    resolver = _get_hgvs_ref_resolver()
+    if resolver is None:
+        return None
+    try:
+        return resolver.get_cds_start_i(accession)
+    except Exception:
+        return None
+
+
+def _apply_vcf_anchor(
     hgvs_str: Optional[str],
     start: Optional[str],
     stop: Optional[str],
     ref: Optional[str],
     alt: Optional[str],
 ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """Re-encode a genomic deletion to follow strict VCF convention.
+    """Apply the VCF leading-residue (anchor) convention to indel alleles.
 
-    VCF requires that the first base of *ref* is the unchanged "anchor"
-    nucleotide immediately before the deletion, and *alt* contains only that
-    anchor.  For a deletion of bases B₁…Bₙ starting at position N:
+    For **deletions** (``alt==""``)::
 
-        start → N-1  (position of the anchor)
-        stop  → N + n - 1  (unchanged, last deleted position)
-        ref   → anchor + B₁…Bₙ
-        alt   → anchor
+        start \u2192 N\u22121  (anchor position, one before the first deleted base)
+        ref   \u2192 anchor + deleted_bases
+        alt   \u2192 anchor
 
-    If the anchor nucleotide cannot be obtained from the reference sequence
-    (UTA unavailable or position 1), the original values are returned unchanged.
+    For **insertions** (``ref==""`` and ``alt!=""``)::
 
-    This transformation is applied **only to genomic (g.) HGVS strings** with
-    a blank alt (i.e. pure deletions, not delins variants).
+        start \u2192 unchanged  (already the left flanking base in HGVS notation)
+        ref   \u2192 anchor  (base at start position)
+        alt   \u2192 anchor + inserted_bases
+
+    Supported coordinate types
+    --------------------------
+    * ``g.`` \u2013 anchor fetched from the genome sequence via UTA.
+    * ``c.`` \u2013 anchor fetched from the transcript CDS sequence via UTA
+      (CDS start offset resolved automatically).
+    * ``n.`` \u2013 anchor fetched from the non-coding transcript sequence via UTA.
+    * ``p.`` \u2013 no-op; protein insertions are handled at parse time.
+
+    Returns the original values unchanged when the anchor cannot be determined
+    (UTA unavailable, intronic coordinate, or position at the start of the
+    sequence).
     """
-    if alt != "" or not start or not hgvs_str:
+    is_deletion = alt == ""
+    is_insertion = ref == "" and bool(alt)
+
+    if not is_deletion and not is_insertion:
+        return start, stop, ref, alt
+    if not start or not hgvs_str:
         return start, stop, ref, alt
 
-    # Only apply to genomic HGVS (coord_type == "g")
     text = (hgvs_str or "").strip()
     if ":" not in text:
         return start, stop, ref, alt
     body = text.split(":", 1)[1].strip()
-    if len(body) < 2 or body[1] != "." or body[0].lower() != "g":
+    if len(body) < 2 or body[1] != ".":
         return start, stop, ref, alt
+    coord_type = body[0].lower()
 
-    try:
-        start_int = int(start)
-    except (ValueError, TypeError):
-        return start, stop, ref, alt
-
-    if start_int <= 1:
+    if coord_type == "p":
+        # Protein anchor is embedded by the parser for insertions; deletions
+        # are left unchanged (no protein sequence database available).
         return start, stop, ref, alt
 
     accession = _extract_accession_from_hgvs(hgvs_str)
     if not accession:
         return start, stop, ref, alt
 
-    anchor_pos = start_int - 1
+    try:
+        start_int = int(start)
+    except (ValueError, TypeError):
+        # Intronic or non-integer position (e.g. "76+1"); skip.
+        return start, stop, ref, alt
 
-    if ref:
-        # Deleted bases are known; only need to fetch the anchor.
-        anchor = _fetch_ref_seq(accession, anchor_pos, anchor_pos)
-        if anchor is None:
+    if coord_type in ("c", "n"):
+        if start_int < 1:
             return start, stop, ref, alt
-        return str(anchor_pos), stop, anchor + ref, anchor
-    else:
-        # Deleted bases are unknown; fetch anchor + deleted region together.
-        try:
-            stop_int = int(stop) if stop else start_int
-        except (ValueError, TypeError):
-            return start, stop, ref, alt
-        full_seq = _fetch_ref_seq(accession, anchor_pos, stop_int)
-        if not full_seq:
-            return start, stop, ref, alt
-        return str(anchor_pos), stop, full_seq, full_seq[0]
+        if coord_type == "c":
+            cds_start_i = _get_cds_start_i(accession)
+            if cds_start_i is None:
+                return start, stop, ref, alt
+            def _tx_pos(c_pos: int) -> int:
+                return cds_start_i + c_pos
+        else:  # n.
+            def _tx_pos(c_pos: int) -> int:  # type: ignore[misc]
+                return c_pos
+
+        if is_insertion:
+            anchor = _fetch_ref_seq(accession, _tx_pos(start_int), _tx_pos(start_int))
+            if anchor is None:
+                return start, stop, ref, alt
+            return start, stop, anchor, anchor + (alt or "")
+        else:
+            anchor_c = start_int - 1
+            if anchor_c < 1:
+                return start, stop, ref, alt
+            anchor = _fetch_ref_seq(accession, _tx_pos(anchor_c), _tx_pos(anchor_c))
+            if anchor is None:
+                return start, stop, ref, alt
+            return str(anchor_c), stop, anchor + (ref or ""), anchor
+
+    else:  # g.
+        if is_insertion:
+            if start_int < 1:
+                return start, stop, ref, alt
+            anchor = _fetch_ref_seq(accession, start_int, start_int)
+            if anchor is None:
+                return start, stop, ref, alt
+            return start, stop, anchor, anchor + (alt or "")
+        else:
+            # Deletion.
+            if start_int <= 1:
+                return start, stop, ref, alt
+            anchor_pos = start_int - 1
+            if ref:
+                anchor = _fetch_ref_seq(accession, anchor_pos, anchor_pos)
+                if anchor is None:
+                    return start, stop, ref, alt
+                return str(anchor_pos), stop, anchor + ref, anchor
+            else:
+                # Deleted bases unknown; fetch anchor + deleted region together.
+                try:
+                    stop_int = int(stop) if stop else start_int
+                except (ValueError, TypeError):
+                    return start, stop, ref, alt
+                full_seq = _fetch_ref_seq(accession, anchor_pos, stop_int)
+                if not full_seq:
+                    return start, stop, ref, alt
+                return str(anchor_pos), stop, full_seq, full_seq[0]
+
+
+# Backward-compatible alias.
+_apply_genomic_vcf_anchor = _apply_vcf_anchor
 
 
 def _detect_separator(file_path: str) -> str:
@@ -379,6 +480,11 @@ def _parse_protein_hgvs(hgvs_body: str) -> tuple[Optional[str], Optional[str], O
             return start, stop, ref_range, ""
         if edit.startswith("dup"):
             return start, stop, ref_range, ref_range + ref_range
+        if edit.startswith("ins"):
+            # VCF convention: anchor = aa1 (the left flanking residue, known from HGVS).
+            alt_part = edit[len("ins"):]
+            inserted = _normalize_protein_allele(alt_part, False, None) or alt_part
+            return start, stop, aa1_1letter, aa1_1letter + inserted
         if edit == "=":
             return start, stop, ref_range, ref_range
         return start, stop, None, None
@@ -407,8 +513,9 @@ def _parse_protein_hgvs(hgvs_body: str) -> tuple[Optional[str], Optional[str], O
         return start, stop, ref_1letter, ref_1letter + ref_1letter
     if edit.startswith("ins"):
         alt_part = edit[len("ins"):]
-        alt_1letter = _normalize_protein_allele(alt_part, False, None) or alt_part
-        return start, stop, "", alt_1letter
+        alt_1letter = _normalize_protein_allele(alt_part, False, ref_1letter) or alt_part
+        # VCF convention: anchor = the AA at start (ref_1letter, already known).
+        return start, stop, ref_1letter, ref_1letter + alt_1letter
     if edit.startswith("fs"):
         return start, stop, ref_1letter, "fs"
 
@@ -590,6 +697,16 @@ def _parse_hgvs(
         if resolved_ref is not None:
             ref = resolved_ref
 
+    # Duplications must never emit the literal string "dup" as the alt allele.
+    # Expand to ref+ref when the sequence is known; otherwise clear both to None
+    # so downstream anchor logic doesn't misinterpret an unresolved dup as a deletion.
+    if alt == "dup":
+        if ref:
+            alt = ref + ref
+        else:
+            ref = None
+            alt = None
+
     touches_intronic_region = False
     spans_intron = False
     if coord_type in {"c", "n"} and start is not None and stop is not None:
@@ -635,8 +752,7 @@ def _annotate_row(
             ref_ids.append("" if ref_id is None else ref_id)
             if alt == "inv" and ref:
                 alt = _reverse_complement(ref)
-            if is_genomic:
-                start, stop, ref, alt = _apply_genomic_vcf_anchor(seg or None, start, stop, ref, alt)
+            start, stop, ref, alt = _apply_vcf_anchor(seg or None, start, stop, ref, alt)
             starts.append("" if start is None else start)
             stops.append("" if stop is None else stop)
             refs.append("" if ref is None else ref)

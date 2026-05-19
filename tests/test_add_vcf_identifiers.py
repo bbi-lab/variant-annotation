@@ -216,3 +216,200 @@ def test_pipe_delimited_hgvs_columns_produce_pipe_delimited_output(tmp_path):
     assert row["mapped_hgvs_p_ref"] == "T"  # Thr -> T
     assert row["mapped_hgvs_p_alt"] == "S"  # Ser -> S
 
+
+# ---------------------------------------------------------------------------
+# VCF anchor convention tests
+# ---------------------------------------------------------------------------
+
+def test_apply_vcf_anchor_genomic_deletion_with_ref(monkeypatch):
+    """Genomic deletion with known ref uses anchor fetched at start-1."""
+    monkeypatch.setattr(mod, "_fetch_ref_seq", lambda acc, s, e: "G" if s == 999 else None)
+    start, stop, ref, alt = mod._apply_vcf_anchor(
+        "NC_000001.11:g.1000_1002del", "1000", "1002", "ATC", ""
+    )
+    assert start == "999"
+    assert ref == "GATC"
+    assert alt == "G"
+
+
+def test_apply_vcf_anchor_genomic_insertion(monkeypatch):
+    """Genomic insertion prepends the anchor base at the left flanking position."""
+    monkeypatch.setattr(mod, "_fetch_ref_seq", lambda acc, s, e: "C" if s == 1000 else None)
+    start, stop, ref, alt = mod._apply_vcf_anchor(
+        "NC_000001.11:g.1000_1001insACGT", "1000", "1001", "", "ACGT"
+    )
+    assert start == "1000"
+    assert ref == "C"
+    assert alt == "CACGT"
+
+
+def test_apply_vcf_anchor_transcript_deletion(monkeypatch):
+    """Transcript (c.) deletion anchors using CDS-offset sequence lookup."""
+    monkeypatch.setattr(mod, "_get_cds_start_i", lambda acc: 100)
+    # c.76 → tx pos 176; anchor at c.75 → tx pos 175
+    monkeypatch.setattr(mod, "_fetch_ref_seq", lambda acc, s, e: "G" if s == 175 else None)
+    start, stop, ref, alt = mod._apply_vcf_anchor(
+        "NM_000314.8:c.76del", "76", "76", "C", ""
+    )
+    assert start == "75"
+    assert ref == "GC"
+    assert alt == "G"
+
+
+def test_apply_vcf_anchor_transcript_insertion(monkeypatch):
+    """Transcript (c.) insertion prepends the anchor at the left flanking c. position."""
+    monkeypatch.setattr(mod, "_get_cds_start_i", lambda acc: 100)
+    # c.76 → tx pos 176
+    monkeypatch.setattr(mod, "_fetch_ref_seq", lambda acc, s, e: "T" if s == 176 else None)
+    start, stop, ref, alt = mod._apply_vcf_anchor(
+        "NM_000314.8:c.76_77insA", "76", "77", "", "A"
+    )
+    assert start == "76"
+    assert ref == "T"
+    assert alt == "TA"
+
+
+def test_apply_vcf_anchor_noncoding_insertion(monkeypatch):
+    """Non-coding transcript (n.) insertion uses position directly (no CDS offset)."""
+    monkeypatch.setattr(mod, "_fetch_ref_seq", lambda acc, s, e: "A" if s == 76 else None)
+    start, stop, ref, alt = mod._apply_vcf_anchor(
+        "NR_024540.1:n.76_77insC", "76", "77", "", "C"
+    )
+    assert start == "76"
+    assert ref == "A"
+    assert alt == "AC"
+
+
+def test_apply_vcf_anchor_substitution_unchanged(monkeypatch):
+    """Substitutions (both ref and alt non-empty) are left unchanged."""
+    called = []
+    monkeypatch.setattr(mod, "_fetch_ref_seq", lambda *a: called.append(a) or "X")
+    start, stop, ref, alt = mod._apply_vcf_anchor(
+        "NC_000001.11:g.1000A>T", "1000", "1000", "A", "T"
+    )
+    assert ref == "A"
+    assert alt == "T"
+    assert not called  # no sequence lookup should happen
+
+
+def test_apply_vcf_anchor_no_uta_returns_unchanged(monkeypatch):
+    """When UTA is unavailable (returns None), values are returned unchanged."""
+    monkeypatch.setattr(mod, "_fetch_ref_seq", lambda *a: None)
+    monkeypatch.setattr(mod, "_get_cds_start_i", lambda *a: None)
+    # genomic deletion
+    start, stop, ref, alt = mod._apply_vcf_anchor(
+        "NC_000001.11:g.1000del", "1000", "1000", "A", ""
+    )
+    assert start == "1000"
+    assert ref == "A"
+    assert alt == ""
+    # genomic insertion
+    start, stop, ref, alt = mod._apply_vcf_anchor(
+        "NC_000001.11:g.1000_1001insA", "1000", "1001", "", "A"
+    )
+    assert ref == ""
+    assert alt == "A"
+
+
+def test_apply_vcf_anchor_protein_is_noop():
+    """Protein (p.) coordinates are left unchanged by _apply_vcf_anchor."""
+    start, stop, ref, alt = mod._apply_vcf_anchor(
+        "NP_000001.1:p.Ala5del", "5", "5", "A", ""
+    )
+    assert ref == "A"
+    assert alt == ""
+
+
+def test_protein_range_insertion_vcf_convention():
+    """p.Aa1_Aa2insXxx should output anchor=Aa1 as ref and anchor+inserted as alt."""
+    # p.Ala5_Gly6insLys
+    start, stop, ref, alt, _, _, _ = mod._parse_hgvs("NP_000001.1:p.Ala5_Gly6insLys")
+    assert start == "5"
+    assert ref == "A"   # Ala = anchor
+    assert alt == "AK"  # anchor + Lys
+
+
+def test_protein_single_position_insertion_vcf_convention():
+    """p.Ala5insLys should use the AA at position 5 as anchor."""
+    start, stop, ref, alt, _, _, _ = mod._parse_hgvs("NP_000001.1:p.Ala5insLys")
+    assert start == "5"
+    assert ref == "A"    # Ala anchor
+    assert alt == "AK"   # anchor + Lys
+
+
+def test_intronic_coordinate_not_anchored(monkeypatch):
+    """Intronic c. positions (e.g. c.76+1) are not altered by _apply_vcf_anchor."""
+    called = []
+    monkeypatch.setattr(mod, "_fetch_ref_seq", lambda *a: called.append(a) or "X")
+    monkeypatch.setattr(mod, "_get_cds_start_i", lambda *a: called.append("cds") or 100)
+    start, stop, ref, alt = mod._apply_vcf_anchor(
+        "NM_000314.8:c.76+1del", "76+1", "76+1", "A", ""
+    )
+    assert start == "76+1"
+    assert not called
+
+
+# ---------------------------------------------------------------------------
+# "dup" alt-allele expansion tests
+# ---------------------------------------------------------------------------
+
+def test_dup_with_inline_seq_already_expanded():
+    """g.1000dupA: _parse_nucleotide_hgvs already gives ref='A', alt='AA'—no sentinel."""
+    start, stop, ref, alt, *_ = mod._parse_hgvs("NC_000001.11:g.1000dupA")
+    assert alt == "AA"
+    assert ref == "A"
+
+
+def test_dup_without_seq_no_resolver_clears_alt():
+    """g.1000dup without resolve_missing_ref_alleles=True: both ref and alt are None."""
+    start, stop, ref, alt, *_ = mod._parse_hgvs("NC_000001.11:g.1000dup")
+    assert alt != "dup"
+    assert alt is None  # ref unknown; cleared to None so anchor logic ignores it
+    assert ref is None
+
+
+def test_dup_with_resolved_ref_expands_to_ref_ref(monkeypatch):
+    """g.1000dup with resolve_missing_ref_alleles=True: alt = ref+ref once resolved."""
+    monkeypatch.setattr(mod, "_resolve_missing_ref_allele", lambda *_: "C")
+    start, stop, ref, alt, *_ = mod._parse_hgvs(
+        "NC_000001.11:g.1000dup", resolve_missing_ref_alleles=True
+    )
+    assert ref == "C"
+    assert alt == "CC"
+
+
+def test_dup_resolver_unavailable_clears_alt(monkeypatch):
+    """If UTA is down, _resolve_missing_ref_allele returns None; ref and alt are None."""
+    monkeypatch.setattr(mod, "_resolve_missing_ref_allele", lambda *_: None)
+    start, stop, ref, alt, *_ = mod._parse_hgvs(
+        "NC_000001.11:g.1000dup", resolve_missing_ref_alleles=True
+    )
+    assert alt != "dup"
+    assert alt is None
+    assert ref is None
+
+
+def test_dup_multibase_expands(monkeypatch):
+    """g.1000_1002dup: alt = resolved-three-base-ref repeated twice."""
+    monkeypatch.setattr(mod, "_resolve_missing_ref_allele", lambda *_: "AGT")
+    start, stop, ref, alt, *_ = mod._parse_hgvs(
+        "NC_000001.11:g.1000_1002dup", resolve_missing_ref_alleles=True
+    )
+    assert ref == "AGT"
+    assert alt == "AGTAGT"
+
+
+def test_dup_unresolved_not_treated_as_deletion_by_anchor(monkeypatch):
+    """When dup ref can't be resolved, _apply_vcf_anchor must not misinterpret
+    the unresolved variant as a deletion even when UTA is available."""
+    # Simulate UTA connected for _apply_vcf_anchor but resolve_missing_ref_alleles=False.
+    monkeypatch.setattr(mod, "_fetch_ref_seq", lambda *_: "XACT")
+    start, stop, ref, alt, *_ = mod._parse_hgvs("NC_000001.11:g.1000_1002dup")
+    # Anchor must not be applied — result should remain empty, not a deletion.
+    start2, stop2, ref2, alt2 = mod._apply_vcf_anchor(
+        "NC_000001.11:g.1000_1002dup", start, stop, ref, alt
+    )
+    assert alt2 != "XACT"[0]  # must not produce a deletion anchor
+    assert ref2 is None or ref2 == ""
+    assert alt2 is None or alt2 == ""
+
