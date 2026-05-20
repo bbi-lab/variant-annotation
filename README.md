@@ -451,6 +451,15 @@ src/scripts/run_annotate_vep.sh annotated.tsv annotated_vep.tsv
 - If resolved candidates disagree, `vep.mutational_consequence` is blank and `vep.error` contains a pipe-delimited consequence list aligned to DNA candidates.
 - If a candidate does not return from VEP, it is treated as matching the shared row consequence when all other resolved candidates agree.
 - Output rows are streamed in input order and support `--skip` / `--limit`.
+- VEP API responses are cached in Redis per HGVS string. On subsequent runs, cached results are used directly without re-querying Ensembl. Caching is enabled automatically when the Redis service is reachable and fails gracefully when it is not.
+
+| Variable | Default | Description |
+|---|---|---|
+| `VEP_CACHE_ENABLED` | `true` | Set to `0` / `false` to disable |
+| `VEP_CACHE_REDIS_URL` | `redis://redis:6379/0` | Redis connection URL (also falls back to `REDIS_URL`) |
+| `VEP_CACHE_PREFIX` | `vep:v1` | Key namespace; bump the version suffix to invalidate the cache after a significant Ensembl release |
+| `VEP_CACHE_TTL_SECONDS` | `8640000` (100 days) | TTL for hits |
+| `VEP_CACHE_MISS_TTL_SECONDS` | `604800` (7 days) | TTL for misses (no consequence returned) |
 
 ### Step 9: Flatten DNA Variants (Optional)
 

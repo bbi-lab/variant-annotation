@@ -12,6 +12,29 @@ equal to the shared resolved consequence), that value is emitted in
 If resolved candidates disagree, ``vep.mutational_consequence`` is left blank and
 ``vep.error`` records the discrepancy including a pipe-delimited consequence list
 aligned to the input candidate positions.
+
+Redis caching
+-------------
+When a Redis instance is reachable, each HGVS → consequence mapping is cached to
+avoid redundant Ensembl API calls across runs.  Hits are stored for 100 days;
+misses (no consequence returned by VEP) are stored for 7 days.  Caching is
+transparent and fails gracefully: if Redis is unreachable the script continues
+without it.
+
+Relevant environment variables:
+
+``VEP_CACHE_ENABLED``
+    Set to ``0`` / ``false`` to disable caching entirely (default: enabled).
+``VEP_CACHE_REDIS_URL``
+    Redis connection URL (default: ``redis://redis:6379/0``; also falls back to
+    the generic ``REDIS_URL`` variable).
+``VEP_CACHE_PREFIX``
+    Key namespace prefix (default: ``vep:v1``).  Bump the version suffix to
+    invalidate all cached entries after a significant Ensembl / VEP release.
+``VEP_CACHE_TTL_SECONDS``
+    TTL for cached hits, in seconds (default: 8 640 000 — 100 days).
+``VEP_CACHE_MISS_TTL_SECONDS``
+    TTL for cached misses, in seconds (default: 604 800 — 7 days).
 """
 
 from __future__ import annotations
@@ -25,13 +48,27 @@ import logging
 import os
 from pathlib import Path
 import sys
-from typing import Optional, TextIO
+from typing import Any, Optional, TextIO
 
 import requests  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
 
 ENSEMBL_API_URL_DEFAULT = os.environ.get("ENSEMBL_API_URL", "https://rest.ensembl.org")
+
+# ---------------------------------------------------------------------------
+# Redis cache configuration
+# ---------------------------------------------------------------------------
+
+VEP_CACHE_REDIS_URL_DEFAULT = "redis://redis:6379/0"
+VEP_CACHE_PREFIX_DEFAULT = "vep:v1"
+VEP_CACHE_TTL_SECONDS_DEFAULT = 86400 # 1 day
+VEP_CACHE_MISS_TTL_SECONDS_DEFAULT = 86400 # 1 day
+
+_VEP_MISS_SENTINEL = "__MISS__"
+_VEP_REDIS_CLIENT: Any = None
+_VEP_REDIS_INIT_ATTEMPTED = False
+_VEP_REDIS_UNAVAILABLE_LOGGED = False
 
 # Ordered from most to least severe (mirrors MaveDB worker logic).
 VEP_CONSEQUENCES = [
@@ -84,6 +121,137 @@ def _split_pipe_preserve_positions(value: str) -> list[str]:
     if "|" not in raw:
         return [raw.strip()]
     return [part.strip() for part in raw.split("|")]
+
+
+# ---------------------------------------------------------------------------
+# Redis cache helpers
+# ---------------------------------------------------------------------------
+
+
+def _vep_env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _vep_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; using default=%d", name, raw, default)
+        return default
+
+
+def _vep_cache_enabled() -> bool:
+    return _vep_env_bool("VEP_CACHE_ENABLED", True)
+
+
+def _vep_cache_prefix() -> str:
+    return (os.environ.get("VEP_CACHE_PREFIX") or VEP_CACHE_PREFIX_DEFAULT).strip()
+
+
+def _vep_cache_ttl() -> int:
+    return max(1, _vep_env_int("VEP_CACHE_TTL_SECONDS", VEP_CACHE_TTL_SECONDS_DEFAULT))
+
+
+def _vep_cache_miss_ttl() -> int:
+    return max(1, _vep_env_int("VEP_CACHE_MISS_TTL_SECONDS", VEP_CACHE_MISS_TTL_SECONDS_DEFAULT))
+
+
+def _vep_cache_redis_url() -> str:
+    return (
+        os.environ.get("VEP_CACHE_REDIS_URL")
+        or os.environ.get("REDIS_URL")
+        or VEP_CACHE_REDIS_URL_DEFAULT
+    )
+
+
+def _vep_cache_key(hgvs: str) -> str:
+    return f"{_vep_cache_prefix()}:{hgvs}"
+
+
+def _vep_get_redis_client(*, force: bool = False):
+    """Return the module-level Redis client, connecting lazily on first call.
+
+    Returns ``None`` when caching is disabled or Redis is unreachable.
+    Pass ``force=True`` to bypass the ``VEP_CACHE_ENABLED`` check.
+    """
+    global _VEP_REDIS_CLIENT
+    global _VEP_REDIS_INIT_ATTEMPTED
+    global _VEP_REDIS_UNAVAILABLE_LOGGED
+
+    if not force and not _vep_cache_enabled():
+        return None
+    if _VEP_REDIS_CLIENT is not None:
+        return _VEP_REDIS_CLIENT
+    if _VEP_REDIS_INIT_ATTEMPTED:
+        return None
+
+    _VEP_REDIS_INIT_ATTEMPTED = True
+    try:
+        import redis  # type: ignore[import-not-found]
+
+        client = redis.Redis.from_url(_vep_cache_redis_url(), decode_responses=True)
+        client.ping()
+        _VEP_REDIS_CLIENT = client
+        logger.info("VEP Redis cache connected: %s", _vep_cache_redis_url())
+        return _VEP_REDIS_CLIENT
+    except Exception as exc:
+        if not _VEP_REDIS_UNAVAILABLE_LOGGED:
+            logger.warning("VEP Redis cache unavailable; continuing without cache: %s", exc)
+            _VEP_REDIS_UNAVAILABLE_LOGGED = True
+        return None
+
+
+def _vep_cache_get_many(hgvs_list: list[str]) -> dict[str, Optional[str]]:
+    """Batch-fetch VEP consequences from Redis.
+
+    Returns a dict containing only the HGVS strings that were found in the
+    cache.  A ``None`` value means VEP was previously queried but returned no
+    consequence (a stored miss), as distinct from a cache miss.
+    """
+    client = _vep_get_redis_client()
+    if client is None or not hgvs_list:
+        return {}
+    keys = [_vep_cache_key(h) for h in hgvs_list]
+    try:
+        values = client.mget(keys)
+    except Exception:
+        return {}
+    result: dict[str, Optional[str]] = {}
+    for hgvs, value in zip(hgvs_list, values):
+        if value is not None:
+            result[hgvs] = None if value == _VEP_MISS_SENTINEL else value
+    return result
+
+
+def _vep_cache_set_many(results: dict[str, Optional[str]]) -> None:
+    """Store a batch of HGVS → consequence mappings in Redis.
+
+    ``None`` consequences (VEP returned nothing) are stored under a sentinel
+    value so that repeated no-hit queries are also short-circuited.
+    """
+    client = _vep_get_redis_client()
+    if client is None or not results:
+        return
+    try:
+        pipe = client.pipeline(transaction=False)
+        for hgvs, consequence in results.items():
+            key = _vep_cache_key(hgvs)
+            if consequence is not None:
+                pipe.set(key, consequence, ex=_vep_cache_ttl())
+            else:
+                pipe.set(key, _VEP_MISS_SENTINEL, ex=_vep_cache_miss_ttl())
+        pipe.execute()
+    except Exception as exc:
+        logger.debug("VEP Redis cache write failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 
 
 def load_vep_cache_file(path: str) -> tuple[dict[str, Optional[str]], dict[str, str]]:
@@ -606,6 +774,15 @@ def _process_batch(
             if hgvs and hgvs not in consequence_cache:
                 batch_hgvs.append(hgvs)
 
+    # Satisfy as many lookups as possible from Redis before hitting the API.
+    if batch_hgvs:
+        unique_batch = list(dict.fromkeys(batch_hgvs))
+        redis_hits = _vep_cache_get_many(unique_batch)
+        if redis_hits:
+            consequence_cache.update(redis_hits)
+            logger.debug("VEP Redis cache: %d/%d hits", len(redis_hits), len(unique_batch))
+        batch_hgvs = [h for h in batch_hgvs if h not in consequence_cache]
+
     if batch_hgvs:
         looked_up = get_functional_consequence(
             batch_hgvs,
@@ -615,6 +792,7 @@ def _process_batch(
             max_workers=vep_workers,
         )
         consequence_cache.update(looked_up)
+        _vep_cache_set_many(looked_up)
 
     kept = 0
     newly_resolved = 0
