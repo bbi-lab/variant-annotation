@@ -297,11 +297,11 @@ src/scripts/run_add_vcf_identifiers.sh output_clingen.tsv output_parsed.tsv
 
 ### Step 5: Annotate with ClinVar Data (Optional)
 
-**Purpose:** Look up clinical significance, review status, and star ratings from ClinVar for DNA variants.
+**Purpose:** Look up clinical significance, review status, and star ratings from ClinVar. Resolves each `dna_clingen_allele_id` to a ClinVar Allele ID via the ClinGen API, then looks up that ID in the cached monthly ClinVar variant-summary TSV from NCBI.
 
 **Input columns:** `dna_clingen_allele_id` (from step 3)
 
-**Output columns:** `clinvar.<YYYYMM>.clinical_significance`, `.review_status`, `.stars`, `.last_review_date`
+**Output columns:** `clinvar.<YYYYMM>.variation_id`, `.allele_id`, `.clinical_significance`, `.review_status`, `.stars`, `.last_review_date`
 
 **Command:**
 ```bash
@@ -311,11 +311,12 @@ src/scripts/run_annotate_clinvar.sh output_parsed.tsv output_clinvar.tsv \
 ```
 
 **Notes:**
-- Uses pipe-delimited `dna_clingen_allele_id` candidates; tries each in order, returns first successful ClinVar match
-- Downloads and caches the monthly ClinVar TSV from NCBI on first run
-- Default namespace is `clinvar`; customize with `--namespace` flag
-- Supports custom DNA ID column via `--dna-clingen-allele-id-col` if needed
-- If all candidates fail to resolve, annotation columns are empty
+- Pipe-delimited `dna_clingen_allele_id` candidates are each annotated independently; output columns are also pipe-delimited
+- Downloads and caches the ClinVar TSV on first run; the cached file is reused permanently (monthly archives are immutable)
+- `stars` (0–4) is derived from `review_status` following ClinVar's own star-rating definitions
+- Default namespace is `clinvar`; use `--clinvar-namespace` to customise (e.g. when running two versions side by side)
+- Use `--dna-clingen-allele-id-col` if your input uses a different column name
+- See [docs/annotate_clinvar.md](docs/annotate_clinvar.md) for star-rating table, ClinGen→ClinVar resolution, caching details, and all options
 
 ### Step 6: Annotate with gnomAD Allele Frequencies (Optional)
 
