@@ -447,7 +447,28 @@ src/scripts/run_annotate_spliceai.sh output_clinvar.tsv output_spliceai.tsv \
 - `spliceai.max_delta_score` is `max(DS_AG, DS_AL, DS_DG, DS_DL)` for each candidate.
 - Precomputed files can have coverage limitations (for example, missing classes of indels).
 
-### Step 8: Annotate with VEP Mutational Consequence (Optional)
+### Step 8: Annotate with ClinGen Expert Panel Classifications (Optional)
+
+**Purpose:** Join each variant candidate against ClinGen Evidence Repository (erepo) expert-panel classifications using HGVS, ClinVar Variation ID, and/or CAID.
+
+See [docs/annotate_erepo.md](docs/annotate_erepo.md) for full reference documentation including join-key details, cache management, and warning diagnostics.
+
+**Input columns:** `mapped_hgvs_c` (from step 1 or step 2), optionally `dna_clingen_allele_id` and a ClinVar variation ID column
+
+**Output columns:** `clingen_evidence_repository.Assertion`, `.Expert Panel`, `.Disease Mondo Id`, `.Mode of Inheritance`, `.Applied Evidence Codes (Met)`, `.Applied Evidence Codes (Not Met)`, `.Summary of interpretation`, `.ClinVar Variation Id`, `.Allele Registry Id`, `.PubMed Articles`, `.Guideline`, `.Approval Date`, `.Published Date`, `.Retracted`, `.Evidence Repo Link`, `.Uuid`, `.warnings`
+
+**Command:**
+```bash
+src/scripts/run_annotate_erepo.sh input.tsv output.tsv
+```
+
+**Notes:**
+- The full erepo classification TSV is downloaded once and cached locally; use `--refresh-cache` to re-download.
+- Lookups use up to three join keys (HGVS, ClinVar Variation ID, CAID) by default; results are deduplicated by erepo UUID.
+- For rows with multiple DNA candidates, all output columns are pipe-delimited and candidate-aligned.
+- Only variants with a formal ClinGen expert-panel classification will be annotated; most variants will have empty output columns.
+
+### Step 9: Annotate with VEP Mutational Consequence (Optional)
 
 **Purpose:** Add a mutational consequence term from Ensembl VEP for each DNA variant row.
 
@@ -497,7 +518,7 @@ VEP API responses are cached in Redis as `(consequence, source)` pairs per HGVS 
 | `VEP_CACHE_TTL_SECONDS` | `86400` (1 day) | TTL for hits |
 | `VEP_CACHE_MISS_TTL_SECONDS` | `86400` (1 day) | TTL for misses (no consequence returned) |
 
-### Step 9: Flatten DNA Variants (Optional)
+### Step 10: Flatten DNA Variants (Optional)
 
 **Purpose:** For annotated variant files with multi-candidate DNA variants (from reverse translation), produce a flattened output where each DNA candidate has its own row. This is useful when you want one row per DNA variant instead of pipe-delimited lists.
 
@@ -1057,9 +1078,9 @@ TP53	CA123456|CA123457||	Pathogenic	0.00234	0.00234	1547
 | `spliceai.dp_dl` | float | Donor loss delta position |
 | `spliceai.max_delta_score` | float | Max of DS_AG, DS_AL, DS_DG, DS_DL |
 
-#### Step 8: flatten_dna_variants
+#### Step 9: flatten_dna_variants
 
-**No new columns are added in Step 8.** Instead, pipe-delimited columns from previous steps are expanded so that each DNA candidate gets its own row. The output file contains all columns from the input file, but with:
+**No new columns are added in Step 9.** Instead, pipe-delimited columns from previous steps are expanded so that each DNA candidate gets its own row. The output file contains all columns from the input file, but with:
 - One row per DNA candidate (instead of one row per protein with pipe-delimited candidates)
 - Non-list columns (e.g., `raw_hgvs_pro`, `gene_symbol`) repeated across the expanded rows
 - Protein-only rows (without DNA variants) dropped entirely
@@ -1092,7 +1113,7 @@ This ensures positional alignment across all downstream annotations.
 
 When annotating, the pipeline tries candidates in order and returns the first successful match.
 
-**Note on Step 8 (flatten_dna_variants):** This optional step converts pipe-delimited columns into separate rows, with one row per DNA candidate. After flattening, there are no more pipe-delimited values in these columns—each candidate has its own row.
+**Note on Step 9 (flatten_dna_variants):** This optional step converts pipe-delimited columns into separate rows, with one row per DNA candidate. After flattening, there are no more pipe-delimited values in these columns—each candidate has its own row.
 
 ## Local installation (without Docker)
 

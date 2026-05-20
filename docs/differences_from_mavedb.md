@@ -130,3 +130,11 @@ Hail mode supports `--genes BRCA1,BRCA2` to restrict the local cache to specific
 **MaveDB:** SpliceAI annotation has not been implemented in MaveDB.
 
 **This pipeline:** `annotate_spliceai` adds nine SpliceAI delta-score columns (`spliceai.ds_ag`, `spliceai.ds_al`, `spliceai.ds_dg`, `spliceai.ds_dl`, `spliceai.dp_ag`, `spliceai.dp_al`, `spliceai.dp_dg`, `spliceai.dp_dl`, `spliceai.max_delta_score`) to each row. Two execution modes are available: `precomputed` (default) — tabix lookup against the Illumina pre-scored SpliceAI VCFs — and `compute` — local on-the-fly scoring using the SpliceAI deep-learning model. For rows with multiple pipe-delimited DNA candidates (from step 2), all output columns are pipe-delimited and candidate-aligned.
+
+---
+
+## `annotate_erepo` (step 8)
+
+**MaveDB:** ClinGen Evidence Repository annotation has not been implemented in MaveDB.
+
+**This pipeline:** `annotate_erepo` downloads the full ClinGen erepo expert-panel classification TSV and joins it against each variant candidate using up to three keys: HGVS expression, ClinVar Variation ID, and CAID. Sixteen classification columns are added per candidate (prefixed `clingen_evidence_repository.`), including `Assertion`, `Expert Panel`, `Disease Mondo Id`, `Mode of Inheritance`, applied ACMG evidence codes, and supporting metadata. A `warnings` column records cross-key discrepancies.
