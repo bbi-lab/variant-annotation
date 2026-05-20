@@ -322,6 +322,8 @@ src/scripts/run_annotate_clinvar.sh output_parsed.tsv output_clinvar.tsv \
 
 **Purpose:** Look up allele frequencies and population-specific metrics from gnomAD using a local Hail table cache.
 
+See [docs/annotate_gnomad.md](docs/annotate_gnomad.md) for full reference documentation including lookup mode details, CAID resolution strategies, and Athena tuning options.
+
 **Input columns:** `dna_clingen_allele_id` (from step 3)
 
 **Output columns:** `gnomad.<VERSION>.minor_allele_frequency`, `.allele_frequency`, `.allele_count`, `.allele_number`, `.faf95_max`, `.faf95_max_ancestry`, `.filters`, `.exome_filters`, `.genome_filters`, `.gene_symbols`

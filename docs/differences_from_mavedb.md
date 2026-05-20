@@ -92,3 +92,33 @@ MaveDB relates DNA and protein variants through the ClinGen Allele Registry: `po
 | Indels | Not generated; depends on what was submitted to ClinGen | Optional via `--include-indels --max-indel-size N` |
 | Novel / unsubmitted variants | Skipped | Handled (candidates produced, ClinGen lookup attempted separately) |
 | Output cardinality | One `hgvs_c` / `hgvs_p` per variant | One or more pipe-delimited candidates per protein row |
+
+---
+
+## `annotate_gnomad` (step 6)
+
+**MaveDB** (`mavedb-api/src/mavedb/lib/gnomad.py`): queries gnomAD using AWS Athena exclusively. The query selects only `caid`, `joint.freq.all.ac`, `joint.freq.all.an`, `joint.fafmax.faf95_max_gen_anc`, and `joint.fafmax.faf95_max`. No QC filter columns are fetched. Lookups are CAID-only. No local cache is used; every run queries Athena.
+
+**This pipeline:** `annotate_gnomad` offers two execution backends (Hail and Athena) and two lookup strategies (coordinate-based or CAID-based), and the Athena backend's query structure deliberately matches MaveDB's for compatibility.
+
+Key differences:
+
+| | MaveDB | This pipeline |
+|---|---|---|
+| Execution backend | Athena only | Hail (default) or Athena |
+| Local cache | None | Hail mode builds an indexed local cache (one-time write, reused on subsequent runs) |
+| Lookup strategy | CAID only | `coordinates` (default) or `caid`; coordinate lookup covers variants that have no CAID in gnomAD |
+| QC filtering | Not available | `--require-pass` (combined filters) and `--callset-pass-filter any/all` (per-callset); Hail mode only |
+| QC filter columns in output | Not produced | `filters`, `exome_filters`, `genome_filters` populated in Hail mode; always empty in Athena mode |
+| Additional output fields | Not produced | `minor_allele_frequency`, `gene_symbols` |
+| Athena query fields | `caid`, AC, AN, faf95_max, faf95_max_gen_anc | Identical when using `--execution-mode athena` |
+
+### Why filtering matters
+
+MaveDB returns raw frequency data regardless of gnomAD QC status. A variant that failed gnomAD quality control (e.g. `AC0`, `AS_VQSR`) will be annotated with potentially unreliable frequency values in MaveDB. This pipeline allows callers to exclude such variants from annotation via `--require-pass` and `--callset-pass-filter`, which leave the frequency columns empty for QC-failed variants rather than propagating potentially misleading values.
+
+Filtering is **only available in Hail mode**. The Athena query (like MaveDB's) does not fetch filter columns, so `--require-pass` and `--callset-pass-filter` are silently no-ops when `--execution-mode athena` is used.
+
+### Gene-level cache filtering
+
+Hail mode supports `--genes BRCA1,BRCA2` to restrict the local cache to specific gene symbols (from `vep.worst_csq_by_gene_canonical`). This has no MaveDB equivalent.
