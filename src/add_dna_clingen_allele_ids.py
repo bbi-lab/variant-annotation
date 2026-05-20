@@ -126,13 +126,16 @@ def _lookup_allele_id_for_candidate(
         else:
             with cache_lock:
                 cached = lookup_cache.get(query)
+                if cached is None:
+                    # Reserve the slot so no other thread starts a duplicate request.
+                    lookup_cache[query] = ""
             if cached is None:
                 data = _query_clingen_by_hgvs(query, max_retries=max_retries)
                 resolved = (_extract_clingen_allele_id(data) or "") if data else ""
                 with cache_lock:
-                    # Keep first resolved value if another thread wrote it first.
-                    lookup_cache.setdefault(query, resolved)
-                    cached = lookup_cache.get(query, "")
+                    # Overwrite the placeholder with the real result.
+                    lookup_cache[query] = resolved
+                cached = resolved
             allele_id = cached or ""
 
         if allele_id:

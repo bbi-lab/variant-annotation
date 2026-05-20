@@ -380,6 +380,8 @@ def query_clingen_by_hgvs(
                 if allele_id:
                     _cache_set(_allele_cache_key(allele_id), json.dumps(data))
                     _cache_set(map_key, allele_id)
+                else:
+                    _cache_set(map_key, _CACHE_MISS_SENTINEL, miss=True)
                 return data
             if resp.status_code == 404:
                 if log_404:
