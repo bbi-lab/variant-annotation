@@ -207,25 +207,30 @@ Output: one row per DNA variant (or fully annotated variants)
 
 ### Step 1: Map Variants (Required)
 
-**Purpose:** Normalize input variants (nucleotide or protein HGVS) to human-genome reference HGVS strings on GRCh38.
+**Purpose:** Normalize input variants (nucleotide or protein HGVS) to human-genome reference HGVS strings on GRCh38 and populate ClinGen Allele Registry metadata.
 
-**Input columns:** `raw_hgvs_nt` (optional), `raw_hgvs_pro` (optional), `target_sequence` (required for sequence-based mapping)
+**Input columns:** `raw_hgvs_nt` (nucleotide HGVS), `raw_hgvs_pro` (protein HGVS), `target_sequence` (required for sequence-based and protein-only rows)
 
-**Output columns:** `mapped_hgvs_g`, `mapped_hgvs_c`, `mapped_hgvs_p`, `clingen_allele_id`, `mapped_errors`
+**Output columns:** `mapped_hgvs_g`, `mapped_hgvs_c`, `mapped_hgvs_p`, `clingen_allele_id`, `mapping_error`, `mapping_warnings`, `dna_vrs_digest`, `protein_vrs_digest`, `strand`
 
 **Command:**
 ```bash
 src/scripts/run_map_variants.sh input.tsv output.tsv \
-    --group-by gene_symbol \
-    --raw-hgvs-nt raw_hgvs_nt \
-    --raw-hgvs-pro raw_hgvs_pro
+    --drop-columns target_sequence
 ```
 
 **Notes:**
-- For transcript-referenced variants (e.g., `NM_000277.3:c.1218G>A`), the script normalizes through `dcd_mapping` to preserve accession handling
-- For sequence-based variants without transcript accessions, same-gene rows are aligned together using BLAT + VRS
-- Protein-only variants (no nucleotide HGVS) get protein mapping but c./g. fields will be empty
-- See [BLAT Error 137 Retry Strategy](#blat-error-137-retry-strategy) section for handling memory issues
+- Three variant cases are detected automatically from the input columns — see [docs/map_variants.md](docs/map_variants.md) for full details:
+  - **Case 1** (`raw_hgvs_nt` with a transcript accession prefix, e.g. `NM_000277.3:c.1218G>A`): normalised through `dcd_mapping` and ClinGen; no target sequence needed
+  - **Case 2** (`raw_hgvs_nt` without an accession prefix, e.g. `c.1218G>A`): BLAT-aligned from `target_sequence`; all rows sharing the same `--group-by` value are aligned together
+  - **Case 3** (protein-only, `raw_hgvs_pro` with no `raw_hgvs_nt`): BLAT-aligned at the protein annotation layer
+- `--drop-columns target_sequence` removes the large sequence column from the output (recommended)
+- Use `--group-by gene_symbol` (or another stable column) instead of the default `target_sequence` when many rows share the same sequence — this avoids redundant BLAT alignments
+- Use `--max-clingen-concurrency 3` to reduce the chance of rate-limit errors from the ClinGen API for large inputs (default: 5)
+- Use `--skip N` to resume an interrupted run from row N
+- Use `--merge-existing prior_output.tsv` to reuse results from a previous partial run without re-processing matched rows
+- See [docs/map_variants.md](docs/map_variants.md) for all options, dependency setup, and troubleshooting
+- See [BLAT Error 137 Retry Strategy](#blat-error-137-retry-strategy) for handling memory issues
 
 ### Step 2: Reverse-Translate Protein Variants (Conditional)
 
