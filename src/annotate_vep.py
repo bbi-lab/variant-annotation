@@ -86,6 +86,35 @@ def _split_pipe_preserve_positions(value: str) -> list[str]:
     return [part.strip() for part in raw.split("|")]
 
 
+def load_vep_cache_file(path: str) -> tuple[dict[str, Optional[str]], dict[str, str]]:
+    """Load a pre-computed VEP cache TSV (columns: hgvs, vep.mutational_consequence,
+    vep.access_date, vep.error).
+
+    Returns ``(consequence_map, date_map)`` containing only rows where *vep.error* is
+    empty.  This is a temporary helper used to avoid re-querying the Ensembl API for
+    variants whose consequences are already known.
+    """
+    consequence_map: dict[str, Optional[str]] = {}
+    date_map: dict[str, str] = {}
+    cache_path = Path(path)
+    if not cache_path.exists():
+        logger.warning("VEP cache file not found: %s", path)
+        return consequence_map, date_map
+    with cache_path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        for row in reader:
+            hgvs = (row.get("hgvs") or "").strip()
+            error = (row.get("vep.error") or "").strip()
+            if not hgvs or error:
+                continue
+            consequence = (row.get("vep.mutational_consequence") or "").strip() or None
+            access_date = (row.get("vep.access_date") or "").strip()
+            consequence_map[hgvs] = consequence
+            date_map[hgvs] = access_date
+    logger.info("Loaded %d entries from VEP cache file: %s", len(consequence_map), cache_path)
+    return consequence_map, date_map
+
+
 def run_variant_recoder(
     hgvs_strings: list[str],
     *,
@@ -265,6 +294,7 @@ def annotate_row(
     col_prefix: str,
     hgvs_cols: list[str],
     access_date: str,
+    precomputed_dates: Optional[dict[str, str]] = None,
 ) -> dict[str, str]:
     consequence_col = f"{col_prefix}.mutational_consequence"
     access_col = f"{col_prefix}.access_date"
@@ -279,6 +309,13 @@ def annotate_row(
     candidates = _split_pipe_preserve_positions(_get_hgvs_for_row(row, hgvs_cols))
     if not candidates or all(c == "" for c in candidates):
         return out
+
+    # Use the pre-computed access date for the first candidate that has one.
+    if precomputed_dates:
+        for hgvs in candidates:
+            if hgvs and hgvs in precomputed_dates:
+                out[access_col] = precomputed_dates[hgvs]
+                break
 
     candidate_consequences: list[str] = []
     known_non_empty: list[str] = []
@@ -388,6 +425,17 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "were newly annotated."
         ),
     )
+    p.add_argument(
+        "--vep-cache-file",
+        default="",
+        metavar="FILE",
+        help=(
+            "(Temporary) Path to a pre-computed VEP cache TSV with columns "
+            "hgvs, vep.mutational_consequence, vep.access_date, vep.error. "
+            "Rows with a non-empty vep.error are ignored. Matching HGVS strings "
+            "use the cached values instead of querying the Ensembl API."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -433,6 +481,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     ]
 
     consequence_cache: dict[str, Optional[str]] = {}
+    precomputed_dates: dict[str, str] = {}
+    if args.vep_cache_file:
+        _precomputed_consequences, precomputed_dates = load_vep_cache_file(args.vep_cache_file)
+        consequence_cache.update(_precomputed_consequences)
     total_rows = 0
     kept_rows = 0
     newly_resolved_rows = 0
@@ -482,6 +534,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 vep_batch_size=args.vep_batch_size,
                 vep_workers=args.vep_workers,
                 keep_existing=args.keep_existing,
+                precomputed_dates=precomputed_dates,
             )
             total_rows += batch_total
             kept_rows += batch_kept
@@ -503,6 +556,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 vep_batch_size=args.vep_batch_size,
                 vep_workers=args.vep_workers,
                 keep_existing=args.keep_existing,
+                precomputed_dates=precomputed_dates,
             )
             total_rows += batch_total
             kept_rows += batch_kept
@@ -533,6 +587,7 @@ def _process_batch(
     vep_batch_size: int,
     vep_workers: int = 1,
     keep_existing: bool = False,
+    precomputed_dates: Optional[dict[str, str]] = None,
 ) -> tuple[int, int, int, int]:
     """Process a batch of rows.
 
@@ -575,6 +630,7 @@ def _process_batch(
             col_prefix=col_prefix,
             hgvs_cols=hgvs_cols,
             access_date=access_date,
+            precomputed_dates=precomputed_dates,
         )
         row.update(ann)
         writer.writerow(row)
