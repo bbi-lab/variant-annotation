@@ -1,8 +1,9 @@
 """Annotate variants with VEP mutational consequences.
 
 This script annotates each input row with a single mutational consequence derived
-from one or more pipe-delimited genomic HGVS candidates (default column:
-``mapped_hgvs_g``).
+from one or more pipe-delimited HGVS candidates.  By default the columns
+``mapped_hgvs_c``, ``mapped_hgvs_g``, and ``mapped_hgvs_p`` are tried in that
+order; the first non-blank value in a row is used (see ``--hgvs-cols``).
 
 For rows with multiple DNA candidates, each candidate is checked independently.
 If all resolved candidate consequences agree (treating unresolved candidates as
@@ -13,13 +14,46 @@ If resolved candidates disagree, ``vep.mutational_consequence`` is left blank an
 ``vep.error`` records the discrepancy including a pipe-delimited consequence list
 aligned to the input candidate positions.
 
+Transcript selection
+--------------------
+Ensembl VEP annotates every transcript that overlaps the genomic position of a
+variant, not just the transcript referenced in the input HGVS string.  The
+top-level ``most_severe_consequence`` field therefore reflects the worst outcome
+across **all** overlapping transcripts, which may differ from the consequence on
+the transcript of interest.
+
+This script addresses that by selecting the consequence from the specific input
+transcript when possible:
+
+- **RefSeq transcripts** (``NM_``, ``NR_``): the request is sent with
+  ``refseq=1``, which makes VEP populate ``transcript_consequences`` with RefSeq
+  transcript IDs.  The entry whose ``transcript_id`` matches the accession in the
+  input HGVS string (version-stripped) is selected.  If no match is found, the
+  script falls back to ``most_severe_consequence``.
+- **Ensembl transcripts** (``ENST``): the default VEP transcript set is used;
+  the matching ``ENST`` accession is looked up in ``transcript_consequences``
+  directly.
+- **Genomic HGVS** (``NC_``, ``chr:g.``) and protein HGVS (``NP_``): no
+  specific transcript can be identified, so ``most_severe_consequence`` is used.
+
+The output column ``vep.consequence_source`` records which path was taken:
+``"transcript"`` for a matched transcript entry, ``"most_severe"`` for the
+global fallback.
+
+Column priority and transcript specificity
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Because transcript HGVS strings (``mapped_hgvs_c``) yield more specific
+consequences than genomic HGVS strings (``mapped_hgvs_g``), ``mapped_hgvs_c``
+should appear first in ``--hgvs-cols``.  The default ordering
+``mapped_hgvs_c,mapped_hgvs_g,mapped_hgvs_p`` reflects this preference.
+
 Redis caching
 -------------
-When a Redis instance is reachable, each HGVS → consequence mapping is cached to
-avoid redundant Ensembl API calls across runs.  Hits are stored for 100 days;
-misses (no consequence returned by VEP) are stored for 7 days.  Caching is
-transparent and fails gracefully: if Redis is unreachable the script continues
-without it.
+When a Redis instance is reachable, each HGVS → (consequence, source) mapping is
+cached to avoid redundant Ensembl API calls across runs.  Hits are stored for 1
+day by default; misses (no consequence returned by VEP) are stored for 1 day.
+Caching is transparent and fails gracefully: if Redis is unreachable the script
+continues without it.
 
 Relevant environment variables:
 
@@ -29,12 +63,12 @@ Relevant environment variables:
     Redis connection URL (default: ``redis://redis:6379/0``; also falls back to
     the generic ``REDIS_URL`` variable).
 ``VEP_CACHE_PREFIX``
-    Key namespace prefix (default: ``vep:v1``).  Bump the version suffix to
+    Key namespace prefix (default: ``vep:v2``).  Bump the version suffix to
     invalidate all cached entries after a significant Ensembl / VEP release.
 ``VEP_CACHE_TTL_SECONDS``
-    TTL for cached hits, in seconds (default: 8 640 000 — 100 days).
+    TTL for cached hits, in seconds (default: 86 400 — 1 day).
 ``VEP_CACHE_MISS_TTL_SECONDS``
-    TTL for cached misses, in seconds (default: 604 800 — 7 days).
+    TTL for cached misses, in seconds (default: 86 400 — 1 day).
 """
 
 from __future__ import annotations
@@ -50,6 +84,7 @@ from pathlib import Path
 import sys
 from typing import Any, Optional, TextIO
 
+import json
 import requests  # type: ignore[import-untyped]
 
 logger = logging.getLogger(__name__)
@@ -207,12 +242,13 @@ def _vep_get_redis_client(*, force: bool = False):
         return None
 
 
-def _vep_cache_get_many(hgvs_list: list[str]) -> dict[str, Optional[str]]:
+def _vep_cache_get_many(hgvs_list: list[str]) -> dict[str, tuple[Optional[str], str]]:
     """Batch-fetch VEP consequences from Redis.
 
     Returns a dict containing only the HGVS strings that were found in the
-    cache.  A ``None`` value means VEP was previously queried but returned no
-    consequence (a stored miss), as distinct from a cache miss.
+    cache.  Each value is a ``(consequence, source)`` tuple.  A ``None``
+    consequence means VEP was previously queried but returned no result (a
+    stored miss), as distinct from a cache miss.
     """
     client = _vep_get_redis_client()
     if client is None or not hgvs_list:
@@ -222,28 +258,43 @@ def _vep_cache_get_many(hgvs_list: list[str]) -> dict[str, Optional[str]]:
         values = client.mget(keys)
     except Exception:
         return {}
-    result: dict[str, Optional[str]] = {}
+    result: dict[str, tuple[Optional[str], str]] = {}
     for hgvs, value in zip(hgvs_list, values):
-        if value is not None:
-            result[hgvs] = None if value == _VEP_MISS_SENTINEL else value
+        if value is None:
+            continue
+        if value == _VEP_MISS_SENTINEL:
+            result[hgvs] = (None, "most_severe")
+        else:
+            try:
+                parsed = json.loads(value)
+                result[hgvs] = (parsed.get("c"), parsed.get("s", "most_severe"))
+            except (json.JSONDecodeError, AttributeError):
+                # Legacy plain-string entry from vep:v1 cache.
+                result[hgvs] = (value, "most_severe")
     return result
 
 
-def _vep_cache_set_many(results: dict[str, Optional[str]]) -> None:
-    """Store a batch of HGVS → consequence mappings in Redis.
+def _vep_cache_set_many(results: dict[str, tuple[Optional[str], str]]) -> None:
+    """Store a batch of HGVS → (consequence, source) mappings in Redis.
 
     ``None`` consequences (VEP returned nothing) are stored under a sentinel
     value so that repeated no-hit queries are also short-circuited.
+
+    Entries with ``source == "api_error"`` are skipped entirely — they result
+    from a failed HTTP request rather than a definitive VEP response, and must
+    not be cached so that subsequent runs can retry them.
     """
     client = _vep_get_redis_client()
     if client is None or not results:
         return
     try:
         pipe = client.pipeline(transaction=False)
-        for hgvs, consequence in results.items():
+        for hgvs, (consequence, source) in results.items():
+            if source == "api_error":
+                continue
             key = _vep_cache_key(hgvs)
             if consequence is not None:
-                pipe.set(key, consequence, ex=_vep_cache_ttl())
+                pipe.set(key, json.dumps({"c": consequence, "s": source}), ex=_vep_cache_ttl())
             else:
                 pipe.set(key, _VEP_MISS_SENTINEL, ex=_vep_cache_miss_ttl())
         pipe.execute()
@@ -254,15 +305,16 @@ def _vep_cache_set_many(results: dict[str, Optional[str]]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def load_vep_cache_file(path: str) -> tuple[dict[str, Optional[str]], dict[str, str]]:
+def load_vep_cache_file(path: str) -> tuple[dict[str, tuple[Optional[str], str]], dict[str, str]]:
     """Load a pre-computed VEP cache TSV (columns: hgvs, vep.mutational_consequence,
     vep.access_date, vep.error).
 
     Returns ``(consequence_map, date_map)`` containing only rows where *vep.error* is
     empty.  This is a temporary helper used to avoid re-querying the Ensembl API for
-    variants whose consequences are already known.
+    variants whose consequences are already known.  Loaded entries are tagged with
+    source ``"most_severe"`` since the original source is not stored in the flat file.
     """
-    consequence_map: dict[str, Optional[str]] = {}
+    consequence_map: dict[str, tuple[Optional[str], str]] = {}
     date_map: dict[str, str] = {}
     cache_path = Path(path)
     if not cache_path.exists():
@@ -277,7 +329,7 @@ def load_vep_cache_file(path: str) -> tuple[dict[str, Optional[str]], dict[str, 
                 continue
             consequence = (row.get("vep.mutational_consequence") or "").strip() or None
             access_date = (row.get("vep.access_date") or "").strip()
-            consequence_map[hgvs] = consequence
+            consequence_map[hgvs] = (consequence, "most_severe")
             date_map[hgvs] = access_date
     logger.info("Loaded %d entries from VEP cache file: %s", len(consequence_map), cache_path)
     return consequence_map, date_map
@@ -288,7 +340,13 @@ def run_variant_recoder(
     *,
     api_url: str,
     timeout_seconds: int,
-) -> dict[str, list[str]]:
+) -> Optional[dict[str, list[str]]]:
+    """Return a mapping of input HGVS to recoded genomic HGVS strings.
+
+    Returns ``None`` when the HTTP request itself fails (network error, timeout,
+    non-200 status), as distinct from a successful response that contains no
+    recoded variants (which returns ``{}``).
+    """
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     out: dict[str, list[str]] = {}
     try:
@@ -300,11 +358,11 @@ def run_variant_recoder(
         )
     except requests.RequestException as exc:
         logger.error("Variant Recoder request failed: %s", exc)
-        return out
+        return None
 
     if response.status_code != 200:
         logger.error("Variant Recoder request failed: %s %s", response.status_code, response.text)
-        return out
+        return None
 
     data = response.json()
     for entry in data:
@@ -324,19 +382,53 @@ def run_variant_recoder(
     return out
 
 
+def _is_refseq_transcript_hgvs(hgvs: str) -> bool:
+    """Return True if the HGVS string refers to a RefSeq transcript (NM_ or NR_)."""
+    return hgvs.startswith(("NM_", "NR_"))
+
+
+def _extract_transcript_accession(hgvs: str) -> Optional[str]:
+    """Return the versionless transcript accession from a transcript HGVS string.
+
+    ``'NM_000049.4:c.256_257delinsAA'`` → ``'NM_000049'``
+    ``'ENST00000366667.8:c.803C>T'``    → ``'ENST00000366667'``
+    ``'9:g.22125504G>C'``               → ``None`` (genomic, no transcript)
+    """
+    if ":" not in hgvs:
+        return None
+    prefix = hgvs.split(":")[0]
+    if "." in prefix:
+        prefix = prefix.rsplit(".", 1)[0]
+    if prefix.startswith(("NM_", "NR_", "ENST", "LRG_")):
+        return prefix
+    return None
+
+
+def _pick_most_severe_from_terms(terms: list[str]) -> Optional[str]:
+    """Return the most severe consequence term from a list, using VEP_CONSEQUENCES order."""
+    for severity in VEP_CONSEQUENCES:
+        if severity in terms:
+            return severity
+    return terms[0] if terms else None
+
+
 def _vep_lookup_batch(
     hgvs_strings: list[str],
     *,
     api_url: str,
     timeout_seconds: int,
-) -> dict[str, Optional[str]]:
+    refseq: bool = False,
+) -> dict[str, tuple[Optional[str], str]]:
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    out: dict[str, Optional[str]] = {}
+    out: dict[str, tuple[Optional[str], str]] = {}
+    body: dict[str, Any] = {"hgvs_notations": hgvs_strings}
+    if refseq:
+        body["refseq"] = 1
     try:
         response = requests.post(
             f"{api_url}/vep/human/hgvs",
             headers=headers,
-            json={"hgvs_notations": hgvs_strings},
+            json=body,
             timeout=timeout_seconds,
         )
     except requests.RequestException as exc:
@@ -351,7 +443,19 @@ def _vep_lookup_batch(
         hgvs = entry.get("input")
         if not hgvs:
             continue
-        out[hgvs] = entry.get("most_severe_consequence")
+        transcript_accession = _extract_transcript_accession(hgvs)
+        transcript_consequences = entry.get("transcript_consequences") or []
+        matched = False
+        if transcript_accession and transcript_consequences:
+            for tc in transcript_consequences:
+                tc_id = (tc.get("transcript_id") or "").split(".")[0]
+                if tc_id == transcript_accession:
+                    terms = tc.get("consequence_terms") or []
+                    out[hgvs] = (_pick_most_severe_from_terms(terms), "transcript")
+                    matched = True
+                    break
+        if not matched:
+            out[hgvs] = (entry.get("most_severe_consequence"), "most_severe")
     return out
 
 
@@ -362,14 +466,30 @@ def _run_batches_concurrent(
     timeout_seconds: int,
     batch_size: int,
     max_workers: int,
-) -> dict[str, Optional[str]]:
-    """Submit all VEP batches concurrently and merge results."""
-    batches = [hgvs_list[i : i + batch_size] for i in range(0, len(hgvs_list), batch_size)]
-    result: dict[str, Optional[str]] = {}
+) -> dict[str, tuple[Optional[str], str]]:
+    """Submit all VEP batches concurrently and merge results.
+
+    RefSeq transcript HGVS strings (NM_/NR_) are sent with ``refseq=1`` so that
+    ``transcript_consequences`` entries use RefSeq IDs and can be matched back to
+    the input accession.  Ensembl transcript and genomic HGVS strings are sent
+    without it.
+    """
+    refseq_hgvs = [h for h in hgvs_list if _is_refseq_transcript_hgvs(h)]
+    other_hgvs = [h for h in hgvs_list if not _is_refseq_transcript_hgvs(h)]
+    batches: list[tuple[list[str], bool]] = []
+    for i in range(0, len(refseq_hgvs), batch_size):
+        batches.append((refseq_hgvs[i : i + batch_size], True))
+    for i in range(0, len(other_hgvs), batch_size):
+        batches.append((other_hgvs[i : i + batch_size], False))
+    if not batches:
+        return {}
+    result: dict[str, tuple[Optional[str], str]] = {}
     with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as pool:
         futures = {
-            pool.submit(_vep_lookup_batch, batch, api_url=api_url, timeout_seconds=timeout_seconds): batch
-            for batch in batches
+            pool.submit(
+                _vep_lookup_batch, batch, api_url=api_url, timeout_seconds=timeout_seconds, refseq=refseq
+            ): batch
+            for batch, refseq in batches
         }
         for fut in as_completed(futures):
             result.update(fut.result())
@@ -383,8 +503,12 @@ def get_functional_consequence(
     timeout_seconds: int,
     batch_size: int,
     max_workers: int = 1,
-) -> dict[str, Optional[str]]:
-    """Return HGVS -> most severe VEP consequence with recoder fallback.
+) -> dict[str, tuple[Optional[str], str]]:
+    """Return HGVS -> (consequence, source) with recoder fallback.
+
+    ``source`` is ``"transcript"`` when the consequence was taken from the
+    matching transcript entry in ``transcript_consequences``, or
+    ``"most_severe"`` when the top-level ``most_severe_consequence`` was used.
 
     Mirrors MaveDB worker behavior:
     1) VEP lookup for input HGVS (batches run concurrently when max_workers > 1)
@@ -392,7 +516,7 @@ def get_functional_consequence(
     3) VEP lookup for recoded genomic HGVS (also concurrent)
     4) Choose the most severe consequence by fixed priority order
     """
-    result: dict[str, Optional[str]] = {}
+    result: dict[str, tuple[Optional[str], str]] = {}
     if not hgvs_strings:
         return result
 
@@ -414,15 +538,24 @@ def get_functional_consequence(
         return result
 
     recoded = run_variant_recoder(missing_hgvs, api_url=api_url, timeout_seconds=timeout_seconds)
+    if recoded is None:
+        # The Recoder request itself failed (network error, timeout, non-200 response).
+        # Mark all missing HGVS as api_error so they are not cached and will be retried
+        # on the next run.
+        for missing in missing_hgvs:
+            result[missing] = (None, "api_error")
+        return result
+
     for missing in missing_hgvs:
         if missing not in recoded:
-            result[missing] = None
+            # Recoder succeeded but found no genomic equivalent — genuine miss.
+            result[missing] = (None, "most_severe")
 
     all_recoded_hgvs: list[str] = []
     for input_hgvs in missing_hgvs:
         all_recoded_hgvs.extend(recoded.get(input_hgvs, []))
 
-    recoded_results: dict[str, Optional[str]] = {}
+    recoded_results: dict[str, tuple[Optional[str], str]] = {}
     if all_recoded_hgvs:
         recoded_results.update(
             _run_batches_concurrent(
@@ -435,13 +568,15 @@ def get_functional_consequence(
         )
 
     for input_hgvs, recoded_hgvs_list in recoded.items():
-        consequences = [recoded_results.get(recoded_hgvs) for recoded_hgvs in recoded_hgvs_list]
-        chosen: Optional[str] = None
-        for consequence in VEP_CONSEQUENCES:
-            if consequence in consequences:
-                chosen = consequence
-                break
-        result[input_hgvs] = chosen
+        found = {rh: recoded_results[rh] for rh in recoded_hgvs_list if rh in recoded_results}
+        if not found and recoded_hgvs_list:
+            # The second VEP batch returned nothing for all recoded genomic HGVS —
+            # most likely a batch-level API error.  Don't cache.
+            result[input_hgvs] = (None, "api_error")
+        else:
+            consequences = [cons for cons, _src in found.values()]
+            chosen = _pick_most_severe_from_terms([c for c in consequences if c])
+            result[input_hgvs] = (chosen, "most_severe")
 
     return result
 
@@ -457,7 +592,7 @@ def _get_hgvs_for_row(row: dict[str, str], hgvs_cols: list[str]) -> str:
 
 def annotate_row(
     row: dict[str, str],
-    consequence_cache: dict[str, Optional[str]],
+    consequence_cache: dict[str, tuple[Optional[str], str]],
     *,
     col_prefix: str,
     hgvs_cols: list[str],
@@ -466,11 +601,13 @@ def annotate_row(
 ) -> dict[str, str]:
     consequence_col = f"{col_prefix}.mutational_consequence"
     access_col = f"{col_prefix}.access_date"
+    source_col = f"{col_prefix}.consequence_source"
     error_col = f"{col_prefix}.error"
 
     out = {
         consequence_col: "",
         access_col: access_date,
+        source_col: "",
         error_col: "",
     }
 
@@ -486,14 +623,23 @@ def annotate_row(
                 break
 
     candidate_consequences: list[str] = []
+    candidate_sources: list[str] = []
     known_non_empty: list[str] = []
     for hgvs in candidates:
         if not hgvs:
             candidate_consequences.append("")
+            candidate_sources.append("")
             continue
-        consequence = consequence_cache.get(hgvs)
-        value = "" if not consequence else str(consequence)
+        cached = consequence_cache.get(hgvs)
+        if cached is None:
+            value, source = "", ""
+        else:
+            consequence, source = cached
+            value = "" if not consequence else str(consequence)
+            if not value:
+                source = ""
         candidate_consequences.append(value)
+        candidate_sources.append(source)
         if value:
             known_non_empty.append(value)
 
@@ -509,6 +655,10 @@ def annotate_row(
 
     if len(unique_known) == 1:
         out[consequence_col] = next(iter(unique_known))
+        for src in candidate_sources:
+            if src:
+                out[source_col] = src
+                break
         return out
 
     # No resolved consequence for any candidate.
@@ -535,6 +685,12 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help=(
             "Comma-separated list of columns to try for HGVS input, in priority order. "
             "The first non-blank value found is used for each row. "
+            "Column order matters for transcript specificity: when a transcript HGVS "
+            "(e.g. NM_000049.4:c.256_257delinsAA from mapped_hgvs_c) is used, the "
+            "script queries VEP with refseq=1 and selects the consequence for the "
+            "specific input transcript (source=transcript). When a genomic HGVS "
+            "(mapped_hgvs_g) is used instead, VEP returns the most severe consequence "
+            "across all overlapping transcripts (source=most_severe). "
             "(default: mapped_hgvs_c,mapped_hgvs_g,mapped_hgvs_p)"
         ),
     )
@@ -645,10 +801,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     ann_cols = [
         f"{prefix}.mutational_consequence",
         f"{prefix}.access_date",
+        f"{prefix}.consequence_source",
         f"{prefix}.error",
     ]
 
-    consequence_cache: dict[str, Optional[str]] = {}
+    consequence_cache: dict[str, tuple[Optional[str], str]] = {}
     precomputed_dates: dict[str, str] = {}
     if args.vep_cache_file:
         _precomputed_consequences, precomputed_dates = load_vep_cache_file(args.vep_cache_file)
@@ -745,7 +902,7 @@ def _process_batch(
     rows: list[dict[str, str]],
     writer: csv.DictWriter,
     out_fh: TextIO,
-    consequence_cache: dict[str, Optional[str]],
+    consequence_cache: dict[str, tuple[Optional[str], str]],
     *,
     hgvs_cols: list[str],
     col_prefix: str,
