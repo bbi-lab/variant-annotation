@@ -162,3 +162,25 @@ Key differences:
 ### Why transcript specificity matters
 
 When a gene has many overlapping transcripts at a locus, `most_severe_consequence` may reflect a consequence on a minor isoform rather than the canonical transcript of interest. For example, a variant in a coding exon of the canonical transcript may be annotated as `missense_variant` on that transcript but `intron_variant` on a longer overlapping non-coding transcript — and vice versa. Using `most_severe_consequence` would pick whichever is most severe globally, which may not be the biologically relevant consequence for the experiment's transcript. This pipeline preferentially selects the consequence on the specific transcript named in the input HGVS (`mapped_hgvs_c`).
+
+---
+
+## `annotate_mavedb` (step 10)
+
+**MaveDB:** stores all calibrations for a score set and exposes all of them (primary, investigator-provided, research-use-only, alternatives) through the API and UI. The MaveDB worker applies calibrations at ingest time using whichever calibrations are associated with a score set.
+
+**This pipeline:** `annotate_mavedb` selects specifically the **primary** calibration and the **investigator-provided** calibration, annotating each variant with the functional classification label under those two calibrations only.
+
+Key differences:
+
+| | MaveDB | This pipeline |
+|---|---|---|
+| Calibrations applied | All associated calibrations | Primary + investigator-provided only |
+| Additional calibrations (alternative thresholds, RUO) | Exposed in the UI and stored | Fetched but not applied |
+| When primary = investigator-provided | One result | Both column groups populated with the same values |
+| Calibration type support | Range-based and class-based | Range-based (local score comparison) and class-based (API variant-to-class lookup) |
+| Caching | Persisted in the MaveDB database | In-memory per run only; no on-disk cache |
+
+### Calibration selection rationale
+
+The primary calibration is the one the MaveDB curators have designated as the recommended interpretation threshold. The investigator-provided calibration reflects the thresholds determined by the original study authors. Exposing both independently allows downstream users to compare the curator-recommended and author-recommended classifications, which sometimes differ. Research-use-only and alternative calibrations are omitted because they are not intended for clinical or variant-interpretation use.
