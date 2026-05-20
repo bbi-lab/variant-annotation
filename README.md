@@ -234,11 +234,11 @@ src/scripts/run_map_variants.sh input.tsv output.tsv \
 
 ### Step 2: Reverse-Translate Protein Variants (Conditional)
 
-**Purpose:** For protein-only variants mapped in step 1, reverse-translate them into multiple DNA (c./g.) candidates. This is essential when the same protein change can result from multiple DNA changes.
+**Purpose:** For protein-only variants mapped in step 1, reverse-translate them into every DNA (c./g.) codon substitution that produces the observed amino acid change. A single protein change can arise from two or three synonymous codons; this step enumerates all of them so downstream annotation (ClinVar, gnomAD, VEP) has a DNA variant to query.
 
 **Input columns:** `mapped_hgvs_p` (non-empty), `mapped_hgvs_c` and `mapped_hgvs_g` (must be empty/blank for this step to apply)
 
-**Output columns:** Updates `mapped_hgvs_c` and `mapped_hgvs_g` with pipe-delimited candidates (e.g., `c.1218G>A|c.1221G>A`)
+**Output columns:** Updates `mapped_hgvs_c` and `mapped_hgvs_g` with pipe-delimited candidates (e.g., `NM_000277.3:c.1216G>A|NM_000277.3:c.1217C>A`). Also adds `assayed_variant_level`, `reverse_translation_error`, `reverse_translation_warnings`, and parsed position/allele columns for each candidate (`mapped_hgvs_c_start`, `mapped_hgvs_g_ref`, etc.)
 
 **Command:**
 ```bash
@@ -246,10 +246,13 @@ src/scripts/run_reverse_translate_protein_variants.sh output.tsv output_rt.tsv
 ```
 
 **Notes:**
-- Only processes rows where `mapped_hgvs_p` is present but `mapped_hgvs_c` and `mapped_hgvs_g` are empty
-- Output candidates are pipe-delimited: `CA1||CA3` preserves position alignment (empty slots for unresolved candidates)
-- DNA variants from step 1 pass through unchanged
-- Queries transcript databases (UTA) to find all possible DNA backtranslations
+- Only processes rows where `mapped_hgvs_p` is non-empty and both `mapped_hgvs_c` and `mapped_hgvs_g` are blank
+- Pipe-delimited candidates are position-aligned across all output columns: an empty slot (e.g. `NM_...:c.1216G>A||NM_...:c.1218G>A`) means the middle candidate could not be resolved
+- DNA variants from step 1 pass through unchanged; their parsed position columns are also populated
+- Requires the `reverse-translate-variants` CLI (installed in the Docker image) and UTA database access
+- Use `--transcript-fallback-column raw_hgvs_nt` if the protein HGVS string lacks a transcript accession prefix
+- Use `--include-indels` to also generate small insertion/deletion candidates (off by default)
+- See [docs/reverse_translate_protein_variants.md](docs/reverse_translate_protein_variants.md) for all options, transcript resolution logic, and troubleshooting
 
 ### Step 3: Add DNA-Level ClinGen Allele IDs (Required for annotation)
 

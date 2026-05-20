@@ -72,3 +72,23 @@ This is the most significant semantic difference.
 **MaveDB:** Jobs are retried automatically by ARQ up to `job.max_retries` times on failure.
 
 **This pipeline:** Supports `--skip N` to resume from a specific row, and `--merge-existing prior.tsv` to reuse results from a partial prior run without reprocessing matched rows.
+
+---
+
+## reverse_translate_protein_variants
+
+**MaveDB equivalent:** None — MaveDB does not perform reverse translation.
+
+MaveDB relates DNA and protein variants through the ClinGen Allele Registry: `populate_hgvs_for_score_set` retrieves `hgvs_c` and `hgvs_p` for a variant by querying ClinGen with the stored `clingen_allele_id`. This means protein-level HGVS (`hgvs_p`) is derived from whatever ClinGen returns for a DNA allele ID, not by enumerating synonymous codons.
+
+**Scope limitation of the MaveDB approach:** ClinGen's coverage is concentrated on SNVs and alleles that have been explicitly submitted by submitters or imported from curated databases (ClinVar, dbSNP, LOVD, etc.). Variants that have never been submitted — especially rare or novel missense changes — often have no ClinGen record at all. For these variants `populate_hgvs_for_score_set` simply skips the row (no `hgvs_p` is populated). There is no mechanism to recover DNA candidates for a protein variant that lacks a pre-existing ClinGen allele.
+
+**This pipeline:** `reverse_translate_protein_variants` performs an exhaustive reverse translation using the `reverse-translate-variants` CLI. For a given `(transcript, p.AminoChange)` pair it enumerates every synonymous codon in the genetic code and emits a pipe-delimited list of `hgvs_c` / `hgvs_g` candidates. This works regardless of whether the variant has ever been submitted to ClinGen. The resulting candidates are then queried against ClinGen in step 3 (`add_dna_clingen_allele_ids`) — but even candidates that have no ClinGen record still appear in the output with an empty allele-ID slot, preserving them for downstream annotation steps that don't require a ClinGen ID (e.g. VEP, gnomAD lookups by position).
+
+| | MaveDB | This pipeline |
+|---|---|---|
+| How protein ↔ DNA link is made | Via stored ClinGen allele ID | Exhaustive codon-level reverse translation |
+| Coverage | Only variants with a ClinGen record | All theoretically possible DNA changes for the amino acid substitution |
+| Indels | Not generated; depends on what was submitted to ClinGen | Optional via `--include-indels --max-indel-size N` |
+| Novel / unsubmitted variants | Skipped | Handled (candidates produced, ClinGen lookup attempted separately) |
+| Output cardinality | One `hgvs_c` / `hgvs_p` per variant | One or more pipe-delimited candidates per protein row |
