@@ -256,11 +256,11 @@ src/scripts/run_reverse_translate_protein_variants.sh output.tsv output_rt.tsv
 
 ### Step 3: Add DNA-Level ClinGen Allele IDs (Required for annotation)
 
-**Purpose:** Resolve DNA-level ClinGen allele IDs for each reverse-translated candidate. For protein variants with multiple candidates, produces one ID per candidate. For DNA variants, reuses the existing ID from step 1.
+**Purpose:** Resolve a DNA-level ClinGen Allele Registry (CAR) identifier for every variant. For protein-origin rows with multiple reverse-translated candidates, each candidate gets its own ID. The resulting `dna_clingen_allele_id` column is the primary key for all downstream annotation steps.
 
-**Input columns:** `mapped_hgvs_c`, `mapped_hgvs_g`, `clingen_allele_id` (from step 1)
+**Input columns:** `mapped_hgvs_c`, `mapped_hgvs_g`, `clingen_allele_id` (from step 1), `raw_hgvs_nt`, `raw_hgvs_pro`
 
-**Output columns:** `dna_clingen_allele_id` (pipe-delimited to match candidates)
+**Output columns:** `dna_clingen_allele_id` (pipe-delimited, aligned to `mapped_hgvs_c`/`_g` candidates)
 
 **Command:**
 ```bash
@@ -268,11 +268,12 @@ src/scripts/run_add_dna_clingen_allele_ids.sh output_rt.tsv output_clingen.tsv
 ```
 
 **Notes:**
-- For **DNA rows** (where `raw_hgvs_nt` is present): reuses existing `clingen_allele_id` if single candidate
-- For **protein-only rows** (where `raw_hgvs_pro` is present): queries ClinGen for each candidate independently
-- Falls back to g. (genomic) HGVS if c. (transcript) HGVS lookup fails
-- Output is pipe-delimited to maintain alignment with reverse-translated candidates: `CA101||CA102` means 3 candidates, 2nd has no match
-- This column becomes the primary key for downstream annotation steps
+- **DNA rows** (`raw_hgvs_nt` non-blank): if `clingen_allele_id` already holds a `CA`-prefixed ID and the row has a single candidate, it is reused without a network request
+- **Protein-origin rows**: ClinGen is queried for each reverse-translated candidate independently using the c. HGVS first, falling back to g.
+- Empty slots preserve cardinality: `CA101||CA103` means 3 candidates, the middle one had no ClinGen match
+- ClinGen misses (404 or no allele ID) are cached in Redis as sentinels so repeated runs skip them without another HTTP request
+- Use `--known-misses-file` to pre-load a list of HGVS strings known to have no ClinGen record, bypassing even the Redis lookup
+- See [docs/add_dna_clingen_allele_ids.md](docs/add_dna_clingen_allele_ids.md) for the full lookup strategy, caching details, and how to generate a known-misses file
 
 ### Step 4: Add Parsed Position/Allele Columns (Optional)
 
