@@ -198,16 +198,22 @@ Input variants
     ↓
 [7] annotate_spliceai (optional) ──→ SpliceAI delta scores
     ↓
-[8] annotate_vep (optional) ──→ VEP mutational consequence
-  ↓
-[9] flatten_dna_variants (optional) ──→ flattened DNA-only variants
+[8] annotate_erepo (optional) ──→ expert-panel classifications
+    ↓
+[9] annotate_vep (optional) ──→ VEP mutational consequence
+    ↓
+[10] flatten_dna_variants (optional) ──→ flattened DNA-only variants
     ↓
 Output: one row per DNA variant (or fully annotated variants)
 ```
 
+For a detailed comparison with MaveDB's annotation workflow, see [docs/differences_from_mavedb.md](docs/differences_from_mavedb.md).
+
 ### Step 1: Map Variants (Required)
 
 **Purpose:** Normalize input variants (nucleotide or protein HGVS) to human-genome reference HGVS strings on GRCh38 and populate ClinGen Allele Registry metadata.
+
+See [docs/map_variants.md](docs/map_variants.md) for full reference documentation including all three input cases, CLI options, and troubleshooting.
 
 **Input columns:** `raw_hgvs_nt` (nucleotide HGVS), `raw_hgvs_pro` (protein HGVS), `target_sequence` (required for sequence-based and protein-only rows)
 
@@ -236,6 +242,8 @@ src/scripts/run_map_variants.sh input.tsv output.tsv \
 
 **Purpose:** For protein-only variants mapped in step 1, reverse-translate them into every DNA (c./g.) codon substitution that produces the observed amino acid change. A single protein change can arise from two or three synonymous codons; this step enumerates all of them so downstream annotation (ClinVar, gnomAD, VEP) has a DNA variant to query.
 
+See [docs/reverse_translate_protein_variants.md](docs/reverse_translate_protein_variants.md) for full reference documentation including transcript resolution order, batching strategy, and troubleshooting.
+
 **Input columns:** `mapped_hgvs_p` (non-empty), `mapped_hgvs_c` and `mapped_hgvs_g` (must be empty/blank for this step to apply)
 
 **Output columns:** Updates `mapped_hgvs_c` and `mapped_hgvs_g` with pipe-delimited candidates (e.g., `NM_000277.3:c.1216G>A|NM_000277.3:c.1217C>A`). Also adds `assayed_variant_level`, `reverse_translation_error`, `reverse_translation_warnings`, and parsed position/allele columns for each candidate (`mapped_hgvs_c_start`, `mapped_hgvs_g_ref`, etc.)
@@ -258,6 +266,8 @@ src/scripts/run_reverse_translate_protein_variants.sh output.tsv output_rt.tsv
 
 **Purpose:** Resolve a DNA-level ClinGen Allele Registry (CAR) identifier for every variant. For protein-origin rows with multiple reverse-translated candidates, each candidate gets its own ID. The resulting `dna_clingen_allele_id` column is the primary key for all downstream annotation steps.
 
+See [docs/add_dna_clingen_allele_ids.md](docs/add_dna_clingen_allele_ids.md) for full reference documentation including the lookup strategy, caching details, and known-misses file generation.
+
 **Input columns:** `mapped_hgvs_c`, `mapped_hgvs_g`, `clingen_allele_id` (from step 1), `raw_hgvs_nt`, `raw_hgvs_pro`
 
 **Output columns:** `dna_clingen_allele_id` (pipe-delimited, aligned to `mapped_hgvs_c`/`_g` candidates)
@@ -279,6 +289,8 @@ src/scripts/run_add_dna_clingen_allele_ids.sh output_rt.tsv output_clingen.tsv
 
 **Purpose:** Decompose the three mapped HGVS columns into VCF-style fields — chromosome/transcript accession, start, stop, reference allele, and alternate allele — for easier filtering, joining to other datasets, and variant comparison. Deletions and insertions follow the VCF left-anchor convention.
 
+See [docs/add_vcf_identifiers.md](docs/add_vcf_identifiers.md) for full reference documentation including HGVS parsing rules, VCF anchor convention, and all column definitions.
+
 **Input columns:** `mapped_hgvs_g`, `mapped_hgvs_c`, `mapped_hgvs_p`
 
 **Output columns:** For each of the three HGVS columns: `<col>_chromosome` (or `<col>_transcript` for c.), `<col>_start`, `<col>_stop`, `<col>_ref`, `<col>_alt`. For g. and c. columns these are pipe-delimited when the input is pipe-delimited (matching the candidate cardinality from step 2). Also adds `touches_intronic_region` and `spans_intron` row-level boolean flags (single `"true"`/`"false"` per row, based on whether any c. candidate is intronic).
@@ -298,6 +310,8 @@ src/scripts/run_add_vcf_identifiers.sh output_clingen.tsv output_parsed.tsv
 ### Step 5: Annotate with ClinVar Data (Optional)
 
 **Purpose:** Look up clinical significance, review status, and star ratings from ClinVar. Resolves each `dna_clingen_allele_id` to a ClinVar Allele ID via the ClinGen API, then looks up that ID in the cached monthly ClinVar variant-summary TSV from NCBI.
+
+See [docs/annotate_clinvar.md](docs/annotate_clinvar.md) for full reference documentation including star-rating table, ClinGen→ClinVar ID resolution, and caching details.
 
 **Input columns:** `dna_clingen_allele_id` (from step 3)
 
