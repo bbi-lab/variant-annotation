@@ -276,11 +276,11 @@ src/scripts/run_add_dna_clingen_allele_ids.sh output_rt.tsv output_clingen.tsv
 
 ### Step 4: Add Parsed Position/Allele Columns (Optional)
 
-**Purpose:** Parse HGVS strings into component fields (position, reference allele, alternate allele) for easier analysis and filtering.
+**Purpose:** Decompose the three mapped HGVS columns into VCF-style fields — chromosome/transcript accession, start, stop, reference allele, and alternate allele — for easier filtering, joining to other datasets, and variant comparison. Deletions and insertions follow the VCF left-anchor convention.
 
 **Input columns:** `mapped_hgvs_g`, `mapped_hgvs_c`, `mapped_hgvs_p`
 
-**Output columns:** For each HGVS column (g./c./p.), `<column>_start`, `<column>_stop`, `<column>_ref`, `<column>_alt`. The columns derived from the HGVS g. and c. columns are pipe-delimited (to handle multiple reverse translations of protein variants), but those derived from the HGVS p. column are not. Also adds pipe-delimited `touches_intronic_region` and `spans_intron` (both boolean flags as strings)
+**Output columns:** For each of the three HGVS columns: `<col>_chromosome` (or `<col>_transcript` for c.), `<col>_start`, `<col>_stop`, `<col>_ref`, `<col>_alt`. For g. and c. columns these are pipe-delimited when the input is pipe-delimited (matching the candidate cardinality from step 2). Also adds `touches_intronic_region` and `spans_intron` row-level boolean flags (single `"true"`/`"false"` per row, based on whether any c. candidate is intronic).
 
 **Command:**
 ```bash
@@ -288,9 +288,11 @@ src/scripts/run_add_vcf_identifiers.sh output_clingen.tsv output_parsed.tsv
 ```
 
 **Notes:**
-- Useful for filtering by variant type or position
-- Requires UTA database access for full ref-allele resolution (attempted but not strictly required)
-- Safe to skip if you don't need parsed components
+- If step 2 (`reverse_translate_protein_variants`) was run, derived columns are already present; this step re-computes them (idempotent for DNA rows, but collapses per-candidate intronic flags to a single row-level flag)
+- If step 2 was skipped (no protein variants), this is the only step that adds derived position columns
+- Inversions are expanded to the reverse-complement sequence; protein HGVS is converted to one-letter amino acid codes
+- UTA is required for resolving missing ref alleles in `del`/`dup`/`inv` variants; those fields are left blank if UTA is unavailable
+- See [docs/add_vcf_identifiers.md](docs/add_vcf_identifiers.md) for full column list, parsing rules, and VCF anchor details
 
 ### Step 5: Annotate with ClinVar Data (Optional)
 
