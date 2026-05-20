@@ -1449,7 +1449,7 @@ def annotate_row(
         faf95_values.append("" if rec.faf95_max is None else str(rec.faf95_max))
         faf95_anc_values.append(rec.faf95_max_ancestry)
         filters_values.append(rec.filters)
-        exome_filters_values.append(rec.exome_filters)
+        exome_filters_values.append(rec.exome_filters.replace('|', '^'))
         genome_filters_values.append(rec.genome_filters)
         gene_symbols_values.append(rec.gene_symbols)
 
