@@ -20,11 +20,16 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+# Thread-local pysam.TabixFile handles; avoids spawning a subprocess per lookup.
+_tabix_local = threading.local()
 
 SPLICEAI_COLS = [
     "spliceai.ds_ag",
@@ -352,7 +357,33 @@ def _chrom_candidates(chrom: str) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
+def _get_tabix_handle(vcf_path: Path) -> Optional[Any]:
+    """Return a thread-local ``pysam.TabixFile``, opening it lazily on first access.
+
+    Returns ``None`` when pysam is unavailable; the caller falls back to subprocess
+    tabix in that case.
+    """
+    try:
+        import pysam  # type: ignore[import]
+    except ImportError:
+        return None
+    handles: Optional[dict[str, Any]] = getattr(_tabix_local, "handles", None)
+    if handles is None:
+        _tabix_local.handles = {}  # type: ignore[attr-defined]
+        handles = _tabix_local.handles
+    key = str(vcf_path.resolve())
+    if key not in handles:
+        handles[key] = pysam.TabixFile(str(vcf_path))
+    return handles[key]
+
+
 def _run_tabix_fetch_lines(vcf_path: Path, chrom: str, pos: int) -> list[str]:
+    handle = _get_tabix_handle(vcf_path)
+    if handle is not None:
+        try:
+            return list(handle.fetch(chrom, pos - 1, pos))
+        except (ValueError, KeyError):
+            return []
     region = f"{chrom}:{pos}-{pos}"
     proc = subprocess.run(
         ["tabix", str(vcf_path), region],
@@ -642,6 +673,17 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         metavar="BYTES",
         help="Maximum per-field character length for CSV/TSV parsing (default: %(default)s).",
     )
+    p.add_argument(
+        "--max-workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Number of parallel tabix lookup threads for precomputed mode (default: 1). "
+            "Values >1 collect all unique HGVS strings in a first pass, look them up in "
+            "parallel, then stream-annotate the output."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -718,12 +760,73 @@ def main(argv: Optional[list[str]] = None) -> None:
     output_path = Path(args.output_file)
 
     if args.mode == "precomputed":
-        logger.info("Precomputed mode: streaming annotation rows as lookups become available")
+        # Pass 1: scan input to collect all unique HGVS strings (fast; reads only one column).
+        logger.info("Precomputed mode: scanning input for unique HGVS variants…")
+        unique_hgvs_set: set[str] = set()
+        with input_path.open("r", encoding="utf-8", newline="") as scan_fh:
+            scan_reader = csv.DictReader(scan_fh, delimiter=delim)
+            for src_idx, row in enumerate(scan_reader):
+                if src_idx < args.skip:
+                    continue
+                if args.limit is not None and (src_idx - args.skip) >= args.limit:
+                    break
+                for hgvs_g in split_pipe_preserve_positions(row.get(args.hgvs_g_col, "")):
+                    if hgvs_g:
+                        unique_hgvs_set.add(hgvs_g)
+
+        unique_hgvs_list = list(unique_hgvs_set)
+        logger.info(
+            "Precomputed mode: looking up %d unique HGVS variants (max_workers=%d)…",
+            len(unique_hgvs_list),
+            args.max_workers,
+        )
+
+        # Pre-parse all HGVS strings to VCF coordinates (CPU-only, no I/O).
+        hgvs_to_exact: dict[str, Optional[tuple[str, int, str, str]]] = {
+            h: parse_hgvs_g_to_vcf(h, nc_to_chrom, fasta) for h in unique_hgvs_list
+        }
+
+        def _lookup_one(hgvs_g: str) -> tuple[str, dict[str, str]]:
+            exact = hgvs_to_exact[hgvs_g]
+            scores = lookup_precomputed_scores(
+                {hgvs_g: exact}, nc_to_chrom, precomputed_vcfs, progress_every=0
+            )
+            return hgvs_g, scores.get(hgvs_g, _empty_score_dict())
+
         hgvs_score_map: dict[str, dict[str, str]] = {}
-        unique_hgvs_checked = 0
         unique_hgvs_matched = 0
         lookup_started = time.monotonic()
+        total_unique = len(unique_hgvs_list)
+        processed_unique = 0
 
+        with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+            for hgvs_g, score in executor.map(_lookup_one, unique_hgvs_list):
+                hgvs_score_map[hgvs_g] = score
+                processed_unique += 1
+                if score.get("spliceai.max_delta_score", "").strip():
+                    unique_hgvs_matched += 1
+                if args.progress_every > 0 and (
+                    processed_unique % args.progress_every == 0 or processed_unique == total_unique
+                ):
+                    elapsed = max(time.monotonic() - lookup_started, 1e-9)
+                    logger.info(
+                        "SpliceAI lookup progress: %d/%d unique variants checked (%d matched, %.1f variants/s)",
+                        processed_unique,
+                        total_unique,
+                        unique_hgvs_matched,
+                        processed_unique / elapsed,
+                    )
+
+        if total_unique:
+            elapsed = max(time.monotonic() - lookup_started, 1e-9)
+            logger.info(
+                "SpliceAI lookup complete: %d unique variants checked (%d matched, %.1f variants/s)",
+                total_unique,
+                unique_hgvs_matched,
+                total_unique / elapsed,
+            )
+
+        # Pass 2: stream input rows, annotate from the complete score map, write output.
         with input_path.open("r", encoding="utf-8", newline="") as in_fh, output_path.open(
             "w", encoding="utf-8", newline=""
         ) as out_fh:
@@ -749,54 +852,19 @@ def main(argv: Optional[list[str]] = None) -> None:
                     continue
                 if args.limit is not None and selected_rows >= args.limit:
                     break
-
                 selected_rows += 1
-                for hgvs_g in split_pipe_preserve_positions(row.get(args.hgvs_g_col, "")):
-                    if not hgvs_g or hgvs_g in hgvs_score_map:
-                        continue
-                    exact = parse_hgvs_g_to_vcf(hgvs_g, nc_to_chrom, fasta)
-                    score = lookup_precomputed_scores(
-                        {hgvs_g: exact},
-                        nc_to_chrom,
-                        precomputed_vcfs,
-                        progress_every=0,
-                    ).get(hgvs_g, _empty_score_dict())
-                    hgvs_score_map[hgvs_g] = score
-                    unique_hgvs_checked += 1
-                    if score["spliceai.max_delta_score"].strip():
-                        unique_hgvs_matched += 1
-
-                    if args.progress_every > 0 and unique_hgvs_checked % args.progress_every == 0:
-                        elapsed = max(time.monotonic() - lookup_started, 1e-9)
-                        logger.info(
-                            "SpliceAI lookup progress: %d unique variants checked (%d matched, %.1f variants/s)",
-                            unique_hgvs_checked,
-                            unique_hgvs_matched,
-                            unique_hgvs_checked / elapsed,
-                        )
-
                 ann = annotate_row_with_scores(row, args.hgvs_g_col, hgvs_score_map)
                 row.update(ann)
                 writer.writerow(row)
                 if ann["spliceai.max_delta_score"].replace("|", "").strip():
                     annotated_rows += 1
-
                 if args.progress_every > 0 and selected_rows % args.progress_every == 0:
                     logger.info(
-                        "SpliceAI row progress: %d rows written (%d annotated, %d unique lookups)",
+                        "SpliceAI row progress: %d rows written (%d annotated)",
                         selected_rows,
                         annotated_rows,
-                        unique_hgvs_checked,
                     )
 
-        if unique_hgvs_checked:
-            elapsed = max(time.monotonic() - lookup_started, 1e-9)
-            logger.info(
-                "SpliceAI lookup complete: %d unique variants checked (%d matched, %.1f variants/s)",
-                unique_hgvs_checked,
-                unique_hgvs_matched,
-                unique_hgvs_checked / elapsed,
-            )
         logger.info("Done. %d/%d rows received SpliceAI annotations", annotated_rows, selected_rows)
         return
 
