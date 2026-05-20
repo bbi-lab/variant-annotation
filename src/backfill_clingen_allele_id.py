@@ -2,10 +2,11 @@
 
 Provenance
 ----------
-This module is project-specific, but its ClinGen lookup helpers and column
-selection behavior are intentionally aligned with src.map_variants, which in
-turn mirrors MaveDB behavior. If src.map_variants is treated as AGPL-coupled,
-review this file together with it before choosing a more permissive license.
+This module is project-specific. ClinGen Allele Registry queries are delegated
+to ``src.lib.clingen.query_clingen_by_hgvs``, which is intentionally aligned
+with ``src.map_variants`` (which in turn mirrors MaveDB behavior). If
+``src.map_variants`` is treated as AGPL-coupled, review this file together
+with it before choosing a more permissive license.
 
 Populate the ``clingen_allele_id`` column (or a custom-named column) for rows
 where it is currently blank, by querying the ClinGen Allele Registry using the
@@ -29,9 +30,20 @@ column contains a pipe-delimited list (i.e. the file has already been through
 Step 2 reverse translation), the entire pipe-delimited string would be used
 as the query, which will fail.  Apply this script only to Step-1 output.
 
-Blank-node-style response identifiers (``_:PA...`` / ``_:CA...``) that
-ClinGen emits when no real allele record exists are treated as misses and
-left blank.
+ClinGen response handling (delegated to ``src.lib.clingen``):
+
+- **HTTP 200**: allele record returned; the ``@id`` field is parsed for the ID.
+- **HTTP 404**: no registry entry; the row is left blank and the miss is
+  cached in Redis.
+- **HTTP 429**: rate-limited; retried with exponential back-off.
+- **HTTP 503**: server temporarily unavailable; retried up to 20 times with
+  exponential back-off (independent of the outer retry counter).
+- **Other non-2xx**: logged as a warning; row left blank.
+- **Network exception**: retried with back-off; row left blank if all attempts
+  fail.
+- **Placeholder IDs** (``_:PA...`` / ``_:CA...``): ClinGen occasionally returns
+  a 200 whose ``@id`` is a blank-node placeholder rather than a real registry
+  ID. These are treated as misses and the row is left blank.
 
 Rows that already have a value in the clingen_allele_id column are left
 untouched.  Row order in the output is preserved.
@@ -63,25 +75,22 @@ import argparse
 import asyncio
 import csv
 import logging
-import sys
-import time
 from pathlib import Path
 from typing import Optional
 
-import requests
 from dotenv import load_dotenv
+
+from src.lib.clingen import query_clingen_by_hgvs
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-CLINGEN_API_URL = "https://reg.genome.network/allele"
-CLINGEN_RETRY_DELAY = 2.0
 PROGRESS_EVERY_ROWS = 1000
 
 
 # ---------------------------------------------------------------------------
-# ClinGen helpers (adapted from map_variants.py)
+# Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -89,56 +98,25 @@ def _detect_separator(file_path: str) -> str:
     return "\t" if Path(file_path).suffix.lower() in (".tsv", ".txt") else ","
 
 
-def _query_clingen_by_hgvs(hgvs_string: str, max_retries: int = 3) -> Optional[dict]:
-    for attempt in range(max_retries):
-        try:
-            resp = requests.get(
-                CLINGEN_API_URL,
-                params={"hgvs": hgvs_string},
-                timeout=30,
-                headers={"Accept": "application/json"},
-            )
-            if resp.status_code == 200:
-                return resp.json()
-            if resp.status_code == 404:
-                logger.warning("ClinGen 404 for %s", hgvs_string)
-                return None
-            if resp.status_code == 429:
-                wait = CLINGEN_RETRY_DELAY * (2**attempt)
-                logger.warning(
-                    "ClinGen rate-limited for %s; waiting %.1f s.", hgvs_string, wait
-                )
-                time.sleep(wait)
-                continue
-            logger.warning(
-                "ClinGen returned HTTP %d for %s", resp.status_code, hgvs_string
-            )
-            return None
-        except requests.exceptions.RequestException as exc:
-            logger.warning(
-                "ClinGen request failed for %s (attempt %d/%d): %s",
-                hgvs_string,
-                attempt + 1,
-                max_retries,
-                exc,
-            )
-            if attempt < max_retries - 1:
-                time.sleep(CLINGEN_RETRY_DELAY)
-    return None
-
-
 async def _query_clingen_batch(
     hgvs_strings: list[str],
     max_concurrency: int,
     max_retries: int,
 ) -> dict[str, Optional[dict]]:
+    """Query ClinGen concurrently for a list of HGVS strings.
+
+    Delegates each lookup to ``src.lib.clingen.query_clingen_by_hgvs``, which
+    handles 404, 429, 503, network errors, Redis caching, and placeholder-ID
+    filtering.  *max_concurrency* controls the maximum number of in-flight
+    requests at any time.
+    """
     semaphore = asyncio.Semaphore(max_concurrency)
 
     async def _query_one(hgvs: str) -> tuple[str, Optional[dict]]:
         async with semaphore:
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(
-                None, _query_clingen_by_hgvs, hgvs, max_retries
+                None, query_clingen_by_hgvs, hgvs, max_retries
             )
             return hgvs, result
 
@@ -148,13 +126,13 @@ async def _query_clingen_batch(
 
 
 def _extract_clingen_allele_id(data: dict) -> Optional[str]:
-    """Extract ClinGen allele identifier (for example ``CA123456``) from response.
+    """Extract ClinGen allele identifier (e.g. ``CA123456``) from a response dict.
 
-    Returns None for placeholder values such as ``_:PA...`` or ``_:CA...`` that
-    ClinGen emits when no real allele record exists.
+    Mirrors ``src.lib.clingen._extract_clingen_allele_id``.  The allele ID is
+    embedded in the ``@id`` URL field; the ``id`` field is a fallback.
+    Blank-node placeholders (``_:PA...``, ``_:CA...``) return ``None``.
     """
     def _is_real_id(value: str) -> bool:
-        # Reject blank-node-style identifiers like "_:PA..." or "_:CA..."
         return bool(value) and not value.startswith("_:")
 
     at_id: str = data.get("@id", "") or ""

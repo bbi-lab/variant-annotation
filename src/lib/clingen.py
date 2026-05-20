@@ -169,6 +169,23 @@ def _cache_set(key: str, value: str, *, miss: bool = False) -> None:
 
 
 def _extract_clingen_allele_id(data: dict) -> Optional[str]:
+    """Extract the ClinGen allele identifier (e.g. ``CA123456``) from a response dict.
+
+    ClinGen embeds the allele identifier in the ``@id`` field as a URL such as
+    ``https://reg.genome.network/allele/CA123456``.  This function strips the URL
+    prefix and returns only the trailing identifier fragment.  When ``@id`` is
+    absent or empty, the ``id`` field is tried as a fallback.
+
+    Blank-node-style placeholder identifiers that ClinGen occasionally emits
+    when no real allele record exists — values like ``_:CA123456`` or
+    ``_:PA789`` — are rejected and cause the function to return ``None``.
+
+    Returns
+    -------
+    str or None
+        The allele identifier string (e.g. ``"CA123456"``), or ``None`` when
+        the response contains no valid allele ID.
+    """
     def _normalize(value: str) -> str:
         text = (value or "").strip()
         if not text or text.startswith("_:"):
@@ -335,12 +352,75 @@ def query_clingen_by_hgvs(
 ) -> Optional[dict]:
     """Query ClinGen Allele Registry by HGVS string.
 
-    HGVS lookups are cached in Redis as HGVS->allele_id mappings and allele
-    responses are cached by allele ID.
+    Returns the raw JSON response dict on success, or ``None`` when no result
+    is available or all retries are exhausted.
 
+    Response handling
+    -----------------
+    HTTP 200
+        Returns the parsed JSON response.  The allele ID (extracted via
+        ``_extract_clingen_allele_id``) and the full response body are written
+        to Redis for future calls.  If the response contains only a placeholder
+        ID (see below), the HGVS key is stored as a miss instead.
+
+    HTTP 404
+        The HGVS string has no entry in the ClinGen registry.  Returns
+        ``None``.  A miss sentinel (``__MISS__``) is stored in Redis under the
+        HGVS mapping key so that repeated lookups skip the network request.
+        Pass ``log_404=True`` to emit a WARNING for each miss.
+
+    HTTP 429
+        The server is rate-limiting requests.  Retried up to *max_retries*
+        times with exponential back-off (``retry_delay * 2 ** attempt``
+        seconds between attempts).
+
+    HTTP 503
+        Server temporarily unavailable.  Handled by ``_get_with_503_retry``
+        **before** the outer retry counter is consulted: up to
+        ``CLINGEN_503_MAX_RETRIES`` (20) additional attempts are made with
+        exponential back-off capped at ``CLINGEN_503_BACKOFF_CAP`` (60 s)
+        per attempt.  Returns ``None`` when all 503 retries are exhausted.
+
+    Other non-2xx statuses
+        Logged as a WARNING.  Returns ``None`` without further retrying.
+
+    Network / timeout exceptions
+        Retried up to *max_retries* times with *retry_delay* seconds between
+        attempts.  Returns ``None`` when all attempts fail.
+
+    Placeholder IDs
+        ClinGen occasionally returns HTTP 200 with an ``@id`` that contains a
+        blank-node-style placeholder such as ``_:CA123456`` or ``_:PA789``
+        rather than a real registry identifier.  ``_extract_clingen_allele_id``
+        rejects these values.  When this occurs the response is still returned
+        (callers may inspect it), but the HGVS key is stored as a miss in Redis
+        so the lookup is not repeated unnecessarily.
+
+    Redis caching
+    -------------
+    When the Redis service is reachable, two keys are written per successful
+    lookup:
+
+    - ``<prefix>:hgvs:<HGVS>``        → allele ID string
+    - ``<prefix>:allele:<allele_ID>``  → full JSON response body
+
+    Both hit and miss results are cached.  Misses are stored as the sentinel
+    value ``__MISS__``.  The default key prefix is ``clingen:v1`` (override
+    with ``CLINGEN_CACHE_PREFIX`` env var).  Default TTL is 86 400 s for hits
+    and misses (configurable via ``CLINGEN_CACHE_TTL_SECONDS`` /
+    ``CLINGEN_CACHE_MISS_TTL_SECONDS``).
+
+    If the HGVS→ID mapping key exists in Redis but the allele response was
+    evicted or is corrupt, the allele is re-fetched by ID without re-querying
+    by HGVS.
+
+    Known-misses list
+    -----------------
     If *known_misses* is supplied and the HGVS string is found there, the
     function returns ``None`` immediately after the Redis check without making
-    an HTTP request and without writing a miss sentinel to Redis.
+    an HTTP request and without writing a miss sentinel to Redis.  This is
+    useful for a stable, pre-computed list of HGVS strings that are known to
+    have no ClinGen record.
     """
     hgvs = (hgvs_string or "").strip()
     if not hgvs:
