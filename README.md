@@ -472,6 +472,8 @@ src/scripts/run_annotate_erepo.sh input.tsv output.tsv
 
 **Purpose:** Add a mutational consequence term from Ensembl VEP for each DNA variant row.
 
+See [docs/annotate_vep.md](docs/annotate_vep.md) for full reference documentation including transcript selection logic, API call strategy, and Redis cache configuration.
+
 **Input columns:** `mapped_hgvs_c` (preferred), `mapped_hgvs_g`, `mapped_hgvs_p`
 
 **Output columns:** `vep.mutational_consequence`, `vep.consequence_source`, `vep.access_date`, `vep.error`

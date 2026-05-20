@@ -138,3 +138,27 @@ Hail mode supports `--genes BRCA1,BRCA2` to restrict the local cache to specific
 **MaveDB:** ClinGen Evidence Repository annotation has not been implemented in MaveDB.
 
 **This pipeline:** `annotate_erepo` downloads the full ClinGen erepo expert-panel classification TSV and joins it against each variant candidate using up to three keys: HGVS expression, ClinVar Variation ID, and CAID. Sixteen classification columns are added per candidate (prefixed `clingen_evidence_repository.`), including `Assertion`, `Expert Panel`, `Disease Mondo Id`, `Mode of Inheritance`, applied ACMG evidence codes, and supporting metadata. A `warnings` column records cross-key discrepancies.
+
+---
+
+## `annotate_vep` (step 9)
+
+**MaveDB** (`mavedb-api/src/mavedb/lib/vep.py`): queries Ensembl VEP via `/vep/human/hgvs` and falls back to Variant Recoder → second VEP pass for unresolved inputs. Always uses the top-level `most_severe_consequence` field, which reflects the worst outcome across **all** transcripts overlapping the variant's genomic position. A single genomic HGVS or `hgvs_nt` value is queried per variant.
+
+**This pipeline:** `annotate_vep` follows the same two-step API strategy (VEP → Recoder → VEP) but adds transcript-specific consequence selection and handles pipe-delimited multi-candidate rows.
+
+Key differences:
+
+| | MaveDB | This pipeline |
+|---|---|---|
+| Consequence selection | Always `most_severe_consequence` (global worst across all transcripts at the locus) | Transcript-specific when input is `NM_`/`NR_`/`ENST` HGVS; falls back to `most_severe_consequence` otherwise |
+| RefSeq transcript handling | Not distinguished from genomic HGVS | Sends `refseq=1` flag for `NM_`/`NR_` inputs so `transcript_consequences` uses RefSeq IDs |
+| `vep.consequence_source` output column | Not produced | `transcript` when a matched transcript entry was used; `most_severe` for global fallback |
+| HGVS input priority | Single HGVS string per variant | Configurable column list (`--hgvs-cols`); default `mapped_hgvs_c,mapped_hgvs_g,mapped_hgvs_p` — transcript HGVS tried first |
+| Multi-candidate rows | Not applicable | Each pipe-delimited candidate resolved independently; discrepancies recorded in `vep.error` |
+| Redis cache structure | Consequence string only | `(consequence, source)` pair; misses stored as explicit sentinel; API errors skipped (never cached) |
+| Resume support | Not built-in | `--keep-existing` skips rows with an existing non-empty annotation |
+
+### Why transcript specificity matters
+
+When a gene has many overlapping transcripts at a locus, `most_severe_consequence` may reflect a consequence on a minor isoform rather than the canonical transcript of interest. For example, a variant in a coding exon of the canonical transcript may be annotated as `missense_variant` on that transcript but `intron_variant` on a longer overlapping non-coding transcript — and vice versa. Using `most_severe_consequence` would pick whichever is most severe globally, which may not be the biologically relevant consequence for the experiment's transcript. This pipeline preferentially selects the consequence on the specific transcript named in the input HGVS (`mapped_hgvs_c`).
