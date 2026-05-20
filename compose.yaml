@@ -144,13 +144,13 @@ services:
       - .:/usr/src/app
       - ${VARIANT_DATA_DIR:-./data}:/work
 
-  annotate-missense-scores:
+  annotate-predictors:
     <<: *tools-image
     profiles:
       - tools
     env_file:
       - settings/.env
-    entrypoint: ["python", "-m", "src.annotate_missense_scores"]
+    entrypoint: ["python", "-m", "src.annotate_predictors"]
     command: ["--help"]
     volumes:
       - .:/usr/src/app

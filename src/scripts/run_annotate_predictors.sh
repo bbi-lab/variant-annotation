@@ -3,10 +3,10 @@ set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
   cat <<'EOF'
-Usage: src/scripts/run_annotate_missense_scores.sh <input-file> <output-file> [annotate_missense_scores options...]
+Usage: src/scripts/run_annotate_predictors.sh <input-file> <output-file> [annotate_predictors options...]
 
 Examples:
-  src/scripts/run_annotate_missense_scores.sh variants.tsv annotated.tsv \
+  src/scripts/run_annotate_predictors.sh variants.tsv annotated.tsv \
     --revel-file /path/to/revel_hg38.tsv.gz \
     --alphamissense-file /path/to/AlphaMissense_hg38.tsv.gz \
     --dbnsfp-file /path/to/dbNSFP5.3.1a_grch38.gz
@@ -15,7 +15,7 @@ Examples:
   export REVEL_FILE=/path/to/revel_hg38.tsv.gz
   export ALPHAMISSENSE_FILE=/path/to/AlphaMissense_hg38.tsv.gz
   export DBNSFP_FILE=/path/to/dbNSFP5.3.1a_grch38.gz
-  src/scripts/run_annotate_missense_scores.sh variants.tsv annotated.tsv
+  src/scripts/run_annotate_predictors.sh variants.tsv annotated.tsv
 
 Notes:
   - Input/output paths are interpreted relative to /work in the container.

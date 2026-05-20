@@ -184,3 +184,11 @@ Key differences:
 ### Calibration selection rationale
 
 The primary calibration is the one the MaveDB curators have designated as the recommended interpretation threshold. The investigator-provided calibration reflects the thresholds determined by the original study authors. Exposing both independently allows downstream users to compare the curator-recommended and author-recommended classifications, which sometimes differ. Research-use-only and alternative calibrations are omitted because they are not intended for clinical or variant-interpretation use.
+
+---
+
+## `annotate_predictors` (step 11)
+
+**MaveDB:** does not incorporate in-silico predictor scores (REVEL, AlphaMissense, MutPred2, etc.). MaveDB focuses on experimentally-derived functional scores from multiplexed assays (MAVE data), not computational predictors.
+
+**This pipeline:** `annotate_predictors` adds pre-computed computational pathogenicity predictions from REVEL, AlphaMissense, and/or MutPred2 as supplementary columns. These are entirely separate from MaveDB scores and calibrations.

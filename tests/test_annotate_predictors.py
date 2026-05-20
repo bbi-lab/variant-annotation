@@ -1,4 +1,4 @@
-"""Unit tests for src/annotate_missense_scores.py."""
+"""Unit tests for src/annotate_predictors.py."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from unittest.mock import patch
 
 import pytest
 
-import src.annotate_missense_scores as mod
-from src.annotate_missense_scores import (
+import src.annotate_predictors as mod
+from src.annotate_predictors import (
     _snv_from_hgvs_g,
     _lookup_revel,
     _lookup_alphamissense,

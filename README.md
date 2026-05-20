@@ -204,7 +204,9 @@ Input variants
     ↓
 [10] annotate_mavedb (optional) ──→ MaveDB functional classifications
     ↓
-[11] flatten_dna_variants (optional) ──→ flattened DNA-only variants
+[11] annotate_predictors (optional) ──→ REVEL / AlphaMissense / MutPred2 scores
+    ↓
+[12] flatten_dna_variants (optional) ──→ flattened DNA-only variants
     ↓
 Output: one row per DNA variant (or fully annotated variants)
 ```
@@ -558,7 +560,29 @@ src/scripts/run_annotate_mavedb.sh input.tsv output.tsv
 - For range-based calibrations, classification uses the numeric `score` column directly. For class-based calibrations, the variant is looked up by URN via the MaveDB API.
 - Rows with no variant URN or no applicable calibration receive empty annotation columns.
 
-### Step 11: Flatten DNA Variants (Optional)
+### Step 11: Annotate with In-Silico Predictor Scores (Optional)
+
+**Purpose:** Annotate variants with pre-computed missense pathogenicity scores from REVEL, AlphaMissense, and/or MutPred2. All tools operate on GRCh38 genomic positions and score missense SNVs only.
+
+See [docs/annotate_predictors.md](docs/annotate_predictors.md) for full reference documentation including data file preparation, pipe-delimited column behaviour, and troubleshooting.
+
+**Input columns:** `mapped_hgvs_g` (pipe-delimited genomic HGVS)
+
+**Output columns:** `revel.score`, `alphamissense.pathogenicity`, `alphamissense.class`, `mutpred2.score` (only columns for supplied tools are written)
+
+**Command:**
+```bash
+src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
+  --alphamissense-file AlphaMissense_hg38.tsv.gz
+```
+
+**Notes:**
+- At least one of `--revel-file`, `--alphamissense-file`, or `--dbnsfp-file` must be provided.
+- All currently supported predictors score missense SNVs only; other variant types receive empty annotation columns.
+- REVEL and AlphaMissense scores are pipe-aligned to the input candidates. MutPred2 emits a single maximum score (protein-level model).
+- Requires `tabix` (htslib) on `$PATH`.
+
+### Step 12: Flatten DNA Variants (Optional)
 
 **Purpose:** For annotated variant files with multi-candidate DNA variants (from reverse translation), produce a flattened output where each DNA candidate has its own row. This is useful when you want one row per DNA variant instead of pipe-delimited lists.
 
@@ -1118,9 +1142,9 @@ TP53	CA123456|CA123457||	Pathogenic	0.00234	0.00234	1547
 | `spliceai.dp_dl` | float | Donor loss delta position |
 | `spliceai.max_delta_score` | float | Max of DS_AG, DS_AL, DS_DG, DS_DL |
 
-#### Step 10: flatten_dna_variants
+#### Step 11: flatten_dna_variants
 
-**No new columns are added in Step 10.** Instead, pipe-delimited columns from previous steps are expanded so that each DNA candidate gets its own row. The output file contains all columns from the input file, but with:
+**No new columns are added in Step 11.** Instead, pipe-delimited columns from previous steps are expanded so that each DNA candidate gets its own row. The output file contains all columns from the input file, but with:
 - One row per DNA candidate (instead of one row per protein with pipe-delimited candidates)
 - Non-list columns (e.g., `raw_hgvs_pro`, `gene_symbol`) repeated across the expanded rows
 - Protein-only rows (without DNA variants) dropped entirely
@@ -1153,7 +1177,7 @@ This ensures positional alignment across all downstream annotations.
 
 When annotating, the pipeline tries candidates in order and returns the first successful match.
 
-**Note on Step 10 (flatten_dna_variants):** This optional step converts pipe-delimited columns into separate rows, with one row per DNA candidate. After flattening, there are no more pipe-delimited values in these columns—each candidate has its own row.
+**Note on Step 11 (flatten_dna_variants):** This optional step converts pipe-delimited columns into separate rows, with one row per DNA candidate. After flattening, there are no more pipe-delimited values in these columns—each candidate has its own row.
 
 ## Local installation (without Docker)
 

@@ -1,4 +1,4 @@
-"""Annotate variants with pre-computed missense pathogenicity scores.
+"""Annotate variants with pre-computed in-silico pathogenicity scores from computational predictors.
 
 Supported scores (hg38 / GRCh38 only):
 
