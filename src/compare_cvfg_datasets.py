@@ -31,10 +31,14 @@ Relaxed fallback join 3 (for off-by-one start coordinate in A):
   Some A rows have len(ref) != end - start + 1; trying start+1 and matching
   against B's transcript alt (with strand-aware revcomp) resolves them.
 
+Pre-filter (applied before the join):
+  compare_errors_in_a.tsv         - A rows with VCF/HGVS-c allele-length mismatch
+
 Outputs (written to --output-dir):
-  compare_only_in_a.tsv   - rows from A with no match in B (all A columns)
-  compare_only_in_b.tsv   - rows from B with no match in A (all B columns)
-  compare_joined.tsv      - matched rows with selected columns from both
+  compare_only_in_a.tsv           - clean A rows with no match in B (all A columns)
+  compare_only_in_a_coord_errors.tsv - unmatched A rows with coordinate or ref-allele errors
+  compare_only_in_b.tsv           - rows from B with no match in A (all B columns)
+  compare_joined.tsv              - matched rows with selected columns from both
 """
 
 import argparse

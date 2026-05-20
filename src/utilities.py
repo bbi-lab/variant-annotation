@@ -7,11 +7,12 @@ scripts and Docker wrappers can invoke:
 
 Available commands:
 - compare-columns: find rows where paired columns contain differing values
-- filter-columns: keep or omit selected columns from CSV/TSV files
-- filter-rows: keep rows where selected columns contain values
-- replace-rows: replace rows from multiple CSV/TSV files by composite key
-- merge-columns: left-join two files and add selected columns from the second
-- reorder-columns: reorder columns using a requested column order
+- filter-columns:  keep or omit selected columns from CSV/TSV files
+- filter-rows:     keep rows where selected columns satisfy a value condition
+- replace-rows:    replace rows from multiple CSV/TSV files by composite key
+- merge-columns:   left-join two files and add selected columns from the second
+- rename-columns:  keep/omit and optionally rename columns; supports --reorder
+- reorder-columns: move listed columns to the front, appending the rest
 """
 
 from __future__ import annotations

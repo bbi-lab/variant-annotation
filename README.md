@@ -694,6 +694,22 @@ services:
 
 This ensures caches survive container restarts and are shared across runs.
 
+## Bundled Utilities
+
+The following tools are included alongside the main pipeline for data inspection, cross-validation, and TSV manipulation. They are not annotation steps.
+
+| Script | Description |
+|---|---|
+| `run_backfill_clingen_allele_id.sh` | Backfill missing `clingen_allele_id` values (Step 1 output only) where the initial `map_variants` run left cells blank. See [docs/backfill_clingen_allele_ids.md](docs/backfill_clingen_allele_ids.md) |
+| `run_clear_clingen_cache.sh` | Delete ClinGen Allele Registry Redis cache keys to force fresh API lookups. See [docs/clear_clingen_cache.md](docs/clear_clingen_cache.md) |
+| `run_compare_cvfg_datasets.sh` | Cross-validate a CVFG pipeline flat file against the integrated variant effect dataset via a positional-genome join; produces matched, unmatched, and error output files. See [docs/compare_cvfg_datasets.md](docs/compare_cvfg_datasets.md) |
+| `run_diff_hgvs.sh` | Compare `mapped_hgvs_g/c/p` columns between two TSV versions, reporting each changed pipe-component. See [docs/diff_hgvs.md](docs/diff_hgvs.md) |
+| `run_diff_vcf_coords.sh` | Compare VCF-style coordinate columns (genomic, transcript, protein) between two TSV versions. See [docs/diff_vcf_coords.md](docs/diff_vcf_coords.md) |
+| `run_diff_tsv.sh` | Row-level diff between two TSV versions: changed rows and HGVS component diffs. See [docs/diff_tsv.md](docs/diff_tsv.md) |
+| `run_haplotypes_to_delins.sh` | Rewrite intra-codon c.-haplotype HGVS expressions to delins notation. See [docs/haplotypes_to_delins.md](docs/haplotypes_to_delins.md) |
+| `run_gnomad_hail_shell.sh` | Launch an interactive bash shell in the Hail-enabled gnomAD container for ad-hoc table inspection. See [docs/gnomad_hail_shell.md](docs/gnomad_hail_shell.md) |
+| `run_utilities.sh` | General-purpose TSV manipulation: `filter-rows`, `filter-columns`, `merge-columns`, `rename-columns`, `reorder-columns`, `replace-rows`, `compare-columns`. See [docs/utilities.md](docs/utilities.md) |
+
 ## Pipeline Data Flow Diagram
 
 ```

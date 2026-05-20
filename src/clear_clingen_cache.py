@@ -1,4 +1,17 @@
-"""Clear ClinGen Redis cache keys for this project namespace."""
+"""Clear ClinGen Allele Registry cache keys from Redis.
+
+The pipeline caches ClinGen API responses in Redis under a key namespace
+prefix (default: ``clingen:v1``, configurable via the ``CLINGEN_CACHE_PREFIX``
+environment variable). Use this script to invalidate the cache when you need
+to force fresh API lookups — for example after a ClinGen data update, when
+troubleshooting stale allele IDs, or when switching to a different ClinGen
+environment.
+
+All keys that begin with the chosen prefix are deleted atomically. The
+number of deleted keys is reported.
+
+Requires the Redis service to be running (see docker compose).
+"""
 
 from __future__ import annotations
 
