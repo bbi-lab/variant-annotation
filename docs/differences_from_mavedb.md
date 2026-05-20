@@ -122,3 +122,11 @@ Filtering is **only available in Hail mode**. The Athena query (like MaveDB's) d
 ### Gene-level cache filtering
 
 Hail mode supports `--genes BRCA1,BRCA2` to restrict the local cache to specific gene symbols (from `vep.worst_csq_by_gene_canonical`). This has no MaveDB equivalent.
+
+---
+
+## `annotate_spliceai` (step 7)
+
+**MaveDB:** SpliceAI annotation has not been implemented in MaveDB.
+
+**This pipeline:** `annotate_spliceai` adds nine SpliceAI delta-score columns (`spliceai.ds_ag`, `spliceai.ds_al`, `spliceai.ds_dg`, `spliceai.ds_dl`, `spliceai.dp_ag`, `spliceai.dp_al`, `spliceai.dp_dg`, `spliceai.dp_dl`, `spliceai.max_delta_score`) to each row. Two execution modes are available: `precomputed` (default) — tabix lookup against the Illumina pre-scored SpliceAI VCFs — and `compute` — local on-the-fly scoring using the SpliceAI deep-learning model. For rows with multiple pipe-delimited DNA candidates (from step 2), all output columns are pipe-delimited and candidate-aligned.

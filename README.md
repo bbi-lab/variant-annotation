@@ -410,6 +410,8 @@ src/scripts/run_annotate_gnomad.sh output_clinvar.tsv output_final.tsv \
 
 **Purpose:** Add SpliceAI splice-impact scores per DNA HGVS candidate.
 
+See [docs/annotate_spliceai.md](docs/annotate_spliceai.md) for full reference documentation including HGVS parsing rules, indel normalization, and parallel lookup options.
+
 **Input columns:** `mapped_hgvs_g` (from step 1 or step 2)
 
 **Output columns:** `spliceai.ds_ag`, `spliceai.ds_al`, `spliceai.ds_dg`, `spliceai.ds_dl`, `spliceai.dp_ag`, `spliceai.dp_al`, `spliceai.dp_dg`, `spliceai.dp_dl`, `spliceai.max_delta_score`
