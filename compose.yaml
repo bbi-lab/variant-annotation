@@ -122,6 +122,8 @@ services:
     <<: *tools-image
     profiles:
       - tools
+    depends_on:
+      - redis
     env_file:
       - settings/.env
     entrypoint: ["python", "-m", "src.annotate_vep"]
