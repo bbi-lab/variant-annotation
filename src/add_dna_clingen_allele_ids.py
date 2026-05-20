@@ -37,9 +37,13 @@ def _detect_separator(file_path: str) -> str:
     return "\t" if Path(file_path).suffix.lower() in (".tsv", ".txt") else ","
 
 
-def _query_clingen_by_hgvs(hgvs_string: str, max_retries: int = 3) -> Optional[dict]:
+def _query_clingen_by_hgvs(
+    hgvs_string: str,
+    max_retries: int = 3,
+    known_misses: Optional[frozenset[str]] = None,
+) -> Optional[dict]:
     """Query ClinGen Allele Registry by HGVS string."""
-    return query_clingen_by_hgvs(hgvs_string, max_retries=max_retries)
+    return query_clingen_by_hgvs(hgvs_string, max_retries=max_retries, known_misses=known_misses)
 
 
 def _extract_clingen_allele_id(data: dict) -> Optional[str]:
@@ -104,6 +108,29 @@ def _candidate_pairs(hgvs_c: str, hgvs_g: str) -> list[tuple[str, str]]:
     return list(zip(c_parts, g_parts))
 
 
+def _load_known_misses(path: str) -> frozenset[str]:
+    """Load a single-column HGVS file (with header) into a frozenset."""
+    import csv as _csv
+    misses: set[str] = set()
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = _csv.reader(fh, delimiter="\t")
+        header = next(reader, None)  # skip header row
+        col = 0
+        if header:
+            # Support both bare lists and files that still have a header
+            try:
+                col = header.index("hgvs")
+            except ValueError:
+                pass
+        for row in reader:
+            if row and len(row) > col:
+                h = row[col].strip()
+                if h:
+                    misses.add(h)
+    logger.info("Loaded %d known-miss HGVS strings from %s", len(misses), path)
+    return frozenset(misses)
+
+
 def _lookup_allele_id_for_candidate(
     hgvs_c: str,
     hgvs_g: str,
@@ -111,6 +138,7 @@ def _lookup_allele_id_for_candidate(
     max_retries: int,
     lookup_cache: dict[str, str],
     cache_lock: Optional[Lock] = None,
+    known_misses: Optional[frozenset[str]] = None,
 ) -> str:
     """Resolve one DNA candidate to a ClinGen allele ID using c-then-g lookup."""
     for hgvs in (hgvs_c, hgvs_g):
@@ -120,7 +148,7 @@ def _lookup_allele_id_for_candidate(
 
         if cache_lock is None:
             if query not in lookup_cache:
-                data = _query_clingen_by_hgvs(query, max_retries=max_retries)
+                data = _query_clingen_by_hgvs(query, max_retries=max_retries, known_misses=known_misses)
                 lookup_cache[query] = (_extract_clingen_allele_id(data) or "") if data else ""
             allele_id = lookup_cache.get(query, "")
         else:
@@ -130,7 +158,7 @@ def _lookup_allele_id_for_candidate(
                     # Reserve the slot so no other thread starts a duplicate request.
                     lookup_cache[query] = ""
             if cached is None:
-                data = _query_clingen_by_hgvs(query, max_retries=max_retries)
+                data = _query_clingen_by_hgvs(query, max_retries=max_retries, known_misses=known_misses)
                 resolved = (_extract_clingen_allele_id(data) or "") if data else ""
                 with cache_lock:
                     # Overwrite the placeholder with the real result.
@@ -190,6 +218,7 @@ def build_dna_clingen_value(
     max_retries: int,
     lookup_cache: dict[str, str],
     cache_lock: Optional[Lock] = None,
+    known_misses: Optional[frozenset[str]] = None,
 ) -> str:
     """Build the DNA-level ClinGen allele-ID cell value for one row."""
     existing_id = (row.get(clingen_allele_id_col) or "").strip()
@@ -220,6 +249,7 @@ def build_dna_clingen_value(
             max_retries=max_retries,
             lookup_cache=lookup_cache,
             cache_lock=cache_lock,
+            known_misses=known_misses,
         )
         for c, g in pairs
     ]
@@ -239,6 +269,7 @@ def _process_row_for_dna_ids(
     output_col: str,
     lookup_cache: dict[str, str],
     cache_lock: Lock,
+    known_misses: Optional[frozenset[str]] = None,
 ) -> tuple[int, dict[str, str], bool]:
     """Compute DNA ClinGen value for one row and return ordered result tuple."""
     row_index_for_errors = row_idx + 2  # Account for header row.
@@ -263,6 +294,7 @@ def _process_row_for_dna_ids(
         max_retries=max_retries,
         lookup_cache=lookup_cache,
         cache_lock=cache_lock,
+        known_misses=known_misses,
     )
     row[output_col] = value
     return row_idx, row, bool(value)
@@ -282,6 +314,7 @@ def add_dna_clingen_allele_ids(
     max_workers: int = 8,
     skip: int = 0,
     limit: Optional[int] = None,
+    known_misses_file: Optional[str] = None,
 ) -> None:
     """Read input table, add DNA-level ClinGen ID column, write output table.
 
@@ -292,6 +325,10 @@ def add_dna_clingen_allele_ids(
     """
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")
+
+    known_misses: Optional[frozenset[str]] = None
+    if known_misses_file:
+        known_misses = _load_known_misses(known_misses_file)
 
     in_sep = _detect_separator(input_path)
     out_sep = _detect_separator(output_path)
@@ -340,6 +377,7 @@ def add_dna_clingen_allele_ids(
                     output_col=output_col,
                     lookup_cache=lookup_cache,
                     cache_lock=cache_lock,
+                    known_misses=known_misses,
                 ): idx
                 for idx, row in enumerate(
                     islice(reader, skip, None if limit is None else skip + limit)
@@ -422,6 +460,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Concurrent worker threads for ClinGen lookups",
     )
     p.add_argument(
+        "--known-misses-file",
+        default=None,
+        metavar="FILE",
+        help=(
+            "(Temporary) Path to a single-column TSV file listing HGVS strings "
+            "known to return no ClinGen allele ID. Matching strings are treated "
+            "as confirmed misses without querying ClinGen or writing to Redis."
+        ),
+    )
+    p.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -474,6 +522,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         max_workers=args.max_workers,
         skip=args.skip,
         limit=args.limit,
+        known_misses_file=args.known_misses_file,
     )
 
 

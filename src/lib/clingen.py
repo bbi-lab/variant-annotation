@@ -19,8 +19,8 @@ CLINGEN_503_BACKOFF_CAP = 60.0  # maximum per-attempt wait (seconds)
 
 CLINGEN_CACHE_REDIS_URL_DEFAULT = "redis://redis:6379/0"
 CLINGEN_CACHE_PREFIX_DEFAULT = "clingen:v1"
-CLINGEN_CACHE_TTL_SECONDS_DEFAULT = 86400 * 100
-CLINGEN_CACHE_MISS_TTL_SECONDS_DEFAULT = 86400
+CLINGEN_CACHE_TTL_SECONDS_DEFAULT = 86400 # 1 day
+CLINGEN_CACHE_MISS_TTL_SECONDS_DEFAULT = 86400 # 1 day
 
 _CACHE_MISS_SENTINEL = "__MISS__"
 _REDIS_CLIENT: Any = None
@@ -331,11 +331,16 @@ def query_clingen_by_hgvs(
     retry_delay: float = CLINGEN_RETRY_DELAY,
     *,
     log_404: bool = False,
+    known_misses: Optional[frozenset] = None,
 ) -> Optional[dict]:
     """Query ClinGen Allele Registry by HGVS string.
 
     HGVS lookups are cached in Redis as HGVS->allele_id mappings and allele
     responses are cached by allele ID.
+
+    If *known_misses* is supplied and the HGVS string is found there, the
+    function returns ``None`` immediately after the Redis check without making
+    an HTTP request and without writing a miss sentinel to Redis.
     """
     hgvs = (hgvs_string or "").strip()
     if not hgvs:
@@ -364,6 +369,10 @@ def query_clingen_by_hgvs(
             max_retries=max_retries,
             retry_delay=retry_delay,
         )
+
+    # Redis missed. Check known_misses before making an HTTP request.
+    if known_misses and hgvs in known_misses:
+        return None
 
     for attempt in range(max_retries):
         try:
