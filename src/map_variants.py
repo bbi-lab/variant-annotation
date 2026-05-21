@@ -844,6 +844,11 @@ def _process_case1_batch(
 
         assay_level_hgvs = raw
         if fetch_clingen_genomic_hgvs is not None:
+            # fetch_clingen_genomic_hgvs is a synchronous dcd_mapping call that
+            # itself hits ClinGen internally.  We don't control its concurrency,
+            # so these normalization calls are sequential.  The subsequent
+            # ClinGen Allele Registry lookups (for hgvs_g/c/p and allele ID) are
+            # batched concurrently below via _query_clingen_by_hgvs_batch.
             assay_level_hgvs = fetch_clingen_genomic_hgvs(raw)
 
         if assay_level_hgvs is None:

@@ -187,6 +187,31 @@ These options are consumed by `run_map_variants.sh` and are not passed to the Py
 
 ---
 
+## ClinGen query batching
+
+ClinGen Allele Registry queries are issued concurrently within each processing
+unit to reduce wall-clock time.
+
+| Case | What is batched |
+|---|---|
+| **1** (reference-based) | After `fetch_clingen_genomic_hgvs` resolves each assay-level HGVS (sequentially — this is a synchronous `dcd_mapping` call), all unique assay-level strings in the input chunk are collected and queried concurrently. |
+| **2** (sequence-based) | After `dcd_mapping` completes for the whole group, all unique assay-level strings are collected and queried concurrently. |
+| **3** (protein-only) | Same as case 2 — batched after the group's DCD pipeline run finishes. |
+
+The `--max-clingen-concurrency` option (default: 5) sets the `asyncio.Semaphore`
+limit — the maximum number of in-flight HTTP requests at any moment. Lower values
+reduce the chance of hitting ClinGen rate limits; higher values reduce wall time
+on fast networks.
+
+Debug logs show per-group batch timing when `--log-level DEBUG` is set:
+
+```
+DEBUG: Batch querying ClinGen for 47 variants in group 'TP53' (transcript: NM_000546.6)
+DEBUG: ClinGen batch query completed for 47 variants in 9.45 seconds
+```
+
+---
+
 ## Dependencies
 
 ### Always required
