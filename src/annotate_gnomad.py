@@ -1448,10 +1448,10 @@ def annotate_row(
         an_values.append(str(rec.allele_number))
         faf95_values.append("" if rec.faf95_max is None else str(rec.faf95_max))
         faf95_anc_values.append(rec.faf95_max_ancestry)
-        filters_values.append(rec.filters)
+        filters_values.append(rec.filters.replace('|', '^'))
         exome_filters_values.append(rec.exome_filters.replace('|', '^'))
-        genome_filters_values.append(rec.genome_filters)
-        gene_symbols_values.append(rec.gene_symbols)
+        genome_filters_values.append(rec.genome_filters.replace('|', '^'))
+        gene_symbols_values.append(rec.gene_symbols.replace('|', '^'))
 
     out[f"{col_prefix}.minor_allele_frequency"] = "|".join(minor_af_values)
     out[f"{col_prefix}.allele_frequency"] = "|".join(af_values)
