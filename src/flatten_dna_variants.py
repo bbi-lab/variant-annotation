@@ -73,7 +73,8 @@ def get_dna_variant_columns(df: pd.DataFrame) -> List[str]:
         "gnomad.",
         "mutpred2.",
         "spliceai.",
-        "revel."
+        "revel.",
+        "vep",
     )
 
     # Add any columns with annotation prefixes

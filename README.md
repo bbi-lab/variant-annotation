@@ -588,7 +588,7 @@ src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
 
 See [docs/flatten_dna_variants.md](docs/flatten_dna_variants.md) for full reference documentation including column auto-detection logic and troubleshooting. This is useful when you want one row per DNA variant instead of pipe-delimited lists.
 
-**Input columns:** `mapped_hgvs_g`, `mapped_hgvs_c`, `dna_clingen_allele_id`, and any annotation columns (spliceai.*, clinvar.*, gnomad.*)
+**Input columns:** `mapped_hgvs_g`, `mapped_hgvs_c`, `dna_clingen_allele_id`, and any annotation columns (`spliceai.*`, `clinvar.*`, `gnomad.*`, `vep.*`)
 
 **Output columns:** All input columns, with pipe-delimited columns expanded to one row per candidate
 
