@@ -10,10 +10,11 @@ Annotates each variant row with a mutational consequence term from the Ensembl V
 
 | Column | Description |
 |---|---|
-| `vep.mutational_consequence` | Sequence Ontology consequence term (e.g. `missense_variant`, `synonymous_variant`). Empty when candidates disagree or VEP returned nothing. |
-| `vep.consequence_source` | `transcript` — consequence taken from the matched `transcript_consequences` entry; `most_severe` — global fallback |
-| `vep.access_date` | ISO date the Ensembl API was queried (or the date from a cache hit) |
-| `vep.error` | Non-empty when resolved candidates disagree; contains a pipe-delimited consequence list aligned to input candidates |
+| `vep.mutational_consequences` | `^`-delimited list of all consequence terms when the result came from a matched transcript entry; single most-severe term otherwise. Pipe-delimited across candidates. Empty string for a candidate with an API error. |
+| `vep.most_severe_mutational_consequence` | Single most-severe consequence term per candidate. Pipe-delimited across candidates. Empty string for a candidate with an API error. |
+| `vep.consequence_source` | `transcript` or `most_severe` per candidate; empty string when the candidate had an API error. Pipe-delimited across candidates. |
+| `vep.access_date` | ISO date the Ensembl API was queried (or the date from a cache hit). Single shared value for the row. |
+| `vep.error` | Per-candidate API error message (`api_error` or `api_error:<sanitized detail>`) when the candidate's request failed; empty string otherwise. Pipe-delimited across candidates. |
 
 The namespace prefix defaults to `vep` and can be changed with `--vep-namespace`.
 
@@ -55,17 +56,18 @@ When multiple consequence terms are present (e.g. from `transcript_consequences`
 
 ## Multi-candidate rows
 
-For rows with pipe-delimited HGVS candidates (from step 2 reverse translation):
+For rows with pipe-delimited HGVS candidates (from step 2 reverse translation), each candidate is resolved independently. All output columns are pipe-delimited with one value per candidate position in the same order as the input.
 
-- Each candidate is resolved independently.
-- If all resolved candidates agree (or only some candidates failed to resolve), `vep.mutational_consequence` contains the single agreed consequence.
-- If resolved candidates return **different** consequences, `vep.mutational_consequence` is left empty and `vep.error` records the discrepancy as a pipe-delimited list aligned to the candidate positions.
+- `vep.mutational_consequences`: `^`-delimited consequence terms for transcript HGVS candidates (`source == "transcript"`), or the single most-severe term for genomic/protein inputs. Empty string for a candidate with an API error.
+- `vep.most_severe_mutational_consequence`: single most-severe term per candidate; empty string on API error.
+- `vep.consequence_source`: `transcript` or `most_severe` per candidate; empty string on API error.
+- `vep.error`: `api_error` or `api_error:<sanitized message>` for candidates whose API request failed; empty string otherwise.
 
 ---
 
 ## Redis caching
 
-VEP API responses are cached in Redis as `(consequence, source)` pairs per HGVS string. Misses (VEP returned nothing) are stored under a sentinel so repeated no-hit queries don't re-query the API. API errors are not cached and will be retried.
+VEP API responses are cached in Redis as `(most_severe, all_consequences, source)` triples per HGVS string. Misses (VEP returned nothing) are stored under a sentinel so repeated no-hit queries don't re-query the API. API errors are not cached and will be retried. Cache entries from prior versions that lack the `all_consequences` field are silently discarded on read and re-queried.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -88,8 +90,7 @@ VEP API responses are cached in Redis as `(consequence, source)` pairs per HGVS 
 | `--vep-workers N` | `VEP_WORKERS` | `8` | Concurrent VEP/Recoder batch requests |
 | `--row-batch-size N` | `VEP_ROW_BATCH_SIZE` | `1000` | Input rows per lookup/write batch |
 | `--vep-timeout-seconds N` | `VEP_TIMEOUT_SECONDS` | `60` | HTTP timeout per API request |
-| `--keep-existing` | — | off | Skip rows already annotated (non-empty `vep.mutational_consequence`); only annotate blank rows |
-| `--vep-cache-file FILE` | — | — | Path to a pre-computed TSV fallback cache (columns: `hgvs`, `vep.mutational_consequence`, `vep.access_date`, `vep.error`); rows with non-empty `vep.error` are ignored |
+| `--keep-existing` | — | off | Skip rows already annotated (non-empty `vep.most_severe_mutational_consequence`); only annotate blank rows |
 | `--skip N` | — | `0` | Skip first N data rows |
 | `--limit N` | — | no limit | Stop after N rows |
 | `--log-level` | — | `INFO` | Logging verbosity |
@@ -127,12 +128,9 @@ src/scripts/run_annotate_vep.sh input.tsv output.tsv \
 
 ## Troubleshooting
 
-**Many rows with empty `vep.mutational_consequence` and non-empty `vep.error`**
-
-Pipe-delimited candidates disagree on consequence. This is expected for protein-derived rows where one synonymous codon causes a `synonymous_variant` and another a `splice_region_variant`. Check the discrepant consequences in `vep.error` and decide whether to post-filter.
-
 **`api_error` entries on every run**
 
+- The `vep.error` column now includes the HTTP status and response excerpt (e.g. `api_error:VEP HTTP 503: ...`) to identify the specific failure.
 - Ensembl REST API may be under maintenance or rate-limiting. Check `https://rest.ensembl.org` directly.
 - Reduce `--vep-workers` or increase `--vep-timeout-seconds`.
 - `api_error` entries are never cached, so they are always retried. Use `--keep-existing` to skip already-annotated rows and only retry the blanks.

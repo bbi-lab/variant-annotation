@@ -494,7 +494,7 @@ See [docs/annotate_vep.md](docs/annotate_vep.md) for full reference documentatio
 
 **Input columns:** `mapped_hgvs_c` (preferred), `mapped_hgvs_g`, `mapped_hgvs_p`
 
-**Output columns:** `vep.mutational_consequence`, `vep.consequence_source`, `vep.access_date`, `vep.error`
+**Output columns:** `vep.mutational_consequences`, `vep.most_severe_mutational_consequence`, `vep.consequence_source`, `vep.access_date`, `vep.error`
 
 **Command:**
 ```bash
@@ -503,10 +503,10 @@ src/scripts/run_annotate_vep.sh annotated.tsv annotated_vep.tsv
 
 **Notes:**
 - Uses Ensembl REST API endpoints `/vep/human/hgvs` and `/variant_recoder/human`.
-- For multi-candidate rows, each candidate is checked independently.
-- If all resolved candidates agree, `vep.mutational_consequence` contains one value.
-- If resolved candidates disagree, `vep.mutational_consequence` is blank and `vep.error` contains a pipe-delimited consequence list aligned to DNA candidates.
-- If a candidate does not return from VEP, it is treated as matching the shared row consequence when all other resolved candidates agree.
+- For multi-candidate rows, each candidate is resolved independently; all output columns are pipe-delimited per candidate position.
+- `vep.mutational_consequences` contains `^`-delimited consequence terms for transcript HGVS candidates, or the single most-severe term for genomic/protein inputs.
+- `vep.most_severe_mutational_consequence` always contains a single term per candidate.
+- `vep.error` is pipe-delimited per candidate and contains the API error message (e.g. `api_error:VEP HTTP 503: ...`) when a candidate's request failed; empty string otherwise.
 - Output rows are streamed in input order and support `--skip` / `--limit`.
 
 **Transcript selection:**
@@ -528,7 +528,7 @@ When no matching transcript entry is found (e.g. the transcript version is not i
 
 **Redis caching:**
 
-VEP API responses are cached in Redis as `(consequence, source)` pairs per HGVS string. On subsequent runs, cached results are used directly without re-querying Ensembl. Caching is enabled automatically when the Redis service is reachable and fails gracefully when it is not.
+VEP API responses are cached in Redis as `(most_severe, all_consequences, source)` triples per HGVS string. On subsequent runs, cached results are used directly without re-querying Ensembl. Caching is enabled automatically when the Redis service is reachable and fails gracefully when it is not.
 
 | Variable | Default | Description |
 |---|---|---|
