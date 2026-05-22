@@ -152,11 +152,12 @@ Key differences:
 | | MaveDB | This pipeline |
 |---|---|---|
 | Consequence selection | Always `most_severe_consequence` (global worst across all transcripts at the locus) | Transcript-specific when input is `NM_`/`NR_`/`ENST` HGVS; falls back to `most_severe_consequence` otherwise |
+| Output consequence columns | Single consequence term (stored in the database, no named TSV column) | `vep.most_severe_mutational_consequence` (single most-severe term per candidate) + `vep.mutational_consequences` (`^`-delimited full list of terms from the matched transcript entry; single most-severe term otherwise) |
 | RefSeq transcript handling | Not distinguished from genomic HGVS | Sends `refseq=1` flag for `NM_`/`NR_` inputs so `transcript_consequences` uses RefSeq IDs |
 | `vep.consequence_source` output column | Not produced | `transcript` when a matched transcript entry was used; `most_severe` for global fallback |
 | HGVS input priority | Single HGVS string per variant | Configurable column list (`--hgvs-cols`); default `mapped_hgvs_c,mapped_hgvs_g,mapped_hgvs_p` — transcript HGVS tried first |
-| Multi-candidate rows | Not applicable | Each pipe-delimited candidate resolved independently; discrepancies recorded in `vep.error` |
-| Redis cache structure | Consequence string only | `(consequence, source)` pair; misses stored as explicit sentinel; API errors skipped (never cached) |
+| Multi-candidate rows | Not applicable | Each pipe-delimited candidate resolved independently; all output columns pipe-delimited per candidate; `vep.error` contains per-candidate API error messages (e.g. `api_error:VEP HTTP 503: …`) |
+| Redis cache structure | Consequence string only | `(most_severe, all_consequences, source)` triple; misses stored as explicit sentinel; API errors skipped (never cached); entries from the prior `(consequence, source)` format (missing `all_consequences`) are silently discarded on read and re-queried |
 | Resume support | Not built-in | `--keep-existing` skips rows with an existing non-empty annotation |
 
 ### Why transcript specificity matters
