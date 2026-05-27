@@ -368,6 +368,7 @@ def test_map_variants_targets_file_unknown_name_logs_warning(tmp_path, monkeypat
         ("NM_000001.1:c.123A>G", "", 1),
         ("ENST00000316054.9:c.1142G>A", "", 1),
         ("c.123A>G", "", 2),
+        ("not_an_accession:c.123A>G", "", 2),
         ("", "p.Ala1Val", 3),
         ("", "", None),
         ("_wt", "", None),
@@ -423,6 +424,28 @@ def test_normalize_protein_hgvs(input_hgvs, expected):
     assert mv.normalize_protein_hgvs(input_hgvs) == expected
 
 
+@pytest.mark.parametrize(
+    "input_hgvs,expected",
+    [
+        ("A334C", "p.Ala334Cys"),
+        ("Ala334Cys", "p.Ala334Cys"),
+        ("A334*", "p.Ala334Ter"),
+        ("A334Ter", "p.Ala334Ter"),
+        ("A334-", "p.Ala334del"),
+        ("A334del", "p.Ala334del"),
+        ("A334=", "p.Ala334Ala"),
+        ("NP_000001.1:A334C", "NP_000001.1:p.Ala334Cys"),
+    ],
+)
+def test_normalize_protein_hgvs_input_without_prefix(input_hgvs, expected):
+    assert mv.normalize_protein_hgvs_input(input_hgvs, allow_missing_prefix=True) == expected
+
+
+def test_normalize_nucleotide_hgvs_input_without_prefix():
+    assert mv.normalize_nucleotide_hgvs_input("123A>G", allow_missing_prefix=True) == "c.123A>G"
+    assert mv.normalize_nucleotide_hgvs_input("[1A>G;3G>T]", allow_missing_prefix=True) == "c.[1A>G;3G>T]"
+
+
 def test_map_variants_normalizes_raw_hgvs_pro_in_output(tmp_path, monkeypatch):
     """1-letter p. strings are normalized to 3-letter in the output row."""
     input_path = tmp_path / "in.tsv"
@@ -456,6 +479,54 @@ def test_map_variants_normalizes_raw_hgvs_pro_in_output(tmp_path, monkeypatch):
 
     out_rows = _read_tsv(output_path)
     assert out_rows[0]["raw_hgvs_pro"] == "p.Ala300Thr"
+
+
+def test_map_variants_normalize_hgvs_accepts_no_prefix_protein_and_nt(tmp_path, monkeypatch):
+    input_path = tmp_path / "in.tsv"
+    output_path = tmp_path / "out.tsv"
+
+    with open(input_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["variant_urn", "raw_hgvs_nt", "raw_hgvs_pro", "target_sequence"],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        writer.writerow(
+            {"variant_urn": "v_case2", "raw_hgvs_nt": "123A>G", "raw_hgvs_pro": "", "target_sequence": "SEQ_A"}
+        )
+        writer.writerow(
+            {"variant_urn": "v_case3", "raw_hgvs_nt": "", "raw_hgvs_pro": "A334C", "target_sequence": "SEQ_A"}
+        )
+
+    seen_entries = []
+
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+        seen_entries.extend(row_entries)
+        return [
+            (orig_idx, f"NC_000001.11:g.{orig_idx + 1}A>G", None, None, None)
+            for orig_idx, *_ in row_entries
+        ], "NM_1", None
+
+    async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
+        return {h: {"hgvs": h, "id": "CA1"} for h in hgvs_strings}
+
+    monkeypatch.setattr(mv, "_try_import_dcd_mapping", lambda: object())
+    monkeypatch.setattr(mv, "_run_dcd_mapping_pipeline", fake_pipeline)
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs_batch", fake_clingen_batch)
+    monkeypatch.setattr(mv, "_extract_hgvs_from_clingen", lambda data, tx: (data["hgvs"], None, None))
+    monkeypatch.setattr(mv, "_extract_clingen_allele_id", lambda data: data.get("id"))
+    monkeypatch.setattr(mv, "_clingen_allele_type", lambda data: "CA")
+
+    mv.map_variants(str(input_path), str(output_path), normalize_hgvs=True)
+
+    out_rows = _read_tsv(output_path)
+    assert out_rows[0]["raw_hgvs_nt"] == "c.123A>G"
+    assert out_rows[1]["raw_hgvs_pro"] == "p.Ala334Cys"
+
+    by_idx = {orig_idx: (hgvs_nt, hgvs_pro, case) for orig_idx, hgvs_nt, hgvs_pro, case in seen_entries}
+    assert by_idx[0] == ("c.123A>G", "", 2)
+    assert by_idx[1] == ("", "p.Ala334Cys", 3)
 
 
 # ---------------------------------------------------------------------------

@@ -237,6 +237,8 @@ _AA1_TO_AA3: dict[str, str] = {
     "S": "Ser", "T": "Thr", "V": "Val", "W": "Trp", "Y": "Tyr",
 }
 
+_AA3_CANONICAL = frozenset(_AA1_TO_AA3.values())
+
 # Matches a 1-letter-coded HGVS p. expression:
 #   p.{REF1}{POS}{ALT_TOKEN}{SUFFIX}
 # Multi-character keywords (del, ins, dup, etc.) are tried before single-char
@@ -248,6 +250,17 @@ _HGVS_P_1LETTER_RE = re.compile(
     r"^(?P<prefix>.*?p\.)(?P<ref>[A-Z])(?P<pos>\d+)"
     r"(?P<alt>del|ins|dup|ext|fs|[A-Z*=\-])"
     r"(?P<suffix>.*)$"
+)
+
+_HGVS_P_BODY_RE = re.compile(
+    r"^(?P<ref>[A-Z]|[A-Z][a-z]{2})(?P<pos>\d+)"
+    r"(?P<alt>Ter|del|[A-Z][a-z]{2}|\*|\-|=|[A-Z])"
+    r"(?P<suffix>.*)$"
+)
+
+_CASE1_RAW_HGVS_NT_RE = re.compile(
+    r"^(?P<accession>[^:\s]+):(?P<body>[cngm]\.\S+)$",
+    re.IGNORECASE,
 )
 
 # Matches bare c.-haplotype expressions for case-2 rows, for example
@@ -298,6 +311,102 @@ def normalize_protein_hgvs(hgvs: str) -> str:
     return f"{m.group('prefix')}{ref3}{m.group('pos')}{alt_out}{m.group('suffix')}"
 
 
+def _normalize_aa3_token(token: str) -> Optional[str]:
+    """Return a canonical 3-letter amino-acid token, or None if invalid."""
+    token_stripped = (token or "").strip()
+    if len(token_stripped) != 3:
+        return None
+    canonical = token_stripped[0].upper() + token_stripped[1:].lower()
+    return canonical if canonical in _AA3_CANONICAL else None
+
+
+def _normalize_protein_hgvs_body(text: str) -> Optional[str]:
+    """Normalize a protein HGVS body like ``A334C`` or ``Ala334Cys``.
+
+    Returns a canonical 3-letter HGVS body (for example ``Ala334Cys``) when
+    the input is recognized. Returns None when the pattern is unsupported.
+    """
+    m = _HGVS_P_BODY_RE.match((text or "").strip())
+    if m is None:
+        return None
+
+    ref_token = m.group("ref")
+    if len(ref_token) == 1:
+        ref3 = _AA1_TO_AA3.get(ref_token)
+    else:
+        ref3 = _normalize_aa3_token(ref_token)
+    if ref3 is None:
+        return None
+
+    alt = m.group("alt")
+    alt_out: Optional[str]
+    if alt == "=":
+        alt_out = ref3
+    elif alt in {"*", "Ter"}:
+        alt_out = "Ter"
+    elif alt in {"-", "del"}:
+        alt_out = "del"
+    elif len(alt) == 1:
+        alt_out = _AA1_TO_AA3.get(alt)
+    else:
+        alt_out = _normalize_aa3_token(alt)
+
+    if alt_out is None:
+        return None
+    return f"{ref3}{m.group('pos')}{alt_out}{m.group('suffix')}"
+
+
+def normalize_protein_hgvs_input(hgvs: str, allow_missing_prefix: bool = False) -> str:
+    """Normalize a raw protein HGVS input string.
+
+    When *allow_missing_prefix* is True, accepts protein HGVS without ``p.``
+    (for example ``A334C`` or ``Ala334Cys``) and adds the ``p.`` prefix.
+    """
+    text = (hgvs or "").strip()
+    if not text:
+        return text
+
+    normalized = normalize_protein_hgvs(text)
+    if normalized != text:
+        return normalized
+
+    if not allow_missing_prefix:
+        return text
+
+    accession_prefix = ""
+    body = text
+    colon = text.find(":")
+    if colon >= 0:
+        accession_prefix = text[: colon + 1]
+        body = text[colon + 1 :]
+
+    body = body.strip()
+    if body.lower().startswith("p."):
+        normalized_with_p = normalize_protein_hgvs(f"{accession_prefix}{body}")
+        return normalized_with_p
+
+    normalized_body = _normalize_protein_hgvs_body(body)
+    if normalized_body is None:
+        return text
+    return f"{accession_prefix}p.{normalized_body}"
+
+
+def normalize_nucleotide_hgvs_input(hgvs: str, allow_missing_prefix: bool = False) -> str:
+    """Normalize a raw nucleotide HGVS input string for case-2 style values."""
+    text = (hgvs or "").strip()
+    if not text or not allow_missing_prefix:
+        return text
+    if ":" in text:
+        return text
+    if re.match(r"^[cngmn]\\.", text, flags=re.IGNORECASE):
+        return text
+    # Heuristic: values starting with coordinates/haplotype syntax are treated as
+    # bare case-2 nucleotide expressions and promoted to c.-prefixed HGVS.
+    if re.match(r"^[\d\*\-\[]", text):
+        return f"c.{text}"
+    return text
+
+
 # Sentinel values that should be treated as "no data" for HGVS columns.
 _HGVS_BLANK_SENTINELS = frozenset({"", "NA", "N/A", "None", "none", "_wt", "_sy", "="})
 
@@ -315,6 +424,17 @@ def _has_transcript_reference(hgvs: str) -> bool:
     return ":" in hgvs.strip()
 
 
+def _is_valid_case1_raw_hgvs_nt(hgvs: str) -> bool:
+    """Return True only for fully qualified transcript/genomic HGVS strings."""
+    text = (hgvs or "").strip()
+    m = _CASE1_RAW_HGVS_NT_RE.match(text)
+    if m is None:
+        return False
+    accession = m.group("accession")
+    # Require a reference-sequence-like accession token (for example NM_/NC_/ENST).
+    return bool(re.match(r"^(?:[A-Z]{2}_[0-9]+(?:\.[0-9]+)?|ENST[0-9]+(?:\.[0-9]+)?)$", accession))
+
+
 def _detect_case(raw_nt: Optional[str], raw_pro: Optional[str]) -> Optional[int]:
     """Return the handling category (1, 2, 3) for a variant row, or None.
 
@@ -326,7 +446,7 @@ def _detect_case(raw_nt: Optional[str], raw_pro: Optional[str]) -> Optional[int]
     raw_nt_text = raw_nt or ""
     raw_pro_text = raw_pro or ""
     if not _is_blank(raw_nt_text):
-        return 1 if _has_transcript_reference(raw_nt_text.strip()) else 2
+        return 1 if _is_valid_case1_raw_hgvs_nt(raw_nt_text.strip()) else 2
     if not _is_blank(raw_pro_text):
         return 3
     return None
@@ -1594,6 +1714,7 @@ def map_variants(
     preserve_order: str = "groups",
     merge_existing_files: tuple[str, ...] = (),
     merge_match_columns: tuple[str, ...] = (),
+    normalize_hgvs: bool = False,
 ) -> None:
     """Map variants in *input_file* to human-genome reference HGVS strings.
 
@@ -1637,6 +1758,9 @@ def map_variants(
             skipped from fresh processing.
         merge_match_columns: Additional columns that must match for merge reuse,
             in addition to ``raw_hgvs_nt_col`` and ``raw_hgvs_pro_col``.
+        normalize_hgvs: If True, normalize relaxed case-2/3 HGVS inputs before
+            case detection and mapping (for example ``A334C`` -> ``p.Ala334Cys``;
+            ``123A>G`` -> ``c.123A>G``).
         preserve_order: Order guarantee for output rows. Options are:
             'no': Write immediately as results arrive; groups may appear
                 out-of-order. Fastest mode.
@@ -2138,13 +2262,26 @@ def map_variants(
                         if existing_value is None or not str(existing_value).strip():
                             row[col] = val
 
-            raw_nt = row.get(raw_hgvs_nt_col) or ""
-            raw_pro = row.get(raw_hgvs_pro_col) or ""
+            raw_nt = (row.get(raw_hgvs_nt_col) or "").strip()
+            raw_pro = (row.get(raw_hgvs_pro_col) or "").strip()
+
+            if raw_nt and not _is_blank(raw_nt):
+                normalized_nt = normalize_nucleotide_hgvs_input(
+                    raw_nt,
+                    allow_missing_prefix=normalize_hgvs,
+                )
+                if normalized_nt != raw_nt:
+                    raw_nt = normalized_nt
+                    row[raw_hgvs_nt_col] = normalized_nt
+
             if raw_pro and not _is_blank(raw_pro):
-                normalized = normalize_protein_hgvs(raw_pro)
-                if normalized != raw_pro:
-                    raw_pro = normalized
-                    row[raw_hgvs_pro_col] = normalized
+                normalized_pro = normalize_protein_hgvs_input(
+                    raw_pro,
+                    allow_missing_prefix=normalize_hgvs,
+                )
+                if normalized_pro != raw_pro:
+                    raw_pro = normalized_pro
+                    row[raw_hgvs_pro_col] = normalized_pro
 
             if existing_results_by_key:
                 merge_key = _build_merge_key(row, merge_key_columns)
@@ -2717,6 +2854,16 @@ def map_variants(
     help="Column name used to join the input file to --targets-file.",
 )
 @click.option(
+    "--normalize-hgvs/--no-normalize-hgvs",
+    "normalize_hgvs",
+    default=False,
+    show_default=True,
+    help=(
+        "Normalize relaxed HGVS inputs for cases 2/3 (no accession required). "
+        "Examples: A334C -> p.Ala334Cys, 123A>G -> c.123A>G."
+    ),
+)
+@click.option(
     "--verbose",
     "-v",
     is_flag=True,
@@ -2758,6 +2905,7 @@ def main(
     merge_match_columns: tuple[str, ...],
     targets_file: Optional[str],
     target_name_col: str,
+    normalize_hgvs: bool,
     verbose: bool,
     csv_field_size_limit: int,
 ) -> None:
@@ -2808,6 +2956,7 @@ def main(
         merge_match_columns=merge_match_columns,
         targets_file=targets_file,
         target_name_col=target_name_col,
+        normalize_hgvs=normalize_hgvs,
     )
 
 
