@@ -170,6 +170,20 @@ def _normalize_merge_value(value: Optional[str]) -> str:
     return (value or "").strip()
 
 
+def _normalize_group_key(raw_key: Optional[str], *, group_by_col: str, target_sequence_col: str) -> str:
+    """Normalize a grouping key to avoid accidental key fragmentation.
+
+    For sequence-based grouping (``group_by_col == target_sequence_col``), remove all
+    whitespace and uppercase so equivalent sequences with formatting/case differences
+    are batched together.
+    """
+    key = (raw_key or "").strip()
+    if group_by_col == target_sequence_col:
+        key = "".join(key.split())
+        key = key.upper()
+    return key
+
+
 def _build_merge_key(row: dict, key_columns: tuple[str, ...]) -> tuple[str, ...]:
     """Build a stable key tuple from *row* using *key_columns*."""
     return tuple(_normalize_merge_value(row.get(col)) for col in key_columns)
@@ -2120,7 +2134,8 @@ def map_variants(
                     for col, val in target_row.items():
                         if col == target_name_col:
                             continue
-                        if not row.get(col):
+                        existing_value = row.get(col)
+                        if existing_value is None or not str(existing_value).strip():
                             row[col] = val
 
             raw_nt = row.get(raw_hgvs_nt_col) or ""
@@ -2190,7 +2205,18 @@ def map_variants(
                         group_id=None,
                     )
                 else:
-                    group_key = (row.get(group_by_col) or target_seq).strip() or target_seq
+                    raw_group_key = row.get(group_by_col) or target_seq
+                    normalized_group_key = _normalize_group_key(
+                        raw_group_key,
+                        group_by_col=group_by_col,
+                        target_sequence_col=target_sequence_col,
+                    )
+                    fallback_group_key = _normalize_group_key(
+                        target_seq,
+                        group_by_col=group_by_col,
+                        target_sequence_col=target_sequence_col,
+                    )
+                    group_key = normalized_group_key or fallback_group_key
                     if idx < 10 or idx % PROGRESS_EVERY_ROWS == 0:
                         logger.debug("Row %d: case %d, group %r", idx, case, group_key)
                     if preserve_order == "groups":
