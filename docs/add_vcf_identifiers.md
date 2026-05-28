@@ -53,7 +53,7 @@ Blank or absent columns are silently skipped.
 |---|---|---|---|---|
 | `mapped_hgvs_g_chromosome` | ✓ | — | — | Chromosome number/letter (1–22, X, Y, M) extracted from NC_ accession |
 | `mapped_hgvs_c_transcript` | — | ✓ | — | Transcript accession extracted from the HGVS prefix |
-| `mapped_hgvs_p_chromosome` | — | — | ✓ | Protein accession extracted from the HGVS prefix |
+| `mapped_hgvs_p_protein` | — | — | ✓ | Protein accession extracted from the HGVS prefix |
 | `mapped_hgvs_*_start` | ✓ | ✓ | ✓ | Start position (1-based); left-shifted by 1 for deletions |
 | `mapped_hgvs_*_stop` | ✓ | ✓ | ✓ | Stop position (1-based; equals start for SNVs) |
 | `mapped_hgvs_*_ref` | ✓ | ✓ | ✓ | Reference allele; one-letter amino acid codes for protein |

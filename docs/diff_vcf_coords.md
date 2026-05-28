@@ -36,7 +36,7 @@ Output defaults to `<new_tsv_stem>.vcf_diffs.tsv` in the current directory.
 |---|---|
 | `genome` | `mapped_hgvs_g`, `mapped_hgvs_g_chromosome`, `mapped_hgvs_g_start`, `mapped_hgvs_g_stop`, `mapped_hgvs_g_ref`, `mapped_hgvs_g_alt` |
 | `transcript` | `mapped_hgvs_c`, `mapped_hgvs_c_transcript`, `mapped_hgvs_c_start`, `mapped_hgvs_c_stop`, `mapped_hgvs_c_ref`, `mapped_hgvs_c_alt` |
-| `protein` | `mapped_hgvs_p`, `mapped_hgvs_p_chromosome`, `mapped_hgvs_p_start`, `mapped_hgvs_p_stop`, `mapped_hgvs_p_ref`, `mapped_hgvs_p_alt` |
+| `protein` | `mapped_hgvs_p`, `mapped_hgvs_p_protein`, `mapped_hgvs_p_start`, `mapped_hgvs_p_stop`, `mapped_hgvs_p_ref`, `mapped_hgvs_p_alt` |
 
 Only columns present in both files are compared. Missing groups are silently skipped.
 

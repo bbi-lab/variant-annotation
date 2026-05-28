@@ -59,8 +59,8 @@ VCF_GROUPS = [
     (
         "protein",
         "mapped_hgvs_p",
-        "mapped_hgvs_p_chromosome",
-        "chromosome",
+        "mapped_hgvs_p_protein",
+        "protein",
         "mapped_hgvs_p_start",
         "mapped_hgvs_p_stop",
         "mapped_hgvs_p_ref",

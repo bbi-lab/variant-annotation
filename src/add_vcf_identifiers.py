@@ -790,7 +790,9 @@ def _annotate_row(
             refs.append("" if ref is None else ref)
             alts.append("" if alt is None else alt)
 
-        ref_id_col = f"{base_col}_transcript" if base_col == mapped_hgvs_c_col else f"{base_col}_chromosome"
+        ref_id_col = f"{base_col}_transcript" if base_col == mapped_hgvs_c_col else (
+            f"{base_col}_chromosome" if base_col == mapped_hgvs_g_col else f"{base_col}_protein"
+        )
         row[ref_id_col] = "|".join(ref_ids)
         row[f"{base_col}_start"] = "|".join(starts)
         row[f"{base_col}_stop"] = "|".join(stops)
@@ -849,7 +851,9 @@ def annotate_variants(
         fieldnames = list(reader.fieldnames)
 
         for base_col in (mapped_hgvs_g_col, mapped_hgvs_c_col, mapped_hgvs_p_col):
-            ref_id_col = f"{base_col}_transcript" if base_col == mapped_hgvs_c_col else f"{base_col}_chromosome"
+            ref_id_col = f"{base_col}_transcript" if base_col == mapped_hgvs_c_col else (
+                f"{base_col}_chromosome" if base_col == mapped_hgvs_g_col else f"{base_col}_protein"
+            )
             _set_or_append_fieldnames(fieldnames, ref_id_col)
             _set_or_append_fieldnames(fieldnames, f"{base_col}_start")
             _set_or_append_fieldnames(fieldnames, f"{base_col}_stop")
