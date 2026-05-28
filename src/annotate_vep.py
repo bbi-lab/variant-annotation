@@ -84,8 +84,10 @@ from itertools import islice
 import logging
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Any, Optional, TextIO
+from urllib.parse import urlsplit
 
 import json
 import requests  # type: ignore[import-untyped]
@@ -107,6 +109,14 @@ _VEP_MISS_SENTINEL = "__MISS__"
 _VEP_REDIS_CLIENT: Any = None
 _VEP_REDIS_INIT_ATTEMPTED = False
 _VEP_REDIS_UNAVAILABLE_LOGGED = False
+
+_UTA_CONN: Any = None
+_UTA_CONN_INIT_ATTEMPTED = False
+_UTA_CONN_UNAVAILABLE_LOGGED = False
+
+_C_DELINS_RE = re.compile(
+    r"^(?P<tx>[^:]+):c\.(?P<start>\d+)_(?P<stop>\d+)delins(?P<alt>[ACGTNacgtn]+)$"
+)
 
 # Ordered from most to least severe (mirrors MaveDB worker logic).
 VEP_CONSEQUENCES = [
@@ -165,6 +175,102 @@ def _sanitize_for_tsv(msg: str, max_length: int = 300) -> str:
     """Replace TSV/pipe-delimited field-breaking characters and truncate."""
     sanitized = msg.replace("|", ";").replace("\t", " ").replace("\r", "").replace("\n", " ").strip()
     return sanitized[:max_length] + ("..." if len(sanitized) > max_length else "")
+
+
+def _build_pg_connection_kwargs(database_url: str) -> dict[str, Any]:
+    parsed = urlsplit(database_url)
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if not path_parts:
+        raise RuntimeError(f"UTA_DB_URL is missing a database name: {database_url}")
+
+    kwargs: dict[str, Any] = {"dbname": path_parts[0]}
+    if parsed.hostname:
+        kwargs["host"] = parsed.hostname
+    if parsed.port:
+        kwargs["port"] = parsed.port
+    if parsed.username:
+        kwargs["user"] = parsed.username
+    if parsed.password:
+        kwargs["password"] = parsed.password
+    return kwargs
+
+
+def _get_uta_connection() -> Optional[Any]:
+    """Return a reusable psycopg2 connection to UTA, or None when unavailable."""
+    global _UTA_CONN
+    global _UTA_CONN_INIT_ATTEMPTED
+    global _UTA_CONN_UNAVAILABLE_LOGGED
+
+    if _UTA_CONN is not None:
+        return _UTA_CONN
+    if _UTA_CONN_INIT_ATTEMPTED:
+        return None
+
+    _UTA_CONN_INIT_ATTEMPTED = True
+    uta_db_url = (os.environ.get("UTA_DB_URL") or "").strip()
+    if not uta_db_url:
+        if not _UTA_CONN_UNAVAILABLE_LOGGED:
+            logger.warning("UTA_DB_URL not set; unchanged-variant no_change fallback disabled.")
+            _UTA_CONN_UNAVAILABLE_LOGGED = True
+        return None
+
+    try:
+        import psycopg2  # type: ignore[import-untyped]
+
+        _UTA_CONN = psycopg2.connect(**_build_pg_connection_kwargs(uta_db_url))
+        return _UTA_CONN
+    except Exception as exc:
+        if not _UTA_CONN_UNAVAILABLE_LOGGED:
+            logger.warning("Cannot connect to UTA; unchanged-variant no_change fallback disabled: %s", exc)
+            _UTA_CONN_UNAVAILABLE_LOGGED = True
+        return None
+
+
+def _lookup_transcript_ref_for_c_interval(transcript: str, c_start: int, c_stop: int) -> Optional[str]:
+    """Return transcript CDS ref sequence for c. interval [c_start, c_stop], or None."""
+    if c_start < 1 or c_stop < c_start:
+        return None
+    conn = _get_uta_connection()
+    if conn is None:
+        return None
+
+    length = c_stop - c_start + 1
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT SUBSTRING(s.seq FROM t.cds_start_i + %s FOR %s)
+                FROM uta_20241220.transcript t
+                JOIN uta_20241220.seq_anno sa ON sa.ac = t.ac
+                JOIN uta_20241220.seq s ON s.seq_id = sa.seq_id
+                WHERE t.ac = %s
+                LIMIT 1
+                """,
+                (c_start, length, transcript),
+            )
+            row = cursor.fetchone()
+    except Exception as exc:
+        logger.debug("UTA ref lookup failed for %s:c.%d_%d: %s", transcript, c_start, c_stop, exc)
+        return None
+
+    if row and row[0]:
+        ref = str(row[0]).upper()
+        if len(ref) == length:
+            return ref
+    return None
+
+
+def _is_unchanged_transcript_delins(hgvs: str) -> bool:
+    """Return True when transcript c. delins encodes no sequence change (ref == alt)."""
+    m = _C_DELINS_RE.match((hgvs or "").strip())
+    if not m:
+        return False
+    tx = m.group("tx")
+    c_start = int(m.group("start"))
+    c_stop = int(m.group("stop"))
+    alt = m.group("alt").upper()
+    ref = _lookup_transcript_ref_for_c_interval(tx, c_start, c_stop)
+    return ref is not None and ref == alt
 
 
 # ---------------------------------------------------------------------------
@@ -639,19 +745,37 @@ def annotate_row(
             continue
         cached = consequence_cache.get(hgvs)
         if cached is None:
-            consequences_values.append("")
-            most_severe_values.append("")
-            source_values.append("")
-            error_values.append("")
+            if _is_unchanged_transcript_delins(hgvs):
+                consequences_values.append("no_change")
+                most_severe_values.append("no_change")
+                source_values.append("no_change")
+                error_values.append("")
+            else:
+                consequences_values.append("")
+                most_severe_values.append("")
+                source_values.append("")
+                error_values.append("")
             continue
         most_severe, all_consequences, source = cached
         if source.startswith("api_error"):
-            consequences_values.append("")
-            most_severe_values.append("")
-            source_values.append("")
-            error_values.append(source)
+            if _is_unchanged_transcript_delins(hgvs):
+                consequences_values.append("no_change")
+                most_severe_values.append("no_change")
+                source_values.append("no_change")
+                error_values.append("")
+            else:
+                consequences_values.append("")
+                most_severe_values.append("")
+                source_values.append("")
+                error_values.append(source)
             continue
         most_severe_str = most_severe or ""
+        if not most_severe_str and _is_unchanged_transcript_delins(hgvs):
+            consequences_values.append("no_change")
+            most_severe_values.append("no_change")
+            source_values.append("no_change")
+            error_values.append("")
+            continue
         if source == "transcript" and all_consequences:
             sorted_terms = sorted(
                 all_consequences,

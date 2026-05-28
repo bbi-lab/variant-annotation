@@ -507,6 +507,7 @@ src/scripts/run_annotate_vep.sh annotated.tsv annotated_vep.tsv
 - For multi-candidate rows, each candidate is resolved independently; all output columns are pipe-delimited per candidate position.
 - `vep.mutational_consequences` contains `^`-delimited consequence terms for transcript HGVS candidates, or the single most-severe term for genomic/protein inputs.
 - `vep.most_severe_mutational_consequence` always contains a single term per candidate.
+- For transcript `c.delins` candidates where transcript reference sequence equals ALT (`ref == alt`), output is normalized to `no_change` (including `vep.consequence_source=no_change`) and `vep.error` is cleared.
 - `vep.error` is pipe-delimited per candidate and contains the API error message (e.g. `api_error:VEP HTTP 503: ...`) when a candidate's request failed; empty string otherwise.
 - Output rows are streamed in input order and support `--skip` / `--limit`.
 

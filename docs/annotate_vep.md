@@ -12,9 +12,9 @@ Annotates each variant row with a mutational consequence term from the Ensembl V
 |---|---|
 | `vep.mutational_consequences` | `^`-delimited list of all consequence terms when the result came from a matched transcript entry; single most-severe term otherwise. Pipe-delimited across candidates. Empty string for a candidate with an API error. |
 | `vep.most_severe_mutational_consequence` | Single most-severe consequence term per candidate. Pipe-delimited across candidates. Empty string for a candidate with an API error. |
-| `vep.consequence_source` | `transcript` or `most_severe` per candidate; empty string when the candidate had an API error. Pipe-delimited across candidates. |
+| `vep.consequence_source` | `transcript`, `most_severe`, or `no_change` per candidate; empty string when the candidate had an API error and no fallback applied. Pipe-delimited across candidates. |
 | `vep.access_date` | ISO date the Ensembl API was queried (or the date from a cache hit). Single shared value for the row. |
-| `vep.error` | Per-candidate API error message (`api_error` or `api_error:<sanitized detail>`) when the candidate's request failed; empty string otherwise. Pipe-delimited across candidates. |
+| `vep.error` | Per-candidate API error message (`api_error` or `api_error:<sanitized detail>`) when the candidate's request failed; empty string otherwise. Pipe-delimited across candidates. When `no_change` fallback is confirmed, this field is cleared. |
 
 The namespace prefix defaults to `vep` and can be changed with `--vep-namespace`.
 
@@ -34,6 +34,22 @@ This script selects the consequence for the specific input transcript when the i
 | Protein (`NP_`) / Recoder fallback | _(default)_ | `most_severe_consequence` used | `most_severe` |
 
 When no matching transcript entry is found (e.g. the transcript version is absent from Ensembl's RefSeq set), the script falls back to `most_severe_consequence` and records `most_severe` in `vep.consequence_source`.
+
+### Special `no_change` handling for unchanged transcript `c.delins`
+
+Some transcript HGVS strings represent no actual sequence change (for example, replacing a codon with the same codon) but can still trigger a VEP parse error. To avoid surfacing these as API failures, `annotate_vep` applies a special fallback:
+
+- Pattern: transcript-level `c.start_stopdelinsALT` (for example `NM_000133.4:c.1_3delinsATG`).
+- Verification: query UTA for the transcript CDS reference sequence at `start..stop` and compare to `ALT`.
+- If identical (`ref == alt`):
+  - `vep.mutational_consequences = no_change`
+  - `vep.most_severe_mutational_consequence = no_change`
+  - `vep.consequence_source = no_change`
+  - `vep.error = ""`
+
+This fallback is used when VEP returns an API error, returns no consequence, or returns no cache entry for that candidate.
+
+Prerequisite: `UTA_DB_URL` must be set and reachable from the runtime container/environment.
 
 **Column priority:** `mapped_hgvs_c` should appear before `mapped_hgvs_g` in `--hgvs-cols` (the default) because transcript HGVS strings yield transcript-specific consequences while genomic HGVS strings always yield `most_severe`.
 
@@ -60,8 +76,8 @@ For rows with pipe-delimited HGVS candidates (from step 2 reverse translation), 
 
 - `vep.mutational_consequences`: `^`-delimited consequence terms for transcript HGVS candidates (`source == "transcript"`), or the single most-severe term for genomic/protein inputs. Empty string for a candidate with an API error.
 - `vep.most_severe_mutational_consequence`: single most-severe term per candidate; empty string on API error.
-- `vep.consequence_source`: `transcript` or `most_severe` per candidate; empty string on API error.
-- `vep.error`: `api_error` or `api_error:<sanitized message>` for candidates whose API request failed; empty string otherwise.
+- `vep.consequence_source`: `transcript`, `most_severe`, or `no_change` per candidate; empty string on API error when no fallback applies.
+- `vep.error`: `api_error` or `api_error:<sanitized message>` for candidates whose API request failed; empty string otherwise. Cleared when `no_change` fallback applies.
 
 ---
 
