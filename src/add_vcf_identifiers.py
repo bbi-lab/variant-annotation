@@ -687,6 +687,38 @@ def _parse_hgvs(
 
     start, stop, ref, alt = _parse_nucleotide_hgvs(posedit)
 
+    # Handle unchanged ranges like g.7669639_7669641=.
+    # HGVS omits the literal sequence for '=', so populate ref/alt from reference
+    # sequence when possible; otherwise keep both unset so downstream VCF anchor
+    # logic does not misclassify this as a deletion.
+    if posedit.endswith("=") and start is not None and stop is not None and ref == "" and alt == "":
+        accession = _extract_accession_from_hgvs(hgvs_value)
+        resolved_equal_seq: Optional[str] = None
+        if accession:
+            try:
+                start_int = int(start)
+                stop_int = int(stop)
+            except (ValueError, TypeError):
+                start_int = 0
+                stop_int = -1
+
+            if start_int >= 1 and stop_int >= start_int:
+                if coord_type in {"g", "n"}:
+                    resolved_equal_seq = _fetch_ref_seq(accession, start_int, stop_int)
+                elif coord_type == "c":
+                    cds_start_i = _get_cds_start_i(accession)
+                    if cds_start_i is not None:
+                        tx_start = cds_start_i + start_int
+                        tx_stop = cds_start_i + stop_int
+                        resolved_equal_seq = _fetch_ref_seq(accession, tx_start, tx_stop)
+
+        if resolved_equal_seq:
+            ref = resolved_equal_seq
+            alt = resolved_equal_seq
+        else:
+            ref = None
+            alt = None
+
     if (
         resolve_missing_ref_alleles
         and coord_type in {"g", "c", "n"}

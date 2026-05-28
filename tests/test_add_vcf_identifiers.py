@@ -413,3 +413,36 @@ def test_dup_unresolved_not_treated_as_deletion_by_anchor(monkeypatch):
     assert ref2 is None or ref2 == ""
     assert alt2 is None or alt2 == ""
 
+
+def test_parse_hgvs_genomic_equal_resolves_ref_alt(monkeypatch):
+    """g.start_stop= should resolve to identical ref/alt sequence."""
+    monkeypatch.setattr(mod, "_fetch_ref_seq", lambda *_: "CAT")
+    start, stop, ref, alt, *_ = mod._parse_hgvs("NC_000017.11:g.7669639_7669641=")
+    assert start == "7669639"
+    assert stop == "7669641"
+    assert ref == "CAT"
+    assert alt == "CAT"
+
+
+def test_genomic_equal_not_misanchored_as_deletion(monkeypatch):
+    """Unchanged g.= variants must not be converted into deletion-style anchored VCF alleles."""
+    monkeypatch.setattr(mod, "_fetch_ref_seq", lambda *_: "CAT")
+    start, stop, ref, alt, *_ = mod._parse_hgvs("NC_000017.11:g.7669639_7669641=")
+    start2, stop2, ref2, alt2 = mod._apply_vcf_anchor(
+        "NC_000017.11:g.7669639_7669641=", start, stop, ref, alt
+    )
+    assert start2 == "7669639"
+    assert stop2 == "7669641"
+    assert ref2 == "CAT"
+    assert alt2 == "CAT"
+
+
+def test_parse_hgvs_genomic_equal_unresolved_keeps_empty_not_deletion(monkeypatch):
+    """If sequence lookup fails for g.=, keep alleles unset so anchor logic does not synthesize a deletion."""
+    monkeypatch.setattr(mod, "_fetch_ref_seq", lambda *_: None)
+    start, stop, ref, alt, *_ = mod._parse_hgvs("NC_000017.11:g.7669639_7669641=")
+    assert start == "7669639"
+    assert stop == "7669641"
+    assert ref is None
+    assert alt is None
+
