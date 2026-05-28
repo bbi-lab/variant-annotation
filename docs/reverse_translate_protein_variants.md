@@ -16,6 +16,14 @@ For each input row where `mapped_hgvs_p` is non-empty and both `mapped_hgvs_c` a
 4. Populates derived position/allele columns (`_start`, `_stop`, `_ref`, `_alt`, `touches_intronic_region`, `spans_intron`) for every candidate.
 5. Sets `assayed_variant_level` to `"protein"` for these rows.
 
+When `--wt-codon-mode` is enabled, rows with synonymous protein HGVS changes (for example `p.Met1Met` or `p.=`) can also receive an additional WT codon candidate in `mapped_hgvs_c` and `mapped_hgvs_g`:
+
+- `unambiguous`: only for amino acids with exactly one codon (Met = `ATG`, Trp = `TGG`)
+- `all`: for all synonymous rows, using UTA to look up the transcript's actual codon for multi-codon amino acids
+- `none` (default): no extra WT codon candidate is appended
+
+Any appended WT candidate is deduplicated against candidates already returned by the reverse-translation CLI.
+
 Rows that already have `mapped_hgvs_c` or `mapped_hgvs_g` (DNA variants from step 1) pass through unchanged; their derived columns are also populated, and `assayed_variant_level` is set to `"dna"`.
 
 ---
@@ -91,6 +99,7 @@ docker compose run --rm reverse-translate-protein-variants \
 |---|---|---|
 | `--include-indels` | off | Include small insertion/deletion candidates in addition to substitutions and delins |
 | `--max-indel-size N` | `3` | Maximum indel size (nt) when `--include-indels` is set |
+| `--wt-codon-mode {none,unambiguous,all}` | `none` | Append WT codon `c.`/`g.` candidates for synonymous protein variants (`ref AA == alt AA`). `unambiguous` adds only Met/Trp; `all` adds all and queries UTA for multi-codon residues. Requires `--include-indels`. |
 | `--no-strict-ref-aa` | off | Disable reference amino-acid validation against the resolved transcript sequence |
 | `--use-inv-notation` | off | Emit inversions using `inv` HGVS notation instead of `delins` |
 | `--substitutions-and-delins-only` | off | For premature-stop changes, suppress length-changing insertion/deletion candidates |
@@ -155,6 +164,8 @@ postgresql://uta_admin:uta@uta:5432/uta
 
 The Docker Compose service starts UTA automatically. If UTA is unreachable the script raises `RuntimeError` immediately.
 
+When `--wt-codon-mode all` is used, UTA is also queried for codon sequence lookup at the relevant CDS position for synonymous protein variants.
+
 ---
 
 ## Batching strategy
@@ -171,7 +182,7 @@ Check that:
 - `mapped_hgvs_p` uses three-letter amino acid codes (e.g. `p.Ala406Thr`, not `p.A406T`). `map_variants` converts one-letter codes automatically, but externally supplied HGVS may not be normalised.
 - A valid transcript accession is resolvable (check logs for "Unable to resolve transcript accession").
 - The amino acid change is valid for the transcript (`--no-strict-ref-aa` relaxes this check).
-- For synonymous (silent) variants (`p.=` or `p.Ala406=`), no candidate is produced — the protein is unchanged.
+- For synonymous (silent) variants (`p.=` or `p.Ala406=`), default behavior (`--wt-codon-mode none`) may return no candidate because the protein is unchanged. Enable `--wt-codon-mode unambiguous` or `--wt-codon-mode all` (with `--include-indels`) to emit WT codon delins candidates.
 
 **Many rows have `reverse_translation_error`**
 

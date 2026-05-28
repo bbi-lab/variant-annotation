@@ -22,6 +22,7 @@ import csv
 import io
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -267,6 +268,115 @@ def _split_hgvs_candidates(joined_hgvs: str) -> list[str]:
     return [part.strip() for part in text.split("|")]
 
 
+# ---------------------------------------------------------------------------
+# WT codon helpers
+# ---------------------------------------------------------------------------
+
+# Amino acids with exactly one codon: no synonymous variants possible.
+_WT_UNAMBIGUOUS_CODONS: dict[str, str] = {
+    "Met": "ATG",  # M
+    "Trp": "TGG",  # W
+}
+
+# Matches fully-written protein HGVS bodies like "p.Met1Met" or "p.Glu2Glu".
+# Also accepts the HGVS-standard synonymous shorthand "=" as the alt.
+# Works on a bare "p.Ref1Alt" string *or* on "accession:p.Ref1Alt".
+_P_HGVS_AA_CHANGE_RE = re.compile(
+    r"(?:^|:)p\.(?P<ref>[A-Z][a-z]{2})(?P<pos>\d+)(?P<alt>[A-Z][a-z]{2}|=)$"
+)
+
+
+def _parse_protein_hgvs_aa_change(hgvs_p: str) -> Optional[tuple[str, int, str]]:
+    """Return *(ref_aa3, position, alt_aa3)* from a protein HGVS string, or ``None``.
+
+    The returned *alt_aa3* is expanded from ``=`` to the reference amino acid when
+    the synonymous shorthand is used, so callers can compare ref and alt directly.
+    """
+    m = _P_HGVS_AA_CHANGE_RE.search((hgvs_p or "").strip())
+    if not m:
+        return None
+    ref_aa3 = m.group("ref")
+    pos = int(m.group("pos"))
+    alt_raw = m.group("alt")
+    alt_aa3 = ref_aa3 if alt_raw == "=" else alt_raw
+    return ref_aa3, pos, alt_aa3
+
+
+def _build_wt_c_hgvs(transcript: str, aa_position: int, codon: str) -> str:
+    """Return the transcript-level WT codon delins HGVS for *aa_position* (1-based).
+
+    Example: ``_build_wt_c_hgvs("NM_000001.1", 1, "ATG")`` → ``"NM_000001.1:c.1_3delinsATG"``
+    """
+    c_start = (aa_position - 1) * 3 + 1
+    c_stop = aa_position * 3
+    return f"{transcript}:c.{c_start}_{c_stop}delins{codon}"
+
+
+def _lookup_codon_from_uta(
+    transcript: str,
+    aa_position: int,
+    uta_connection: Any,
+) -> Optional[str]:
+    """Query UTA for the codon sequence at *aa_position* (1-based) in *transcript*.
+
+    Returns the 3-letter uppercase codon string, or ``None`` if it cannot be
+    determined (missing data, unexpected length, etc.).
+    """
+    cds_offset = (aa_position - 1) * 3
+    with uta_connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT SUBSTRING(s.seq FROM ti.cds_start_i + %s + 1 FOR 3)
+            FROM uta_20241220.tx_info ti
+            JOIN uta_20241220.seq_anno sa ON sa.ac = ti.ac
+            JOIN uta_20241220.seq s ON s.seq_id = sa.seq_id
+            WHERE ti.ac = %s
+            LIMIT 1
+            """,
+            (cds_offset, transcript),
+        )
+        row = cursor.fetchone()
+    if row and row[0] and len(row[0]) == 3:
+        return row[0].upper()
+    return None
+
+
+def _get_wt_codon_for_mode(
+    ref_aa3: str,
+    aa_position: int,
+    transcript: str,
+    wt_codon_mode: str,
+    uta_connection: Any,
+) -> Optional[str]:
+    """Return the WT codon for *ref_aa3* at *aa_position*, respecting *wt_codon_mode*.
+
+    * ``"unambiguous"`` – only Met (ATG) and Trp (TGG); returns ``None`` for all others.
+    * ``"all"``         – uses the hardcoded codon for Met/Trp; queries UTA for the rest.
+    * ``"none"``        – always returns ``None``.
+    """
+    if wt_codon_mode == "unambiguous":
+        return _WT_UNAMBIGUOUS_CODONS.get(ref_aa3)
+    if wt_codon_mode == "all":
+        if ref_aa3 in _WT_UNAMBIGUOUS_CODONS:
+            return _WT_UNAMBIGUOUS_CODONS[ref_aa3]
+        return _lookup_codon_from_uta(transcript, aa_position, uta_connection)
+    return None
+
+
+def _do_map_c_to_g(c_hgvs: str, hgvs_parser: Any, assembly_mapper: Any) -> Optional[str]:
+    """Map *c_hgvs* to a genomic g. HGVS string using the HGVS AssemblyMapper.
+
+    Returns ``None`` and logs a warning on failure (e.g. transcript not in UTA).
+    """
+    try:
+        c_var = hgvs_parser.parse_hgvs_variant(c_hgvs)
+        g_var = assembly_mapper.c_to_g(c_var)
+        return str(g_var)
+    except Exception as exc:
+        logger.warning("WT codon c→g mapping failed for %r: %s", c_hgvs, exc)
+        return None
+
+
 def _capture_hgvs_warnings():
     """Return a context manager that captures hgvs logger warnings."""
     class WarningCapture:
@@ -442,9 +552,18 @@ def reverse_translate_protein_variants(
     strict_ref_aa: bool = True,
     use_inv_notation: bool = False,
     allow_length_changing_stop_candidates: bool = True,
+    wt_codon_mode: str = "none",
     skip: int = 0,
     limit: int = 0,
 ) -> None:
+    if wt_codon_mode not in ("none", "unambiguous", "all"):
+        raise ValueError(f"wt_codon_mode must be 'none', 'unambiguous', or 'all'; got {wt_codon_mode!r}")
+    if wt_codon_mode != "none" and not include_indels:
+        raise ValueError(
+            "--wt-codon-mode requires --include-indels to be enabled, "
+            "because WT codon delins variants are intra-codon insertions/deletions."
+        )
+
     in_sep = _detect_separator(input_file)
     out_sep = _detect_separator(output_file)
     started = time.monotonic()
@@ -452,6 +571,28 @@ def reverse_translate_protein_variants(
     uta_db_url = (os.environ.get("UTA_DB_URL") or "").strip()
     if not uta_db_url:
         raise RuntimeError("UTA_DB_URL must be set for protein reverse translation.")
+
+    # Lazily-initialized HGVS AssemblyMapper used to map WT codon c. HGVS → g. HGVS.
+    # Captured by closure in flush_block.
+    _wt_hgvs_parser: Any = None
+    _wt_assembly_mapper: Any = None
+    if wt_codon_mode != "none":
+        try:
+            import hgvs.dataproviders.uta as _hgvs_uta  # type: ignore[import-untyped]
+            import hgvs.assemblymapper as _hgvs_am  # type: ignore[import-untyped]
+            import hgvs.parser as _hgvs_parser_module  # type: ignore[import-untyped]
+
+            _wt_hgvs_hdp = _hgvs_uta.connect(uta_db_url)
+            _wt_hgvs_parser = _hgvs_parser_module.Parser()
+            _wt_assembly_mapper = _hgvs_am.AssemblyMapper(
+                _wt_hgvs_hdp,
+                assembly_name=assembly,
+                alt_aln_method="splign",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Cannot initialise HGVS AssemblyMapper for WT codon c→g mapping: {exc}"
+            ) from exc
 
     def flush_block(
         writer: csv.DictWriter,
@@ -538,11 +679,37 @@ def reverse_translate_protein_variants(
             row = block_rows[offset]
             hgvs_c = (translated_row.get("hgvs_c") or "").strip()
             hgvs_g = (translated_row.get("hgvs_g") or "").strip()
-            row[mapped_hgvs_c_col] = hgvs_c
-            row[mapped_hgvs_g_col] = hgvs_g
             error_key = (input_row["transcript"], input_row["hgvs_p"])
             if error_messages_by_key[error_key]:
                 block_errors[offset] = error_messages_by_key[error_key].pop(0)
+
+            # WT codon handling: append a "c.N_Mdelins{codon}" candidate for
+            # protein variants where ref_aa == alt_aa (e.g. p.Met1Met).
+            if wt_codon_mode != "none":
+                protein_hgvs = (row.get(mapped_hgvs_p_col) or "").strip()
+                aa_change = _parse_protein_hgvs_aa_change(protein_hgvs)
+                if aa_change is not None:
+                    ref_aa3, aa_pos, alt_aa3 = aa_change
+                    if ref_aa3 == alt_aa3:
+                        codon = _get_wt_codon_for_mode(
+                            ref_aa3, aa_pos, input_row["transcript"], wt_codon_mode, uta_connection
+                        )
+                        if codon is not None:
+                            wt_c = _build_wt_c_hgvs(input_row["transcript"], aa_pos, codon)
+                            # Avoid adding a duplicate if the synonymous search already
+                            # returned the same codon (possible when mode is "all").
+                            if wt_c not in set(_split_hgvs_candidates(hgvs_c)):
+                                wt_g = (
+                                    _do_map_c_to_g(wt_c, _wt_hgvs_parser, _wt_assembly_mapper)
+                                    if _wt_assembly_mapper is not None
+                                    else None
+                                )
+                                hgvs_c = f"{hgvs_c}|{wt_c}" if hgvs_c else wt_c
+                                if wt_g:
+                                    hgvs_g = f"{hgvs_g}|{wt_g}" if hgvs_g else wt_g
+
+            row[mapped_hgvs_c_col] = hgvs_c
+            row[mapped_hgvs_g_col] = hgvs_g
             if not hgvs_c and not hgvs_g and not block_errors[offset]:
                 block_errors[offset] = "Reverse translation returned no candidate DNA variants"
 
@@ -759,6 +926,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="For premature stops, suppress length-changing insertion/deletion candidates.",
     )
     parser.add_argument(
+        "--wt-codon-mode",
+        dest="wt_codon_mode",
+        choices=["none", "unambiguous", "all"],
+        default="none",
+        help=(
+            "Generate WT codon delins candidates for wild-type protein variants "
+            "(where ref AA == alt AA, e.g. p.Met1Met). "
+            "'none' (default): synonymous variants only. "
+            "'unambiguous': also emit a WT delins for Met and Trp, which have only one codon each. "
+            "'all': also emit a WT delins for every WT protein variant, querying UTA for "
+            "the actual codon when the amino acid has multiple codons. "
+            "Requires --include-indels."
+        ),
+    )
+    parser.add_argument(
         "--skip",
         type=int,
         default=0,
@@ -824,6 +1006,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         strict_ref_aa=args.strict_ref_aa,
         use_inv_notation=args.use_inv_notation,
         allow_length_changing_stop_candidates=args.allow_length_changing_stop_candidates,
+        wt_codon_mode=args.wt_codon_mode,
         skip=args.skip,
         limit=args.limit,
     )

@@ -264,6 +264,7 @@ src/scripts/run_reverse_translate_protein_variants.sh output.tsv output_rt.tsv
 - Requires the `reverse-translate-variants` CLI (installed in the Docker image) and UTA database access
 - Use `--transcript-fallback-column raw_hgvs_nt` if the protein HGVS string lacks a transcript accession prefix
 - Use `--include-indels` to also generate small insertion/deletion candidates (off by default)
+- Use `--wt-codon-mode unambiguous` or `--wt-codon-mode all` (requires `--include-indels`) to append WT codon candidates for synonymous protein variants (`ref AA == alt AA`, e.g. `p.Met1Met`)
 - See [docs/reverse_translate_protein_variants.md](docs/reverse_translate_protein_variants.md) for all options, transcript resolution logic, and troubleshooting
 
 ### Step 3: Add DNA-Level ClinGen Allele IDs (Required for annotation)
