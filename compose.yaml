@@ -168,6 +168,18 @@ services:
       - .:/usr/src/app
       - ${VARIANT_DATA_DIR:-./data}:/work
 
+  remap-transcript-ids:
+    <<: *tools-image
+    profiles:
+      - tools
+    env_file:
+      - settings/.env
+    entrypoint: ["python", "-m", "src.remap_transcript_ids"]
+    command: ["--help"]
+    volumes:
+      - .:/usr/src/app
+      - ${VARIANT_DATA_DIR:-./data}:/work
+
   utilities:
     <<: *tools-image
     profiles:
