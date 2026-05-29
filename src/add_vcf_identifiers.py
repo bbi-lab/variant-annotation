@@ -822,22 +822,25 @@ def _annotate_row(
         row[f"{base_col}_ref"] = "|".join(refs)
         row[f"{base_col}_alt"] = "|".join(alts)
 
-    # touches_intronic_region / spans_intron: true if any c. candidate fires
+    # touches_intronic_region / spans_intron: per-candidate flags aligned to c. segments
     c_raw = row.get(mapped_hgvs_c_col) or ""
     c_segments = c_raw.split("|") if c_raw else [""]
-    touches_any = False
-    spans_any = False
+    touches_values: list[str] = []
+    spans_values: list[str] = []
     for seg in c_segments:
+        seg = seg.strip()
+        if not seg:
+            touches_values.append("")
+            spans_values.append("")
+            continue
         _, _, _, _, touches, spans, _ = _parse_hgvs(
-            seg or None,
+            seg,
             resolve_missing_ref_alleles=resolve_missing_ref_alleles,
         )
-        if touches:
-            touches_any = True
-        if spans:
-            spans_any = True
-    row[touches_intronic_region_col] = "true" if touches_any else "false"
-    row[spans_intron_col] = "true" if spans_any else "false"
+        touches_values.append("true" if touches else "false")
+        spans_values.append("true" if spans else "false")
+    row[touches_intronic_region_col] = "|".join(touches_values)
+    row[spans_intron_col] = "|".join(spans_values)
     return row_idx, row
 
 

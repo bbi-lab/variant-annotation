@@ -210,11 +210,52 @@ def test_pipe_delimited_hgvs_columns_produce_pipe_delimited_output(tmp_path):
     # Transcript column: two candidates
     assert row["mapped_hgvs_c_start"] == "4|5"
     assert row["mapped_hgvs_c_ref"] == "A|C"
+    assert row["touches_intronic_region"] == "false|false"
+    assert row["spans_intron"] == "false|false"
 
     # Protein column: single value, no pipe
     assert "|" not in row["mapped_hgvs_p_start"]
     assert row["mapped_hgvs_p_ref"] == "T"  # Thr -> T
     assert row["mapped_hgvs_p_alt"] == "S"  # Ser -> S
+
+
+def test_intronic_flags_are_pipe_aligned_and_preserve_empty_slots(tmp_path, monkeypatch):
+    inp = tmp_path / "in.tsv"
+    out = tmp_path / "out.tsv"
+
+    with open(inp, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["variant_urn", "mapped_hgvs_g", "mapped_hgvs_c", "mapped_hgvs_p"],
+            delimiter="\t",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerow({
+            "variant_urn": "v1",
+            "mapped_hgvs_g": "",
+            "mapped_hgvs_c": "NM_000001.1:c.76+1_77-1del||NM_000001.1:c.90A>G",
+            "mapped_hgvs_p": "",
+        })
+
+    original_parse_hgvs = mod._parse_hgvs
+
+    def fake_parse_hgvs(hgvs_value, resolve_missing_ref_alleles=False):
+        text = (hgvs_value or "").strip()
+        if text == "NM_000001.1:c.76+1_77-1del":
+            return "76+1", "77-1", "AG", "", True, True, "NM_000001.1"
+        if text == "NM_000001.1:c.90A>G":
+            return "90", "90", "A", "G", False, False, "NM_000001.1"
+        return original_parse_hgvs(hgvs_value, resolve_missing_ref_alleles=resolve_missing_ref_alleles)
+
+    monkeypatch.setattr(mod, "_parse_hgvs", fake_parse_hgvs)
+
+    mod.annotate_variants(str(inp), str(out), max_workers=1)
+
+    rows = _read_tsv(out)
+    row = rows[0]
+    assert row["touches_intronic_region"] == "true||false"
+    assert row["spans_intron"] == "true||false"
 
 
 # ---------------------------------------------------------------------------

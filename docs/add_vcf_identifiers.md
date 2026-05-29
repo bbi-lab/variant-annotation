@@ -18,7 +18,7 @@ For each input row the script:
 4. Converts inversions to the reverse-complement sequence.
 5. Writes pipe-delimited strings of the extracted values as new output columns.
 6. Resolves missing `ref` alleles for `del`/`delins`/`dup`/`inv` variants where no sequence was supplied in the HGVS string, by querying UTA via the `hgvs` Python library.
-7. Sets per-row boolean flags `touches_intronic_region` and `spans_intron` — both are `"true"` if **any** transcript candidate is intronic or spans an intron boundary.
+7. Sets pipe-delimited per-candidate flags `touches_intronic_region` and `spans_intron`, aligned to transcript candidates.
 
 ---
 
@@ -26,9 +26,8 @@ For each input row the script:
 
 `reverse_translate_protein_variants` (step 2) imports `_parse_hgvs` and `_apply_vcf_anchor` from this module and writes the same derived columns for every row as part of its processing. If you run step 2, the derived position columns will already exist in the output.
 
-Step 4 re-computes these columns. Two differences to be aware of:
+Step 4 re-computes these columns. One difference to be aware of:
 
-- **`touches_intronic_region` / `spans_intron`:** step 2 writes these as *pipe-delimited* per-candidate flags. Step 4 collapses them to a single `"true"` / `"false"` per row (True if any candidate fires). Running step 4 after step 2 overwrites the per-candidate flags with the row-level flags.
 - **`--resolve-missing-ref-alleles`:** step 4 always enables this from the CLI (default True). Step 2 also enables it by default. Results should be identical but the code paths are separate.
 
 If you have no protein-only rows, step 2 was skipped, and step 4 is the only place where derived position columns are added.
@@ -58,8 +57,8 @@ Blank or absent columns are silently skipped.
 | `mapped_hgvs_*_stop` | ✓ | ✓ | ✓ | Stop position (1-based; equals start for SNVs) |
 | `mapped_hgvs_*_ref` | ✓ | ✓ | ✓ | Reference allele; one-letter amino acid codes for protein |
 | `mapped_hgvs_*_alt` | ✓ | ✓ | ✓ | Alternate allele; one-letter amino acid codes for protein |
-| `touches_intronic_region` | — | ✓ | — | `"true"` if any c. candidate coordinate includes an intronic offset (`+`/`-`) |
-| `spans_intron` | — | ✓ | — | `"true"` if any c. candidate spans both sides of an intron boundary |
+| `touches_intronic_region` | — | ✓ | — | Pipe-delimited per-candidate flags (`"true"`/`"false"`), aligned to `mapped_hgvs_c` (empty slot for empty candidate) |
+| `spans_intron` | — | ✓ | — | Pipe-delimited per-candidate flags (`"true"`/`"false"`), aligned to `mapped_hgvs_c` (empty slot for empty candidate) |
 
 All g. and c. output columns are pipe-delimited when the input is pipe-delimited; p. columns are never pipe-delimited (at most one protein HGVS per row).
 

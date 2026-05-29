@@ -298,7 +298,7 @@ See [docs/add_vcf_identifiers.md](docs/add_vcf_identifiers.md) for full referenc
 
 **Input columns:** `mapped_hgvs_g`, `mapped_hgvs_c`, `mapped_hgvs_p`
 
-**Output columns:** For each of the three HGVS columns: `<col>_chromosome` (or `<col>_transcript` for c.), `<col>_start`, `<col>_stop`, `<col>_ref`, `<col>_alt`. For g. and c. columns these are pipe-delimited when the input is pipe-delimited (matching the candidate cardinality from step 2). Also adds `touches_intronic_region` and `spans_intron` row-level boolean flags (single `"true"`/`"false"` per row, based on whether any c. candidate is intronic).
+**Output columns:** For each of the three HGVS columns: `<col>_chromosome` (or `<col>_transcript` for c.), `<col>_start`, `<col>_stop`, `<col>_ref`, `<col>_alt`. For g. and c. columns these are pipe-delimited when the input is pipe-delimited (matching the candidate cardinality from step 2). Also adds `touches_intronic_region` and `spans_intron` as pipe-delimited per-candidate flags (`"true"`/`"false"`) aligned to `mapped_hgvs_c` (empty slot preserved for empty candidates).
 
 **Command:**
 ```bash
@@ -306,7 +306,7 @@ src/scripts/run_add_vcf_identifiers.sh output_clingen.tsv output_parsed.tsv
 ```
 
 **Notes:**
-- If step 2 (`reverse_translate_protein_variants`) was run, derived columns are already present; this step re-computes them (idempotent for DNA rows, but collapses per-candidate intronic flags to a single row-level flag)
+- If step 2 (`reverse_translate_protein_variants`) was run, derived columns are already present; this step re-computes them (idempotent for DNA rows, with per-candidate intronic flags preserved and aligned)
 - If step 2 was skipped (no protein variants), this is the only step that adds derived position columns
 - Inversions are expanded to the reverse-complement sequence; protein HGVS is converted to one-letter amino acid codes
 - UTA is required for resolving missing ref alleles in `del`/`dup`/`inv` variants; those fields are left blank if UTA is unavailable
@@ -1117,8 +1117,8 @@ TP53	CA123456|CA123457||	Pathogenic	0.00234	0.00234	1547
 | `mapped_hgvs_p_stop` | int | End position of protein variant |
 | `mapped_hgvs_p_ref` | string | Reference amino acid |
 | `mapped_hgvs_p_alt` | string | Alternate amino acid |
-| `touches_intronic_region` | bool | True if transcript HGVS contains intron offsets |
-| `spans_intron` | bool | True if transcript HGVS crosses an intron boundary |
+| `touches_intronic_region` | string | Pipe-delimited per-candidate flags (`"true"`/`"false"`), aligned to `mapped_hgvs_c` |
+| `spans_intron` | string | Pipe-delimited per-candidate flags (`"true"`/`"false"`), aligned to `mapped_hgvs_c` |
 
 #### Step 5: annotate_clinvar
 
