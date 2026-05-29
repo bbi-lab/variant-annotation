@@ -664,10 +664,11 @@ def _parse_hgvs(
 
     coord_type = body[0].lower()
     posedit = body[2:]
+    accession = _extract_accession_from_hgvs(hgvs_value)
 
     # For genomic/protein coords use chromosome; for transcript coords use the accession itself.
     if coord_type in {"c", "n"}:
-        ref_id: Optional[str] = _extract_accession_from_hgvs(hgvs_value)
+        ref_id: Optional[str] = accession
     else:
         ref_id = _extract_chromosome_from_hgvs(hgvs_value)
 
@@ -725,9 +726,31 @@ def _parse_hgvs(
         and (ref is None or ref == "")
         and ("del" in posedit or "dup" in posedit or "inv" in posedit)
     ):
-        resolved_ref = _resolve_missing_ref_allele(text)
-        if resolved_ref is not None:
-            ref = resolved_ref
+        # For transcript delins with missing ref, try direct UTA sequence fetch first.
+        # This is more reliable than HGVS normalization for some transcripts.
+        if coord_type in {"c", "n"} and start is not None and stop is not None:
+            try:
+                start_int = int(start)
+                stop_int = int(stop)
+                if start_int >= 1 and stop_int >= start_int:
+                    if coord_type == "c":
+                        cds_start_i = _get_cds_start_i(accession)
+                        if cds_start_i is not None:
+                            tx_start = cds_start_i + start_int
+                            tx_stop = cds_start_i + stop_int
+                            resolved_ref = _fetch_ref_seq(accession, tx_start, tx_stop)
+                    else:  # n.
+                        resolved_ref = _fetch_ref_seq(accession, start_int, stop_int)
+                    if resolved_ref is not None:
+                        ref = resolved_ref
+            except (ValueError, TypeError):
+                pass
+
+        # Fall back to HGVS normalization if direct fetch didn't work.
+        if ref is None or ref == "":
+            resolved_ref = _resolve_missing_ref_allele(text)
+            if resolved_ref is not None:
+                ref = resolved_ref
 
     # Duplications must never emit the literal string "dup" as the alt allele.
     # Expand to ref+ref when the sequence is known; otherwise clear both to None
