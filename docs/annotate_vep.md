@@ -13,7 +13,7 @@ Annotates each variant row with a mutational consequence term from the Ensembl V
 | `vep.mutational_consequences` | `^`-delimited list of all consequence terms when the result came from a matched transcript entry; single most-severe term otherwise. Pipe-delimited across candidates. Empty string for a candidate with an API error. |
 | `vep.most_severe_mutational_consequence` | Single most-severe consequence term per candidate. Pipe-delimited across candidates. Empty string for a candidate with an API error. |
 | `vep.consequence_source` | `transcript`, `most_severe`, or `no_change` per candidate; empty string when the candidate had an API error and no fallback applied. Pipe-delimited across candidates. |
-| `vep.access_date` | ISO date the Ensembl API was queried (or the date from a cache hit). Single shared value for the row. |
+| `vep.access_date` | ISO access date per candidate. Pipe-delimited across candidates, aligned to the input candidate positions (empty slot for empty candidates). |
 | `vep.error` | Per-candidate API error message (`api_error` or `api_error:<sanitized detail>`) when the candidate's request failed; empty string otherwise. Pipe-delimited across candidates. When `no_change` fallback is confirmed, this field is cleared. |
 
 The namespace prefix defaults to `vep` and can be changed with `--vep-namespace`.
@@ -76,6 +76,7 @@ For rows with pipe-delimited HGVS candidates (from step 2 reverse translation), 
 
 - `vep.mutational_consequences`: `^`-delimited consequence terms for transcript HGVS candidates (`source == "transcript"`), or the single most-severe term for genomic/protein inputs. Empty string for a candidate with an API error.
 - `vep.most_severe_mutational_consequence`: single most-severe term per candidate; empty string on API error.
+- `vep.access_date`: ISO access date per candidate; pipe-delimited and position-aligned to candidates.
 - `vep.consequence_source`: `transcript`, `most_severe`, or `no_change` per candidate; empty string on API error when no fallback applies.
 - `vep.error`: `api_error` or `api_error:<sanitized message>` for candidates whose API request failed; empty string otherwise. Cleared when `no_change` fallback applies.
 

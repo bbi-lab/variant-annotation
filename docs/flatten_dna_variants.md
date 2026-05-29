@@ -17,7 +17,7 @@ Columns are expanded (split on `|`) when they are:
 - **Hard-coded DNA variant columns:** `mapped_hgvs_g`, `mapped_hgvs_c`, `dna_clingen_allele_id`, `mapped_hgvs_g_chromosome`, `mapped_hgvs_g_start`, `mapped_hgvs_g_stop`, `mapped_hgvs_g_ref`, `mapped_hgvs_g_alt`, `mapped_hgvs_c_transcript`, `mapped_hgvs_c_start`, `mapped_hgvs_c_stop`, `mapped_hgvs_c_ref`, `mapped_hgvs_c_alt`, `touches_intronic_region`, `spans_intron`, `reverse_translation_warnings`
 - **Any column whose name begins with an annotation prefix:** `alphamissense.`, `clingen_evidence_repository.`, `clinvar.`, `gnomad.`, `mutpred2.`, `revel.`, `spliceai.`, `vep.`
 
-These prefixes cover all annotation columns written by earlier pipeline steps. Columns from `annotate_predictors` (`revel.*`, `alphamissense.*`, `mutpred2.*`) are pipe-aligned to candidates by that step and are correctly expanded here. All VEP columns (`vep.*`) are also expanded: `vep.mutational_consequences`, `vep.most_severe_mutational_consequence`, `vep.consequence_source`, and `vep.error` are pipe-delimited per candidate by `annotate_vep` and are split correctly. `vep.access_date` is a single ISO date with no pipe delimiter and so is effectively repeated as-is across expanded rows.
+These prefixes cover all annotation columns written by earlier pipeline steps. Columns from `annotate_predictors` (`revel.*`, `alphamissense.*`, `mutpred2.*`) are pipe-aligned to candidates by that step and are correctly expanded here. All VEP columns (`vep.*`) are also expanded: `vep.mutational_consequences`, `vep.most_severe_mutational_consequence`, `vep.access_date`, `vep.consequence_source`, and `vep.error` are pipe-delimited per candidate by `annotate_vep` and are split correctly.
 
 ### What gets repeated (not expanded)
 

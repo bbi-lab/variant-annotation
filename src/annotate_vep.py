@@ -722,7 +722,7 @@ def annotate_row(
     out = {
         consequences_col: "",
         most_severe_col: "",
-        access_col: access_date,
+        access_col: "",
         source_col: "",
         error_col: "",
     }
@@ -733,6 +733,7 @@ def annotate_row(
 
     consequences_values: list[str] = []
     most_severe_values: list[str] = []
+    access_values: list[str] = []
     source_values: list[str] = []
     error_values: list[str] = []
 
@@ -740,11 +741,13 @@ def annotate_row(
         if not hgvs:
             consequences_values.append("")
             most_severe_values.append("")
+            access_values.append("")
             source_values.append("")
             error_values.append("")
             continue
         cached = consequence_cache.get(hgvs)
         if cached is None:
+            access_values.append(access_date)
             if _is_unchanged_transcript_delins(hgvs):
                 consequences_values.append("no_change")
                 most_severe_values.append("no_change")
@@ -758,6 +761,7 @@ def annotate_row(
             continue
         most_severe, all_consequences, source = cached
         if source.startswith("api_error"):
+            access_values.append(access_date)
             if _is_unchanged_transcript_delins(hgvs):
                 consequences_values.append("no_change")
                 most_severe_values.append("no_change")
@@ -771,6 +775,7 @@ def annotate_row(
             continue
         most_severe_str = most_severe or ""
         if not most_severe_str and _is_unchanged_transcript_delins(hgvs):
+            access_values.append(access_date)
             consequences_values.append("no_change")
             most_severe_values.append("no_change")
             source_values.append("no_change")
@@ -786,11 +791,13 @@ def annotate_row(
             cs_str = most_severe_str
         consequences_values.append(cs_str)
         most_severe_values.append(most_severe_str)
+        access_values.append(access_date)
         source_values.append(source if most_severe_str or cs_str else "")
         error_values.append("")
 
     out[consequences_col] = "|".join(consequences_values)
     out[most_severe_col] = "|".join(most_severe_values)
+    out[access_col] = "|".join(access_values)
     out[source_col] = "|".join(source_values)
     out[error_col] = "|".join(error_values)
     return out

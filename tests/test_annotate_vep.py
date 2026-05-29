@@ -277,3 +277,39 @@ def test_main_keep_existing_makes_no_api_calls_when_all_annotated(tmp_path, monk
 
     assert rows[0]["vep.mutational_consequence"] == "synonymous_variant"
     assert rows[0]["vep.access_date"] == "2025-01-01"
+
+
+def test_access_date_is_pipe_aligned_for_multiple_candidates():
+    row = {"mapped_hgvs_g": "NC_000001.11:g.1A>T|NC_000001.11:g.2C>G"}
+    cache = {
+        "NC_000001.11:g.1A>T": ("missense_variant", None, "most_severe"),
+        "NC_000001.11:g.2C>G": ("synonymous_variant", None, "most_severe"),
+    }
+
+    out = mod.annotate_row(
+        row,
+        cache,
+        col_prefix="vep",
+        hgvs_cols=["mapped_hgvs_g"],
+        access_date="2026-05-29",
+    )
+
+    assert out["vep.access_date"] == "2026-05-29|2026-05-29"
+
+
+def test_access_date_preserves_empty_candidate_slots():
+    row = {"mapped_hgvs_g": "NC_000001.11:g.1A>T||NC_000001.11:g.3G>A"}
+    cache = {
+        "NC_000001.11:g.1A>T": ("missense_variant", None, "most_severe"),
+        "NC_000001.11:g.3G>A": ("intron_variant", None, "most_severe"),
+    }
+
+    out = mod.annotate_row(
+        row,
+        cache,
+        col_prefix="vep",
+        hgvs_cols=["mapped_hgvs_g"],
+        access_date="2026-05-29",
+    )
+
+    assert out["vep.access_date"] == "2026-05-29||2026-05-29"
