@@ -710,6 +710,7 @@ The following tools are included alongside the main pipeline for data inspection
 | `run_diff_tsv.sh` | Row-level diff between two TSV versions: changed rows and HGVS component diffs. See [docs/diff_tsv.md](docs/diff_tsv.md) |
 | `run_haplotypes_to_delins.sh` | Rewrite intra-codon c.-haplotype HGVS expressions to delins notation. See [docs/haplotypes_to_delins.md](docs/haplotypes_to_delins.md) |
 | `run_gnomad_hail_shell.sh` | Launch an interactive bash shell in the Hail-enabled gnomAD container for ad-hoc table inspection. See [docs/gnomad_hail_shell.md](docs/gnomad_hail_shell.md) |
+| `run_filter_dna_variants.sh` | Remove non-SNV DNA candidates while preserving row count and aligned candidate columns. See [docs/filter_dna_variants.md](docs/filter_dna_variants.md) |
 | `run_utilities.sh` | General-purpose TSV manipulation: `filter-rows`, `filter-columns`, `merge-columns`, `rename-columns`, `reorder-columns`, `replace-rows`, `compare-columns`. See [docs/utilities.md](docs/utilities.md) |
 
 ## Pipeline Data Flow Diagram
