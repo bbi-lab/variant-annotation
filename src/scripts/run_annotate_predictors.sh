@@ -117,4 +117,4 @@ fi
 
 exec docker compose --profile tools run \
   ${compose_build_flag:+$compose_build_flag} ${compose_no_cache_flag:+$compose_no_cache_flag} --rm \
-  annotate-missense-scores "$input_in_container" "$output_in_container" "$@"
+  annotate-predictors "$input_in_container" "$output_in_container" "$@"
