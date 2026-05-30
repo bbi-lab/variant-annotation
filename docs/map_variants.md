@@ -35,7 +35,7 @@ The script detects three mutually exclusive cases from the `raw_hgvs_nt` and `ra
 
 ### Case 1 — Reference-based transcript HGVS
 
-**Condition:** `raw_hgvs_nt` contains a transcript accession prefix (e.g. `NM_000277.3:c.1218G>A` or `ENST00000316054.9:c.1142G>A`).
+**Condition:** `raw_hgvs_nt` contains a **valid, fully-qualified** accession-based nucleotide HGVS string (e.g. `NM_000277.3:c.1218G>A` or `NC_000012.12:g.102917016C>A`).
 
 **Processing:**
 1. The HGVS is passed through `dcd_mapping.vrs_map.fetch_clingen_genomic_hgvs` to obtain an assay-level genomic HGVS (this normalises the notation and resolves any Ensembl → RefSeq conversion if needed).
@@ -50,13 +50,14 @@ The script detects three mutually exclusive cases from the `raw_hgvs_nt` and `ra
 
 ### Case 2 — Sequence-based nucleotide HGVS (no accession prefix)
 
-**Condition:** `raw_hgvs_nt` is present but contains no colon (e.g. `c.1218G>A`).
+**Condition:** `raw_hgvs_nt` is present but is not a valid case-1 accession HGVS (e.g. `c.1218G>A`).
 
 **Processing:**
 1. All rows sharing the same `--group-by` column value are batched together for a single BLAT alignment run.
 2. `dcd_mapping` aligns the `target_sequence` to GRCh38, selects transcripts, and performs VRS mapping for every row in the batch.
 3. The assay-level HGVS from VRS mapping is queried in ClinGen to populate all three output columns.
 4. Multi-variant intra-codon haplotypes (e.g. `c.[1A>G;3G>T]`) are normalised to a `delins` expression before mapping when all components fall within one codon.
+5. With `--normalize-hgvs`, bare nucleotide expressions without `c.` prefix (e.g. `1218G>A`, `[1A>G;3G>T]`) are promoted to `c.` form before processing.
 
 **Requirements:** `target_sequence` column (or `--targets-file`). `dcd_mapping` must be installed with its data dependencies.
 
@@ -67,7 +68,8 @@ The script detects three mutually exclusive cases from the `raw_hgvs_nt` and `ra
 **Condition:** `raw_hgvs_nt` is absent (or a blank sentinel such as `_wt`, `_sy`, `=`), and `raw_hgvs_pro` is present (e.g. `p.Ala406Thr` or `p.A406T`).
 
 **Processing:**
-1. Protein HGVS strings in one-letter amino acid code (`p.A406T`) are automatically converted to three-letter code (`p.Ala406Thr`) before processing.
+1. Protein HGVS strings in one-letter amino acid code (`p.A406T`) are converted to three-letter code (`p.Ala406Thr`) before processing.
+2. With `--normalize-hgvs`, protein strings without `p.` are accepted (e.g. `A406T`, `Ala406Thr`, `A406*`, `A406-`, `A406=`) and normalized to canonical `p.` three-letter form.
 2. `dcd_mapping` runs at the protein annotation layer to map the variant.
 3. ClinGen is queried to populate `mapped_hgvs_p`. `mapped_hgvs_c` and `mapped_hgvs_g` will be empty unless a protein allele entry in ClinGen carries them (uncommon).
 
@@ -138,6 +140,7 @@ Columns specified in `--drop-columns` are excluded from the output entirely. In 
 | Option | Default | Description |
 |---|---|---|
 | `--group-by COLUMN` | `target_sequence` | Column used to batch sequence-based rows (cases 2 & 3). Rows sharing the same value are aligned together in a single BLAT run. Use `gene_symbol` or a dataset name rather than `target_sequence` when multiple rows share the same sequence, to avoid redundant alignments. |
+| `--normalize-hgvs / --no-normalize-hgvs` | off | Normalize relaxed case-2/3 inputs before mapping. Examples: `A334C` → `p.Ala334Cys`, `1218G>A` → `c.1218G>A`. |
 | `--targets-file FILE` | — | Optional TSV/CSV file containing target sequences and other target-level columns. Joined to the input on the column specified by `--target-name`. Columns from the targets file are merged onto the input row before processing; input columns take precedence when both are present. |
 | `--target-name COLUMN` | `target_name` | Join column for `--targets-file`. |
 
