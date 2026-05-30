@@ -124,6 +124,8 @@ services:
       - tools
     depends_on:
       - redis
+      - seqrepo
+      - uta
     env_file:
       - settings/.env
     entrypoint: ["python", "-m", "src.annotate_vep"]
