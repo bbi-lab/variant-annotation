@@ -345,21 +345,36 @@ See [docs/annotate_gnomad.md](docs/annotate_gnomad.md) for full reference docume
 
 **Input columns:** `dna_clingen_allele_id` (from step 3)
 
-**Output columns:** `gnomad.<VERSION>.minor_allele_frequency`, `.allele_frequency`, `.allele_count`, `.allele_number`, `.faf95_max`, `.faf95_max_ancestry`, `.filters`, `.exome_filters`, `.genome_filters`, `.gene_symbols`
+**Output columns (standard):** `gnomad.<VERSION>.minor_allele_frequency`, `.allele_frequency`, `.allele_count`, `.allele_number`, `.faf95_max`, `.faf95_max_ancestry`, `.filters`, `.exome_filters`, `.genome_filters`, `.gene_symbols`
 
-**Command:**
+**Optional histogram columns (Hail mode):** When `--age-histograms` or `--allele-balance-histograms` is passed, per-bin frequency columns are added with names like `gnomad.<V>.age_hist_exome_het.bin_1_17.5_25`, `gnomad.<V>.ab_hist_genome_adj.bin_1_0_0.05`, etc. See [docs/annotate_gnomad.md](docs/annotate_gnomad.md) for full column naming details.
+
+**Command (standard annotation):**
 ```bash
 src/scripts/run_annotate_gnomad.sh output_clinvar.tsv output_final.tsv \
     --gnomad-version v4.1 \
     --cache-dir ./gnomad_cache
 ```
 
-**First-time setup (downloads and caches gnomAD Hail table):**
+**First-time setup — build cache with all histogram columns included:**
+```bash
+src/scripts/run_annotate_gnomad.sh /dev/null /dev/null \
+    --gnomad-version v4.1 \
+    --cache-dir ./gnomad_cache \
+    --download-only \
+    --refresh-cache \
+    --gnomad-ht-uri gs://gcp-public-data--gnomad/release/4.1/ht/joint/gnomad.joint.v4.1.sites.ht \
+    --age-histograms exome,genome,joint \
+    --allele-balance-histograms exome,genome,joint
+```
+
+**Annotate with all histograms enabled:**
 ```bash
 src/scripts/run_annotate_gnomad.sh output_clinvar.tsv output_final.tsv \
     --gnomad-version v4.1 \
     --cache-dir ./gnomad_cache \
-    --download-only
+    --age-histograms exome,genome,joint \
+    --allele-balance-histograms exome,genome,joint
 ```
 
 **QC filtering at annotation time:**
@@ -387,6 +402,7 @@ Both flags treat a missing gnomAD match as "no annotation" (columns left empty) 
 - Output columns are pipe-delimited and candidate-aligned across all annotation fields
 - Supports custom DNA ID column via `--dna-clingen-allele-id-col` if needed
 - Cache refresh: use `--refresh-cache` flag to re-download the source table
+- Histogram columns (`--age-histograms`, `--allele-balance-histograms`) must be requested both when building the cache and when annotating; passing them to an older cache logs a warning and omits those columns
 
 #### Athena execution mode (alternative to Hail)
 
@@ -1134,6 +1150,8 @@ TP53	CA123456|CA123457||	Pathogenic	0.00234	0.00234	1547
 
 #### Step 6: annotate_gnomad
 
+Standard columns (always emitted):
+
 | Column | Type | Description |
 |--------|------|-------------|
 | `gnomad.<VERSION>.minor_allele_frequency` | float | MAF = min(AF, 1-AF) |
@@ -1146,6 +1164,16 @@ TP53	CA123456|CA123457||	Pathogenic	0.00234	0.00234	1547
 | `gnomad.<VERSION>.exome_filters` | string | Pipe-delimited exome-callset QC filter flags (empty = PASS or not in exome callset) |
 | `gnomad.<VERSION>.genome_filters` | string | Pipe-delimited genome-callset QC filter flags (empty = PASS or not in genome callset) |
 | `gnomad.<VERSION>.gene_symbols` | string | Pipe-delimited VEP gene symbols overlapping the variant |
+
+Optional histogram columns (Hail mode only, enabled by `--age-histograms` / `--allele-balance-histograms`):
+
+| Column pattern | Type | Description |
+|--------|------|-------------|
+| `gnomad.<V>.<hist_name>.n_smaller` | int | Count of carriers below the lowest bin edge |
+| `gnomad.<V>.<hist_name>.bin_N_<lo>_<hi>` | int | Carrier count in bin N with edges \[lo, hi) |
+| `gnomad.<V>.<hist_name>.n_larger` | int | Count of carriers above the highest bin edge |
+
+Where `<hist_name>` is one of: `age_hist_exome_het`, `age_hist_exome_hom`, `age_hist_genome_het`, `age_hist_genome_hom`, `age_hist_joint_het`, `age_hist_joint_hom` (age histograms) or `ab_hist_exome_adj`, `ab_hist_exome_raw`, `ab_hist_genome_adj`, `ab_hist_genome_raw`, `ab_hist_joint_adj`, `ab_hist_joint_raw` (allele balance histograms). See [docs/annotate_gnomad.md](docs/annotate_gnomad.md) for full details.
 
 (Default version is `v4.1`; customize with `--gnomad-version` flag)
 
