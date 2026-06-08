@@ -10,6 +10,8 @@ Annotates each variant row with gnomAD allele frequency metrics. Supports two ex
 
 Output column names follow `<namespace>.<version>.<field>` (namespace defaults to `gnomad`, version defaults to `v4.1`).
 
+### Standard columns (always emitted)
+
 | Column | Description |
 |---|---|
 | `gnomad.<V>.minor_allele_frequency` | Minor allele frequency (= `min(AF, 1-AF)`) |
@@ -23,7 +25,52 @@ Output column names follow `<namespace>.<version>.<field>` (namespace defaults t
 | `gnomad.<V>.genome_filters` | Genome-callset QC filters (empty = passed or not called in genomes) |
 | `gnomad.<V>.gene_symbols` | Gene symbols from `vep.worst_csq_by_gene_canonical` (pipe-delimited) |
 
-All ten columns are pipe-delimited and candidate-aligned when `dna_clingen_allele_id` or the coordinate columns are themselves pipe-delimited (i.e. for rows with multiple reverse-translated DNA candidates from step 2).
+All standard columns are pipe-delimited and candidate-aligned when `dna_clingen_allele_id` or the coordinate columns are themselves pipe-delimited (i.e. for rows with multiple reverse-translated DNA candidates from step 2).
+
+### Optional histogram columns (Hail mode only)
+
+When `--age-histograms` or `--allele-balance-histograms` is specified, one group of columns is added per requested histogram. The column names are derived at runtime from the bin edges found in the first matched gnomAD record, and therefore reflect the actual gnomAD bin boundaries rather than hard-coded values.
+
+**Column naming convention:**
+
+```
+gnomad.<V>.<histogram_name>.n_smaller
+gnomad.<V>.<histogram_name>.bin_1_<lo>_<hi>
+gnomad.<V>.<histogram_name>.bin_2_<lo>_<hi>
+...
+gnomad.<V>.<histogram_name>.bin_N_<lo>_<hi>
+gnomad.<V>.<histogram_name>.n_larger
+```
+
+Where `<lo>` and `<hi>` are the lower and upper bin edges formatted without trailing zeros (e.g. `17.5`, `25`, `0.05`).
+
+**Age distribution histograms** (`--age-histograms`):
+
+| `<histogram_name>` | Callset | Genotype |
+|---|---|---|
+| `age_hist_exome_het` | Exome | Heterozygous |
+| `age_hist_exome_hom` | Exome | Homozygous |
+| `age_hist_genome_het` | Genome | Heterozygous |
+| `age_hist_genome_hom` | Genome | Homozygous |
+| `age_hist_joint_het` | Joint | Heterozygous |
+| `age_hist_joint_hom` | Joint | Homozygous |
+
+For gnomAD v4.1 the age bins span 17.5 – 80 years in irregular intervals, yielding 12 bins + `n_smaller` + `n_larger` = 14 values per histogram.
+
+**Allele balance histograms** (`--allele-balance-histograms`):
+
+| `<histogram_name>` | Callset | Filter level |
+|---|---|---|
+| `ab_hist_exome_adj` | Exome | Adjusted (genotype-filtered) |
+| `ab_hist_exome_raw` | Exome | Raw (unfiltered) |
+| `ab_hist_genome_adj` | Genome | Adjusted |
+| `ab_hist_genome_raw` | Genome | Raw |
+| `ab_hist_joint_adj` | Joint | Adjusted |
+| `ab_hist_joint_raw` | Joint | Raw |
+
+For gnomAD v4.1 the allele balance bins span 0 – 1 in 20 equal-width intervals, yielding 20 bins + `n_smaller` + `n_larger` = 22 values per histogram.
+
+Histogram columns are also pipe-delimited and candidate-aligned, matching the standard columns.
 
 ---
 
@@ -33,7 +80,7 @@ All ten columns are pipe-delimited and candidate-aligned when `dna_clingen_allel
 
 Downloads the gnomAD Hail table from a source URI (GCS or local filesystem), builds a compact local indexed cache, and queries that cache for each run. Requires Java and the `hail` Python library.
 
-**First run** (building the cache):
+**First run** (building the cache — standard columns only):
 ```bash
 src/scripts/run_annotate_gnomad.sh /dev/null /dev/null \
     --gnomad-version v4.1 \
@@ -44,6 +91,19 @@ src/scripts/run_annotate_gnomad.sh /dev/null /dev/null \
 
 The first run writes a compact local Hail table to `--cache-dir`. This is a one-time step and typically takes hours for a full gnomAD joint sites table (GCS read + Parquet write). The cache is a Hail keyed table (`gnomad_{version}_indexed.ht`) stored as a directory. Subsequent runs use the cache directly in seconds.
 
+**First run with all histogram columns included in the cache:**
+```bash
+src/scripts/run_annotate_gnomad.sh /dev/null /dev/null \
+    --gnomad-version v4.1 \
+    --download-only \
+    --refresh-cache \
+    --gnomad-ht-uri gs://gcp-public-data--gnomad/release/4.1/ht/joint/gnomad.joint.v4.1.sites.ht \
+    --age-histograms exome,genome,joint \
+    --allele-balance-histograms exome,genome,joint
+```
+
+Histogram field names passed at cache-build time determine which histogram arrays are stored in the local Hail table. If you request histograms on an annotation run against a cache built without them, a warning is logged and those columns are omitted. Use `--refresh-cache` to rebuild the cache with the new fields.
+
 To cache a local gnomAD HT copy instead of downloading from GCS:
 ```bash
 src/scripts/run_annotate_gnomad.sh /dev/null /dev/null \
@@ -52,10 +112,25 @@ src/scripts/run_annotate_gnomad.sh /dev/null /dev/null \
     --gnomad-ht-uri /work/gnomAD/gnomad.joint.v4.1.sites.ht
 ```
 
-**Annotation run:**
+**Annotation run (standard columns):**
 ```bash
 src/scripts/run_annotate_gnomad.sh input.tsv output.tsv \
     --gnomad-version v4.1
+```
+
+**Annotation run with all histograms enabled:**
+```bash
+src/scripts/run_annotate_gnomad.sh input.tsv output.tsv \
+    --gnomad-version v4.1 \
+    --age-histograms exome,genome,joint \
+    --allele-balance-histograms exome,genome,joint
+```
+
+**Selective histogram output (exome age distribution only):**
+```bash
+src/scripts/run_annotate_gnomad.sh input.tsv output.tsv \
+    --gnomad-version v4.1 \
+    --age-histograms exome
 ```
 
 ### Athena mode
@@ -151,6 +226,12 @@ The local cache directory defaults to `$GNOMAD_CACHE_DIR` or `/tmp/gnomad_cache`
 
 Pass `--genes BRCA1,BRCA2` when building the cache to retain only rows whose `vep.worst_csq_by_gene_canonical` contains at least one matching gene symbol. Reduces cache size by ~100× for targeted analyses. Requires `--refresh-cache` (or a cache miss) to take effect; an existing cache is not re-filtered.
 
+### Histogram fields in the cache
+
+Histogram arrays (`--age-histograms`, `--allele-balance-histograms`) are stored as array fields in the local cache. They are only present when explicitly requested at cache-build time. If you run an annotation with histogram flags against an older cache, the tool will log a warning per missing histogram name and omit those columns from output. Rebuild the cache with `--refresh-cache` (and the histogram flags) to include them.
+
+The cache is a superset: you can request a subset of histograms on any given annotation run, as long as all requested fields were included when the cache was built.
+
 ---
 
 ## CLI options
@@ -195,6 +276,8 @@ Pass `--genes BRCA1,BRCA2` when building the cache to retain only rows whose `ve
 | `--refresh-cache` | off | Rebuild cache even if present |
 | `--genes GENE,...` | none | Gene-level cache filter |
 | `--cache-progress-every-seconds N` | `300` | Cache build heartbeat interval |
+| `--age-histograms CALLSET,...` | none | Include age distribution histogram columns; comma-separated from `exome`, `genome`, `joint` |
+| `--allele-balance-histograms CALLSET,...` | none | Include allele balance histogram columns; comma-separated from `exome`, `genome`, `joint` |
 
 ### Athena-mode options
 
@@ -244,6 +327,22 @@ Set `HAIL_GCS_AUTH_TYPE=UNAUTHENTICATED` for the public gnomAD GCS buckets. This
 **`--callset-pass-filter any/all` raises an error**
 
 The gnomAD cache was built from a source table without separate `exome.filters` / `genome.filters` fields (e.g. the browser sites HT). Use `--require-pass` instead, or rebuild the cache from the gnomAD joint sites HT.
+
+**Histogram columns missing from output despite passing `--age-histograms` / `--allele-balance-histograms`**
+
+The local cache was built without those histogram fields. The log will contain a warning such as:
+```
+Histogram field(s) age_hist_exome_het, age_hist_exome_hom not found in gnomAD cache; use --refresh-cache to rebuild with histogram support
+```
+Rebuild the cache with `--refresh-cache` and the same histogram flags, then re-run annotation.
+
+**Inconsistent bin edges error**
+
+```
+ValueError: Inconsistent bin edges for histogram 'age_hist_exome_het' at key ...
+```
+
+The gnomAD source table contains variant rows with different bin-edge arrays for the same histogram field. This should not occur in standard gnomAD release tables but may happen with custom or merged tables. If you encounter it, open an issue with the source table URI.
 
 **Many empty frequency columns despite valid `dna_clingen_allele_id`**
 

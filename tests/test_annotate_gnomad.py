@@ -383,6 +383,155 @@ def test_main_athena_mode_streams_batches_in_input_order(tmp_path, monkeypatch):
     assert calls == [{"CA1"}, {"CA2"}]
 
 
+def test_histogram_col_names_age():
+    cols = mod._histogram_col_names("gnomad.v4_1", "age_hist_exome_het", [17.5, 25.0, 30.0])
+    assert cols == [
+        "gnomad.v4_1.age_hist_exome_het.n_smaller",
+        "gnomad.v4_1.age_hist_exome_het.bin_1_17.5_25",
+        "gnomad.v4_1.age_hist_exome_het.bin_2_25_30",
+        "gnomad.v4_1.age_hist_exome_het.n_larger",
+    ]
+
+
+def test_histogram_col_names_ab():
+    cols = mod._histogram_col_names("gnomad.v4_1", "ab_hist_genome_adj", [0.0, 0.05, 0.1])
+    assert cols == [
+        "gnomad.v4_1.ab_hist_genome_adj.n_smaller",
+        "gnomad.v4_1.ab_hist_genome_adj.bin_1_0_0.05",
+        "gnomad.v4_1.ab_hist_genome_adj.bin_2_0.05_0.1",
+        "gnomad.v4_1.ab_hist_genome_adj.n_larger",
+    ]
+
+
+def test_check_and_collect_bin_edges_consistent():
+    hist = mod.HistogramData(bin_edges=[0.0, 0.5, 1.0], bin_freq=[10, 20], n_smaller=1, n_larger=2)
+    records = {
+        "k1": mod.GnomadRecord("k1", 1, 10, 0.1, 0.1, None, "", histograms={"ab_hist_genome_adj": hist}),
+        "k2": mod.GnomadRecord("k2", 2, 10, 0.2, 0.2, None, "", histograms={"ab_hist_genome_adj": hist}),
+    }
+    result = mod._check_and_collect_bin_edges(records, ["ab_hist_genome_adj"])
+    assert result == {"ab_hist_genome_adj": [0.0, 0.5, 1.0]}
+
+
+def test_check_and_collect_bin_edges_inconsistent():
+    import pytest
+    hist_a = mod.HistogramData(bin_edges=[0.0, 0.5, 1.0], bin_freq=[10, 20], n_smaller=1, n_larger=2)
+    hist_b = mod.HistogramData(bin_edges=[0.0, 1.0], bin_freq=[30], n_smaller=0, n_larger=0)
+    records = {
+        "k1": mod.GnomadRecord("k1", 1, 10, 0.1, 0.1, None, "", histograms={"ab": hist_a}),
+        "k2": mod.GnomadRecord("k2", 2, 10, 0.2, 0.2, None, "", histograms={"ab": hist_b}),
+    }
+    with pytest.raises(ValueError, match="Inconsistent bin edges"):
+        mod._check_and_collect_bin_edges(records, ["ab"])
+
+
+def test_collect_histogram_specs_age():
+    specs = mod._collect_histogram_specs("exome", None)
+    field_names = [f for f, _ in specs]
+    assert "age_hist_exome_het" in field_names
+    assert "age_hist_exome_hom" in field_names
+    assert "age_hist_genome_het" not in field_names
+
+
+def test_collect_histogram_specs_ab_multi():
+    specs = mod._collect_histogram_specs(None, "genome,joint")
+    field_names = [f for f, _ in specs]
+    assert "ab_hist_genome_adj" in field_names
+    assert "ab_hist_genome_raw" in field_names
+    assert "ab_hist_joint_adj" in field_names
+    assert "ab_hist_joint_raw" in field_names
+    assert "ab_hist_exome_adj" not in field_names
+
+
+def test_annotate_histogram_row_single_key():
+    hist = mod.HistogramData(bin_edges=[17.5, 25.0, 30.0], bin_freq=[5, 12], n_smaller=2, n_larger=3)
+    records = {
+        "CA1": mod.GnomadRecord("CA1", 1, 10, 0.1, 0.1, None, "", histograms={"age_hist_exome_het": hist}),
+    }
+    bin_edges_map = {"age_hist_exome_het": [17.5, 25.0, 30.0]}
+    out = mod._annotate_histogram_row(["CA1"], records, "gnomad.v4_1", bin_edges_map)
+    assert out["gnomad.v4_1.age_hist_exome_het.n_smaller"] == "2"
+    assert out["gnomad.v4_1.age_hist_exome_het.bin_1_17.5_25"] == "5"
+    assert out["gnomad.v4_1.age_hist_exome_het.bin_2_25_30"] == "12"
+    assert out["gnomad.v4_1.age_hist_exome_het.n_larger"] == "3"
+
+
+def test_annotate_histogram_row_missing_key():
+    bin_edges_map = {"age_hist_exome_het": [17.5, 25.0, 30.0]}
+    out = mod._annotate_histogram_row(["CA_MISSING"], {}, "gnomad.v4_1", bin_edges_map)
+    assert out["gnomad.v4_1.age_hist_exome_het.n_smaller"] == ""
+    assert out["gnomad.v4_1.age_hist_exome_het.bin_1_17.5_25"] == ""
+
+
+def test_annotate_histogram_row_pipe_aligned():
+    hist = mod.HistogramData(bin_edges=[0.0, 0.5, 1.0], bin_freq=[8, 15], n_smaller=1, n_larger=0)
+    records = {
+        "CA1": mod.GnomadRecord("CA1", 1, 10, 0.1, 0.1, None, "", histograms={"ab": hist}),
+    }
+    bin_edges_map = {"ab": [0.0, 0.5, 1.0]}
+    # Two keys: first missing, second present
+    out = mod._annotate_histogram_row(["CA_NONE", "CA1"], records, "g", bin_edges_map)
+    assert out["g.ab.n_smaller"] == "|1"
+    assert out["g.ab.bin_1_0_0.5"] == "|8"
+
+
+def test_main_hail_mode_outputs_histogram_columns(tmp_path, monkeypatch):
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+
+    with in_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["variant_urn", "mapped_hgvs_g_chromosome", "mapped_hgvs_g_start",
+                        "mapped_hgvs_g_ref", "mapped_hgvs_g_alt"],
+            delimiter="\t",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        writer.writerow({
+            "variant_urn": "v1",
+            "mapped_hgvs_g_chromosome": "chr7",
+            "mapped_hgvs_g_start": "117548628",
+            "mapped_hgvs_g_ref": "G",
+            "mapped_hgvs_g_alt": "A",
+        })
+
+    hist = mod.HistogramData(bin_edges=[17.5, 25.0, 30.0], bin_freq=[5, 12], n_smaller=2, n_larger=3)
+    fake_record = mod.GnomadRecord(
+        caid="chr7:117548628:G:A",
+        allele_count=10,
+        allele_number=100,
+        allele_frequency=0.1,
+        minor_allele_frequency=0.1,
+        faf95_max=None,
+        faf95_max_ancestry="",
+        histograms={"age_hist_exome_het": hist},
+    )
+
+    monkeypatch.setattr(mod, "ensure_local_gnomad_ht", lambda *a, **kw: tmp_path / "dummy.ht")
+    monkeypatch.setattr(
+        mod,
+        "load_gnomad_records_by_gnomad_keys",
+        lambda *a, **kw: {"chr7:117548628:G:A": fake_record},
+    )
+
+    mod.main([
+        str(in_path),
+        str(out_path),
+        "--gnomad-ht-uri", "dummy-uri",
+        "--age-histograms", "exome",
+    ])
+
+    with out_path.open("r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh, delimiter="\t"))
+
+    assert len(rows) == 1
+    assert rows[0]["gnomad.v4_1.age_hist_exome_het.n_smaller"] == "2"
+    assert rows[0]["gnomad.v4_1.age_hist_exome_het.bin_1_17.5_25"] == "5"
+    assert rows[0]["gnomad.v4_1.age_hist_exome_het.bin_2_25_30"] == "12"
+    assert rows[0]["gnomad.v4_1.age_hist_exome_het.n_larger"] == "3"
+
+
 def test_cache_progress_message_reports_file_growth(tmp_path):
     cache_dir = tmp_path / "gnomad_cache"
     ht_path = cache_dir / "gnomad_v4_1_indexed.ht"
