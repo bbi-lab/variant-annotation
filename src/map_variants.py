@@ -2187,7 +2187,7 @@ def map_variants(
                             continue
 
                         hgvs_g, hgvs_c, hgvs_p = _extract_hgvs_from_clingen(data, transcript_nm)
-                        if _clingen_allele_type(data) == "PA" and hgvs_p is None:
+                        if _clingen_allele_type(data) == "PA" and hgvs_p is None and _is_protein_hgvs(hgvs_assay):
                             hgvs_p = hgvs_assay
 
                         _record_result(
@@ -2542,7 +2542,7 @@ def map_variants(
                             # For protein-layer variants where ClinGen returns a PA allele, the
                             # assay-level p. string is the best available protein HGVS if ClinGen
                             # did not populate hgvs_p from aminoAcidAlleles.
-                            if _clingen_allele_type(data) == "PA" and hgvs_p is None:
+                            if _clingen_allele_type(data) == "PA" and hgvs_p is None and _is_protein_hgvs(hgvs_assay):
                                 hgvs_p = hgvs_assay
 
                             _record_result(
