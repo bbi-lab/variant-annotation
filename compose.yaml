@@ -42,6 +42,20 @@ services:
       - variant-annotation-seqrepo:/usr/local/share/seqrepo
       - ${VARIANT_DATA_DIR:-./data}:/work
 
+  add-dna-clingen-allele-ids:
+    <<: *tools-image
+    profiles:
+      - tools
+    depends_on:
+      - redis
+    env_file:
+      - settings/.env
+    entrypoint: ["python", "-m", "src.add_dna_clingen_allele_ids"]
+    command: ["--help"]
+    volumes:
+      - .:/usr/src/app
+      - ${VARIANT_DATA_DIR:-./data}:/work
+
   annotate-clinvar:
     <<: *tools-image
     profiles:
@@ -254,6 +268,8 @@ services:
     image: biocommons/uta:uta_20241220
     environment:
       POSTGRES_PASSWORD: ${UTA_POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "5452:5432"
     volumes:
       - ./data/uta/uta_20241220.pgd.gz:/tmp/uta_20241220.pgd.gz:ro
 
