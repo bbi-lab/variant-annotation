@@ -1304,7 +1304,7 @@ def _try_import_dcd_mapping() -> dict:
             VrsVersion,
         )
         from dcd_mapping.transcripts import TxSelectError, select_transcripts  # noqa: PLC0415
-        from dcd_mapping.vrs_map import fetch_clingen_genomic_hgvs, vrs_map  # noqa: PLC0415
+        import dcd_mapping.vrs_map as _dcd_vrs_map  # noqa: PLC0415
     except ImportError as exc:
         raise ImportError(
             "dcd_mapping (and cool_seq_tool) are required for sequence-based mapping "
@@ -1316,6 +1316,8 @@ def _try_import_dcd_mapping() -> dict:
     _patch_seqrepo_chr_lookup()
     _patch_dcd_clingen_fetch()
 
+    # Read fetch_clingen_genomic_hgvs from the module *after* patching so callers
+    # get the cached wrapper, not the original function captured before the patch.
     return {
         "AnnotationLayer": AnnotationLayer,
         "build_alignment_result": build_alignment_result,
@@ -1328,8 +1330,8 @@ def _try_import_dcd_mapping() -> dict:
         "VrsVersion": VrsVersion,
         "TxSelectError": TxSelectError,
         "select_transcripts": select_transcripts,
-        "fetch_clingen_genomic_hgvs": fetch_clingen_genomic_hgvs,
-        "vrs_map": vrs_map,
+        "fetch_clingen_genomic_hgvs": _dcd_vrs_map.fetch_clingen_genomic_hgvs,
+        "vrs_map": _dcd_vrs_map.vrs_map,
     }
 
 
