@@ -166,6 +166,11 @@ def _hgvs_candidates(raw: str) -> list[str]:
     return [h.strip() for h in raw.split(",") if h.strip()]
 
 
+def _sanitize_for_pipe_delimited(value: str) -> str:
+    """Escape pipe characters in field values for pipe-delimited output."""
+    return (value or "").replace("|", ";")
+
+
 ErepoRecord = dict[str, str]
 
 
@@ -326,7 +331,7 @@ def _join_records(records: list[ErepoRecord]) -> ErepoRecord:
             if v not in seen:
                 seen.add(v)
                 deduped.append(v)
-        merged[col] = " | ".join(deduped)
+        merged[col] = " | ".join(_sanitize_for_pipe_delimited(v) for v in deduped)
     return merged
 
 
@@ -365,8 +370,12 @@ def annotate_row(
 
     out: dict[str, str] = {}
     for col in EREPO_OUTPUT_COLS:
-        out[f"{OUTPUT_COL_PREFIX}.{col}"] = "|".join(r.get(col, "") for r in per_candidate_records)
-    out[OUTPUT_WARNINGS_COL] = "|".join(per_candidate_warnings)
+        out[f"{OUTPUT_COL_PREFIX}.{col}"] = "|".join(
+            _sanitize_for_pipe_delimited(r.get(col, "")) for r in per_candidate_records
+        )
+    out[OUTPUT_WARNINGS_COL] = "|".join(
+        _sanitize_for_pipe_delimited(w) for w in per_candidate_warnings
+    )
     return out
 
 
