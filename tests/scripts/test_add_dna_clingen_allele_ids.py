@@ -76,7 +76,7 @@ def test_protein_row_pipe_candidates_preserve_positions(tmp_path, monkeypatch):
         ],
     )
 
-    def fake_query(hgvs, max_retries=3):
+    def fake_query(hgvs, max_retries=3, known_misses=None):
         if hgvs == "NM_1:c.10A>G":
             return {"@id": "https://reg.genome.network/allele/CA10"}
         if hgvs == "NC_1:g.101A>G":
@@ -112,7 +112,7 @@ def test_single_candidate_without_existing_id_uses_c_then_g(tmp_path, monkeypatc
 
     calls = []
 
-    def fake_query(hgvs, max_retries=3):
+    def fake_query(hgvs, max_retries=3, known_misses=None):
         calls.append(hgvs)
         if hgvs == "NC_2:g.200A>G":
             return {"@id": "https://reg.genome.network/allele/CA200"}
@@ -145,7 +145,7 @@ def test_mismatched_pipe_lengths_are_padded(tmp_path, monkeypatch):
         ],
     )
 
-    def fake_query(hgvs, max_retries=3):
+    def fake_query(hgvs, max_retries=3, known_misses=None):
         if hgvs == "NM_3:c.30A>G":
             return {"@id": "https://reg.genome.network/allele/CA30"}
         return None
@@ -177,7 +177,7 @@ def test_protein_single_candidate_does_not_reuse_existing_id(tmp_path, monkeypat
         ],
     )
 
-    def fake_query(hgvs, max_retries=3):
+    def fake_query(hgvs, max_retries=3, known_misses=None):
         if hgvs == "NM_4:c.40A>G":
             return {"@id": "https://reg.genome.network/allele/CA40"}
         return None
@@ -236,7 +236,7 @@ def test_protein_row_with_valid_pa_prefix(tmp_path, monkeypatch):
         ],
     )
 
-    def fake_query(hgvs, max_retries=3):
+    def fake_query(hgvs, max_retries=3, known_misses=None):
         if hgvs == "NM_1:c.10A>G":
             return {"@id": "https://reg.genome.network/allele/CA10"}
         return None
@@ -344,7 +344,7 @@ def test_concurrent_processing_preserves_row_order(tmp_path, monkeypatch):
     max_active = 0
     lock = threading.Lock()
 
-    def fake_query(hgvs, max_retries=3):
+    def fake_query(hgvs, max_retries=3, known_misses=None):
         nonlocal active, max_active
         with lock:
             active += 1
@@ -411,7 +411,7 @@ def test_placeholder_ids_from_clingen_response_are_treated_as_null(tmp_path, mon
         ],
     )
 
-    def fake_query(hgvs, max_retries=3):
+    def fake_query(hgvs, max_retries=3, known_misses=None):
         if hgvs == "NM_1:c.10A>G":
             return {"@id": "_:CA123"}
         if hgvs == "NC_1:g.100A>G":

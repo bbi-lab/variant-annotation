@@ -99,7 +99,7 @@ def test_main_applies_skip_and_limit(tmp_path, monkeypatch):
     monkeypatch.setattr(
         mod,
         "lookup_precomputed_scores",
-        lambda hgvs_to_exact_vcf, nc_to_chrom, vcf_paths: {
+        lambda hgvs_to_exact_vcf, nc_to_chrom, vcf_paths, progress_every=0: {
             hgvs_g: {
                 "spliceai.ds_ag": hgvs_g[-1],
                 "spliceai.ds_al": "",

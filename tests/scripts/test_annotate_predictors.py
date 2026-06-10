@@ -364,9 +364,9 @@ def test_annotate_row_both_scores(tmp_path):
     mutpred2_cache: dict = {}
 
     def fake_tabix(path: Path, chrom: str, pos: int) -> list[str]:
-        if "revel" in str(path):
+        if "revel" in path.name:
             return ["1\t69094\tT\tA\t0.5500"]
-        if "db" in str(path):
+        if "db" in path.name:
             return [_dbnsfp_line("1", 69094, "T", "A", "0.7200")]
         return ["chr1\t69094\tT\tA\thg38\tQ\tT\tI1K\t0.8200\tlikely_pathogenic"]
 
@@ -432,7 +432,7 @@ def test_annotate_row_mutpred2_single_score_across_candidates(tmp_path):
     row = {"mapped_hgvs_g": "NC_000001.11:g.69094T>A|NC_000001.11:g.69094T>C"}
 
     def fake_tabix(path: Path, chrom: str, pos: int) -> list[str]:
-        if "revel" in str(path):
+        if "revel" in path.name:
             return [
                 "1\t69094\tT\tA\t0.5500",
                 "1\t69094\tT\tC\t0.3300",
@@ -574,9 +574,9 @@ def test_main_writes_score_columns(tmp_path, monkeypatch):
     )
 
     def fake_tabix(path: Path, chrom: str, pos: int) -> list[str]:
-        if "revel" in str(path) and pos == 69094:
+        if "revel" in path.name and pos == 69094:
             return ["1\t69094\tT\tA\t0.7500"]
-        if "am" in str(path) and pos == 69094:
+        if "am" in path.name and pos == 69094:
             return ["chr1\t69094\tT\tA\thg38\tQ\tT\tI1K\t0.9000\tlikely_pathogenic"]
         return []
 
