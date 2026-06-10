@@ -3,7 +3,7 @@
 Use ``python -m src.replace_rows`` for the renamed utility.
 """
 
-from src.replace_rows import main, replace_rows as merge_rows
+from replace_rows import main, replace_rows as merge_rows
 
 
 if __name__ == "__main__":

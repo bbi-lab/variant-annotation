@@ -22,12 +22,12 @@ from typing import Optional
 
 import click
 
-from src.compare_columns import compare_columns
-from src.filter_columns import filter_columns, rename_columns, _parse_keep_col_args
-from src.filter_rows import filter_rows
-from src.merge_columns import merge_columns, _parse_add_col_args, _parse_key_col_args
-from src.reorder_columns import reorder_columns
-from src.replace_rows import replace_rows
+from compare_columns import compare_columns
+from filter_columns import filter_columns, rename_columns, _parse_keep_col_args
+from filter_rows import filter_rows
+from merge_columns import merge_columns, _parse_add_col_args, _parse_key_col_args
+from reorder_columns import reorder_columns
+from replace_rows import replace_rows
 
 
 def _split_csv_args(values: tuple[str, ...]) -> list[str]:

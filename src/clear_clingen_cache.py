@@ -20,7 +20,7 @@ import logging
 import sys
 from typing import Optional
 
-from src.lib.clingen import clear_clingen_cache
+from variant_annotation.lib.clingen import clear_clingen_cache
 
 
 logger = logging.getLogger(__name__)

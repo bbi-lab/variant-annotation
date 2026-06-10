@@ -1096,7 +1096,7 @@ def load_gnomad_records_for_caids(
                     "resolving %d CAIDs to GRCh38 coordinates",
                     len(caids),
                 )
-                from src.lib.clingen import resolve_grch38_coordinates  # local import to keep Hail optional
+                from variant_annotation.lib.clingen import resolve_grch38_coordinates  # local import to keep Hail optional
 
                 coord_cache: dict[str, Optional[tuple[str, int, str, str]]] = {}
                 resolved = {}

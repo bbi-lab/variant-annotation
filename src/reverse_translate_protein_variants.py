@@ -1,840 +1,149 @@
-"""Reverse-translate mapped protein-only variants into HGVS c./g. candidates.
+"""Construct the set of DNA variants protein-equivalent to each input variant.
 
-Provenance
-----------
-This module was developed for this repository's standalone pipeline. It
-interoperates with src.map_variants output columns and project-specific Docker
-tooling, but it does not claim to be a direct extraction of a MaveDB module.
-Review it separately from src.map_variants when deciding what code is
-AGPL-coupled versus independently licensable.
-
-This is the second step of the variant-annotation pipeline. It only processes
-rows that represent assay-level protein variants, defined as rows with a
-non-blank protein HGVS value and blank c./g. HGVS values. Reverse-translated
-candidate HGVS c./g. strings are joined with ``|`` and written back to the
-existing mapped columns while preserving input row order.
+CLI entry point. Handles CSV streaming; all translation and column logic lives
+in src.lib.translation and src.lib.pipeline.reverse_translate_step.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import io
 import logging
 import os
-import re
-import shutil
-import subprocess
-import tempfile
 import time
-from urllib.parse import urlsplit
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional
 
 from dotenv import load_dotenv
-import psycopg2  # type: ignore[import-untyped]
-from src.add_vcf_identifiers import _apply_vcf_anchor, _parse_hgvs, _reverse_complement
+
+from variant_annotation.lib.clients.coordinates import HgvsMapper
+from variant_annotation.lib.clients.uta import UtaClient, connect_uta
+from variant_annotation.lib.pipeline.reverse_translate_step import ColumnConfig, process_rows
+from variant_annotation.lib.translation.types import TranslationConfig, WtCodonMode
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 PROGRESS_EVERY_ROWS = 1000
-TRANSCRIPT_ACCESSION_PREFIXES = ("NM_", "NR_", "XM_", "XR_", "ENST", "LRG_")
-REFSEQ_PROTEIN_ACCESSION_PREFIXES = ("NP_", "XP_", "YP_", "WP_")
 
 
 def _detect_separator(file_path: str) -> str:
     return "\t" if Path(file_path).suffix.lower() in (".tsv", ".txt") else ","
 
 
-def _extract_accession(hgvs_string: str) -> str:
-    token = (hgvs_string or "").strip()
-    if ":" not in token:
-        return ""
-    return token.split(":", 1)[0].strip()
-
-
-def _looks_like_transcript_accession(accession: str) -> bool:
-    return accession.startswith(TRANSCRIPT_ACCESSION_PREFIXES)
-
-
-def _looks_like_refseq_protein_accession(accession: str) -> bool:
-    return accession.startswith(REFSEQ_PROTEIN_ACCESSION_PREFIXES)
-
-
-def _transcript_sort_key(accession: str) -> tuple[int, int, str]:
-    if accession.startswith(("NM_", "NR_")):
-        prefix_rank = 0
-    elif accession.startswith(("XM_", "XR_")):
-        prefix_rank = 1
-    elif accession.startswith(("ENST", "LRG_")):
-        prefix_rank = 2
-    else:
-        prefix_rank = 3
-
-    _, _, version = accession.partition(".")
-    version_number = int(version) if version.isdigit() else -1
-    return prefix_rank, -version_number, accession
-
-
-def _append_error(existing_error: str, new_error: str) -> str:
-    existing = existing_error.strip()
-    if not existing:
-        return new_error
-    if new_error in existing:
-        return existing
-    return f"{existing}; {new_error}"
-
-
-def _find_reverse_translate_cli() -> str:
-    cli_path = shutil.which("reverse-translate-variants")
-    if cli_path is None:
-        raise RuntimeError(
-            "reverse-translate-variants was not found on PATH. Ensure variant-translation is installed in the image."
-        )
-    return cli_path
-
-
-def _build_pg_connection_kwargs(database_url: str) -> dict[str, Any]:
-    parsed = urlsplit(database_url)
-    path_parts = [part for part in parsed.path.split("/") if part]
-    if not path_parts:
-        raise RuntimeError(f"UTA_DB_URL is missing a database name: {database_url}")
-
-    kwargs: dict[str, Any] = {"dbname": path_parts[0]}
-    if parsed.hostname:
-        kwargs["host"] = parsed.hostname
-    if parsed.port:
-        kwargs["port"] = parsed.port
-    if parsed.username:
-        kwargs["user"] = parsed.username
-    if parsed.password:
-        kwargs["password"] = parsed.password
-    return kwargs
-
-
-def _resolve_transcript_from_refseq_protein_id(connection: Any, protein_accession: str) -> str:
-    with connection.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT tx_ac
-            FROM uta_20241220.associated_accessions
-            WHERE pro_ac = %s
-            """,
-            (protein_accession,),
-        )
-        transcript_accessions = sorted(
-            {
-                row[0]
-                for row in cursor.fetchall()
-                if row and row[0] and _looks_like_transcript_accession(row[0])
-            },
-            key=_transcript_sort_key,
-        )
-    return transcript_accessions[0] if transcript_accessions else ""
-
-
-def _run_reverse_translate_batch(
-    cli_path: str,
-    rows: list[dict[str, str]],
-    *,
-    assembly: str,
-    include_indels: bool,
-    max_indel_size: int,
-    strict_ref_aa: bool,
-    use_inv_notation: bool,
-    allow_length_changing_stop_candidates: bool,
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    with tempfile.TemporaryDirectory(prefix="reverse_translate_block_") as temp_dir_name:
-        temp_dir = Path(temp_dir_name)
-        input_path = temp_dir / "input.tsv"
-        output_path = temp_dir / "output.tsv"
-        errors_path = temp_dir / "errors.tsv"
-
-        with open(input_path, "w", newline="", encoding="utf-8") as input_handle:
-            writer = csv.DictWriter(input_handle, fieldnames=["transcript", "hgvs_p"], delimiter="\t")
-            writer.writeheader()
-            writer.writerows(rows)
-
-        command = [
-            cli_path,
-            "--input",
-            str(input_path),
-            "--input-format",
-            "tsv",
-            "--transcript-column",
-            "transcript",
-            "--hgvs-p-column",
-            "hgvs_p",
-            "--assembly",
-            assembly,
-            "--max-indel-size",
-            str(max_indel_size),
-            "--one-row-per-input",
-            "--join-delimiter",
-            "|",
-            "--output",
-            str(output_path),
-            "--errors",
-            str(errors_path),
-        ]
-        if include_indels:
-            command.append("--include-indels")
-        if not strict_ref_aa:
-            command.append("--no-strict-ref-aa")
-        if use_inv_notation:
-            command.append("--use-inv-notation")
-        if not allow_length_changing_stop_candidates:
-            command.append("--substitutions-and-delins-only")
-
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if completed.returncode != 0:
-            stderr = (completed.stderr or completed.stdout or "").strip()
-            raise RuntimeError(
-                "reverse-translate-variants failed"
-                + (f": {stderr}" if stderr else ".")
-            )
-
-        translated_rows: list[dict[str, str]] = []
-        if output_path.is_file():
-            with open(output_path, newline="", encoding="utf-8") as output_handle:
-                translated_rows = list(csv.DictReader(output_handle, delimiter="\t"))
-
-        error_rows: list[dict[str, str]] = []
-        if errors_path.is_file() and errors_path.stat().st_size > 0:
-            with open(errors_path, newline="", encoding="utf-8") as error_handle:
-                error_rows = list(csv.DictReader(error_handle, delimiter="\t"))
-
-        return translated_rows, error_rows
-
-
-def _classify_row(
-    row: dict[str, str],
-    *,
-    mapped_hgvs_g_col: str,
-    mapped_hgvs_c_col: str,
-    mapped_hgvs_p_col: str,
-    assayed_variant_level_col: str,
-) -> tuple[bool, bool]:
-    existing_level = (row.get(assayed_variant_level_col) or "").strip().lower()
-    has_g = bool((row.get(mapped_hgvs_g_col) or "").strip())
-    has_c = bool((row.get(mapped_hgvs_c_col) or "").strip())
-    has_p = bool((row.get(mapped_hgvs_p_col) or "").strip())
-
-    protein_origin = existing_level == "protein" or (existing_level == "" and has_p and not has_c and not has_g)
-    target_for_reverse_translation = protein_origin and not has_c and not has_g and has_p
-    return protein_origin, target_for_reverse_translation
-
-
-def _resolve_transcript_accession(
-    row: dict[str, str],
-    *,
-    mapped_hgvs_p_col: str,
-    transcript_fallback_columns: tuple[str, ...],
-    uta_connection: Any,
-) -> str:
-    protein_hgvs = (row.get(mapped_hgvs_p_col) or "").strip()
-    protein_accession = _extract_accession(protein_hgvs)
-
-    if protein_accession:
-        if _looks_like_transcript_accession(protein_accession):
-            return protein_accession
-
-        if _looks_like_refseq_protein_accession(protein_accession):
-            transcript_accession = _resolve_transcript_from_refseq_protein_id(uta_connection, protein_accession)
-            if transcript_accession:
-                return transcript_accession
-
-    for col in transcript_fallback_columns:
-        value = (row.get(col) or "").strip()
-        accession = _extract_accession(value)
-        if accession and _looks_like_transcript_accession(accession):
-            return accession
-
-    return ""
-
-
-def _split_hgvs_candidates(joined_hgvs: str) -> list[str]:
-    text = (joined_hgvs or "").strip()
-    if not text:
-        return []
-    return [part.strip() for part in text.split("|")]
-
-
-# ---------------------------------------------------------------------------
-# WT codon helpers
-# ---------------------------------------------------------------------------
-
-# Amino acids with exactly one codon: no synonymous variants possible.
-_WT_UNAMBIGUOUS_CODONS: dict[str, str] = {
-    "Met": "ATG",  # M
-    "Trp": "TGG",  # W
-}
-
-# Matches fully-written protein HGVS bodies like "p.Met1Met" or "p.Glu2Glu".
-# Also accepts the HGVS-standard synonymous shorthand "=" as the alt.
-# Works on a bare "p.Ref1Alt" string *or* on "accession:p.Ref1Alt".
-_P_HGVS_AA_CHANGE_RE = re.compile(
-    r"(?:^|:)p\.(?P<ref>[A-Z][a-z]{2})(?P<pos>\d+)(?P<alt>[A-Z][a-z]{2}|=)$"
-)
-
-
-def _parse_protein_hgvs_aa_change(hgvs_p: str) -> Optional[tuple[str, int, str]]:
-    """Return *(ref_aa3, position, alt_aa3)* from a protein HGVS string, or ``None``.
-
-    The returned *alt_aa3* is expanded from ``=`` to the reference amino acid when
-    the synonymous shorthand is used, so callers can compare ref and alt directly.
-    """
-    m = _P_HGVS_AA_CHANGE_RE.search((hgvs_p or "").strip())
-    if not m:
-        return None
-    ref_aa3 = m.group("ref")
-    pos = int(m.group("pos"))
-    alt_raw = m.group("alt")
-    alt_aa3 = ref_aa3 if alt_raw == "=" else alt_raw
-    return ref_aa3, pos, alt_aa3
-
-
-def _build_wt_c_hgvs(transcript: str, aa_position: int, codon: str) -> str:
-    """Return the transcript-level WT codon delins HGVS for *aa_position* (1-based).
-
-    Example: ``_build_wt_c_hgvs("NM_000001.1", 1, "ATG")`` → ``"NM_000001.1:c.1_3delinsATG"``
-    """
-    c_start = (aa_position - 1) * 3 + 1
-    c_stop = aa_position * 3
-    return f"{transcript}:c.{c_start}_{c_stop}delins{codon}"
-
-
-def _lookup_codon_from_uta(
-    transcript: str,
-    aa_position: int,
-    uta_connection: Any,
-) -> Optional[str]:
-    """Query UTA for the codon sequence at *aa_position* (1-based) in *transcript*.
-
-    Returns the 3-letter uppercase codon string, or ``None`` if it cannot be
-    determined (missing data, unexpected length, etc.).
-    """
-    cds_offset = (aa_position - 1) * 3
-    with uta_connection.cursor() as cursor:
-        cursor.execute(
-            """
-            SELECT SUBSTRING(s.seq FROM ti.cds_start_i + %s + 1 FOR 3)
-            FROM uta_20241220.tx_info ti
-            JOIN uta_20241220.seq_anno sa ON sa.ac = ti.ac
-            JOIN uta_20241220.seq s ON s.seq_id = sa.seq_id
-            WHERE ti.ac = %s
-            LIMIT 1
-            """,
-            (cds_offset, transcript),
-        )
-        row = cursor.fetchone()
-    if row and row[0] and len(row[0]) == 3:
-        return row[0].upper()
-    return None
-
-
-def _get_wt_codon_for_mode(
-    ref_aa3: str,
-    aa_position: int,
-    transcript: str,
-    wt_codon_mode: str,
-    uta_connection: Any,
-) -> Optional[str]:
-    """Return the WT codon for *ref_aa3* at *aa_position*, respecting *wt_codon_mode*.
-
-    * ``"unambiguous"`` – only Met (ATG) and Trp (TGG); returns ``None`` for all others.
-    * ``"all"``         – uses the hardcoded codon for Met/Trp; queries UTA for the rest.
-    * ``"none"``        – always returns ``None``.
-    """
-    if wt_codon_mode == "unambiguous":
-        return _WT_UNAMBIGUOUS_CODONS.get(ref_aa3)
-    if wt_codon_mode == "all":
-        if ref_aa3 in _WT_UNAMBIGUOUS_CODONS:
-            return _WT_UNAMBIGUOUS_CODONS[ref_aa3]
-        return _lookup_codon_from_uta(transcript, aa_position, uta_connection)
-    return None
-
-
-def _do_map_c_to_g(c_hgvs: str, hgvs_parser: Any, assembly_mapper: Any) -> Optional[str]:
-    """Map *c_hgvs* to a genomic g. HGVS string using the HGVS AssemblyMapper.
-
-    Returns ``None`` and logs a warning on failure (e.g. transcript not in UTA).
-    """
-    try:
-        c_var = hgvs_parser.parse_hgvs_variant(c_hgvs)
-        g_var = assembly_mapper.c_to_g(c_var)
-        return str(g_var)
-    except Exception as exc:
-        logger.warning("WT codon c→g mapping failed for %r: %s", c_hgvs, exc)
-        return None
-
-
-def _capture_hgvs_warnings():
-    """Return a context manager that captures hgvs logger warnings."""
-    class WarningCapture:
-        def __init__(self):
-            self.warnings = []
-            self.handler = None
-            self.hgvs_logger = logging.getLogger("hgvs")
-        
-        def __enter__(self):
-            self.handler = logging.StreamHandler(io.StringIO())
-            self.handler.setLevel(logging.WARNING)
-            # Store original propagate setting
-            self.original_propagate = self.hgvs_logger.propagate
-            self.hgvs_logger.propagate = False
-            self.hgvs_logger.addHandler(self.handler)
-            return self
-        
-        def __exit__(self, *args):
-            if self.handler:
-                # Get any warnings that were logged
-                stream = self.handler.stream
-                if hasattr(stream, 'getvalue'):
-                    content = stream.getvalue()
-                    if content:
-                        self.warnings.append(content.strip())
-                self.hgvs_logger.removeHandler(self.handler)
-            self.hgvs_logger.propagate = self.original_propagate
-        
-        def get_warnings(self) -> str:
-            return "|".join(self.warnings) if self.warnings else ""
-    
-    return WarningCapture()
-
-
-def _derive_joined_hgvs_fields(
-    joined_hgvs: str,
-    *,
-    resolve_missing_ref_alleles: bool,
-    is_genomic: bool = False,
-) -> tuple[str, str, str, str, str, str, str, str]:
-    candidates = _split_hgvs_candidates(joined_hgvs)
-    if not candidates:
-        return "", "", "", "", "", "", "", ""
-
-    starts: list[str] = []
-    stops: list[str] = []
-    refs: list[str] = []
-    alts: list[str] = []
-    touches_intronic: list[str] = []
-    spans_intron: list[str] = []
-    chromosomes: list[str] = []
-    warnings: list[str] = []
-
-    for candidate in candidates:
-        if not candidate:
-            starts.append("")
-            stops.append("")
-            refs.append("")
-            alts.append("")
-            touches_intronic.append("")
-            spans_intron.append("")
-            chromosomes.append("")
-            warnings.append("")
-            continue
-
-        with _capture_hgvs_warnings() as warn_capture:
-            start, stop, ref, alt, touches_intronic_region, spans_intronic_region, chromosome = _parse_hgvs(
-                candidate,
-                resolve_missing_ref_alleles=resolve_missing_ref_alleles,
-            )
-        
-        if alt == "inv" and ref:
-            alt = _reverse_complement(ref)
-        start, stop, ref, alt = _apply_vcf_anchor(candidate, start, stop, ref, alt)
-        starts.append(start or "")
-        stops.append(stop or "")
-        refs.append(ref or "")
-        alts.append(alt or "")
-        touches_intronic.append("true" if touches_intronic_region else "false")
-        spans_intron.append("true" if spans_intronic_region else "false")
-        chromosomes.append(chromosome or "")
-        warnings.append(warn_capture.get_warnings())
-
-    return (
-        "|".join(starts),
-        "|".join(stops),
-        "|".join(refs),
-        "|".join(alts),
-        "|".join(touches_intronic),
-        "|".join(spans_intron),
-        "|".join(chromosomes),
-        "|".join(warnings),
-    )
-
-
-def _populate_derived_hgvs_columns(
-    row: dict[str, str],
-    *,
-    mapped_hgvs_g_col: str,
-    mapped_hgvs_c_col: str,
-    mapped_hgvs_g_chromosome_col: str,
-    mapped_hgvs_c_transcript_col: str,
-    mapped_hgvs_g_start_col: str,
-    mapped_hgvs_g_stop_col: str,
-    mapped_hgvs_g_ref_col: str,
-    mapped_hgvs_g_alt_col: str,
-    mapped_hgvs_c_start_col: str,
-    mapped_hgvs_c_stop_col: str,
-    mapped_hgvs_c_ref_col: str,
-    mapped_hgvs_c_alt_col: str,
-    touches_intronic_region_col: str,
-    spans_intron_col: str,
-    reverse_translation_warnings_col: str,
-    resolve_missing_ref_alleles: bool,
-) -> None:
-    g_start, g_stop, g_ref, g_alt, _, _, g_chromosome, g_warnings = _derive_joined_hgvs_fields(
-        row.get(mapped_hgvs_g_col, ""),
-        resolve_missing_ref_alleles=resolve_missing_ref_alleles,
-        is_genomic=True,
-    )
-    c_start, c_stop, c_ref, c_alt, touches_intronic_region, spans_intron, c_transcript, c_warnings = _derive_joined_hgvs_fields(
-        row.get(mapped_hgvs_c_col, ""),
-        resolve_missing_ref_alleles=resolve_missing_ref_alleles,
-    )
-
-    row[mapped_hgvs_g_chromosome_col] = g_chromosome
-    row[mapped_hgvs_g_start_col] = g_start
-    row[mapped_hgvs_g_stop_col] = g_stop
-    row[mapped_hgvs_g_ref_col] = g_ref
-    row[mapped_hgvs_g_alt_col] = g_alt
-
-    row[mapped_hgvs_c_transcript_col] = c_transcript
-    row[mapped_hgvs_c_start_col] = c_start
-    row[mapped_hgvs_c_stop_col] = c_stop
-    row[mapped_hgvs_c_ref_col] = c_ref
-    row[mapped_hgvs_c_alt_col] = c_alt
-
-    row[touches_intronic_region_col] = touches_intronic_region
-    row[spans_intron_col] = spans_intron
-    
-    # Combine warnings from both g and c columns, with c warnings taking priority
-    combined_warnings = c_warnings if c_warnings else g_warnings
-    row[reverse_translation_warnings_col] = combined_warnings
-
-
 def reverse_translate_protein_variants(
     input_file: str,
     output_file: str,
+    config: TranslationConfig = TranslationConfig(),
+    columns: ColumnConfig = ColumnConfig(),
     *,
-    mapped_hgvs_g_col: str = "mapped_hgvs_g",
-    mapped_hgvs_c_col: str = "mapped_hgvs_c",
-    mapped_hgvs_p_col: str = "mapped_hgvs_p",
-    reverse_translation_error_col: str = "reverse_translation_error",
-    assayed_variant_level_col: str = "assayed_variant_level",
-    mapped_hgvs_g_chromosome_col: str = "mapped_hgvs_g_chromosome",
-    mapped_hgvs_c_transcript_col: str = "mapped_hgvs_c_transcript",
-    mapped_hgvs_g_start_col: str = "mapped_hgvs_g_start",
-    mapped_hgvs_g_stop_col: str = "mapped_hgvs_g_stop",
-    mapped_hgvs_g_ref_col: str = "mapped_hgvs_g_ref",
-    mapped_hgvs_g_alt_col: str = "mapped_hgvs_g_alt",
-    mapped_hgvs_c_start_col: str = "mapped_hgvs_c_start",
-    mapped_hgvs_c_stop_col: str = "mapped_hgvs_c_stop",
-    mapped_hgvs_c_ref_col: str = "mapped_hgvs_c_ref",
-    mapped_hgvs_c_alt_col: str = "mapped_hgvs_c_alt",
-    touches_intronic_region_col: str = "touches_intronic_region",
-    spans_intron_col: str = "spans_intron",
-    reverse_translation_warnings_col: str = "reverse_translation_warnings",
     resolve_missing_ref_alleles: bool = True,
-    transcript_fallback_columns: tuple[str, ...] = (),
-    assembly: str = "GRCh38",
-    include_indels: bool = False,
-    max_indel_size: int = 3,
-    strict_ref_aa: bool = True,
-    use_inv_notation: bool = False,
-    allow_length_changing_stop_candidates: bool = True,
-    wt_codon_mode: str = "none",
     skip: int = 0,
     limit: int = 0,
 ) -> None:
-    if wt_codon_mode not in ("none", "unambiguous", "all"):
-        raise ValueError(f"wt_codon_mode must be 'none', 'unambiguous', or 'all'; got {wt_codon_mode!r}")
-    if wt_codon_mode != "none" and not include_indels:
-        raise ValueError(
-            "--wt-codon-mode requires --include-indels to be enabled, "
-            "because WT codon delins variants are intra-codon insertions/deletions."
-        )
-
     in_sep = _detect_separator(input_file)
     out_sep = _detect_separator(output_file)
     started = time.monotonic()
-    cli_path = _find_reverse_translate_cli()
+
     uta_db_url = (os.environ.get("UTA_DB_URL") or "").strip()
     if not uta_db_url:
         raise RuntimeError("UTA_DB_URL must be set for protein reverse translation.")
 
-    # Lazily-initialized HGVS AssemblyMapper used to map WT codon c. HGVS → g. HGVS.
-    # Captured by closure in flush_block.
-    _wt_hgvs_parser: Any = None
-    _wt_assembly_mapper: Any = None
-    if wt_codon_mode != "none":
-        try:
-            import hgvs.dataproviders.uta as _hgvs_uta  # type: ignore[import-untyped]
-            import hgvs.assemblymapper as _hgvs_am  # type: ignore[import-untyped]
-            import hgvs.parser as _hgvs_parser_module  # type: ignore[import-untyped]
+    with connect_uta(uta_db_url) as uta_conn:
+        transcripts = UtaClient(uta_conn)
+        coordinates = HgvsMapper.from_url(uta_db_url, assembly=config.assembly)
 
-            _wt_hgvs_hdp = _hgvs_uta.connect(uta_db_url)
-            _wt_hgvs_parser = _hgvs_parser_module.Parser()
-            _wt_assembly_mapper = _hgvs_am.AssemblyMapper(
-                _wt_hgvs_hdp,
-                assembly_name=assembly,
-                alt_aln_method="splign",
+        def flush_block(
+            writer: csv.DictWriter,
+            out_handle: Any,
+            block_rows: list[dict[str, str]],
+            block_start_idx: int,
+        ) -> None:
+            if not block_rows:
+                return
+            logger.info(
+                "Translating protein block: rows %d-%d (%d row(s)).",
+                block_start_idx,
+                block_start_idx + len(block_rows) - 1,
+                len(block_rows),
             )
-        except Exception as exc:
-            raise RuntimeError(
-                f"Cannot initialise HGVS AssemblyMapper for WT codon c→g mapping: {exc}"
-            ) from exc
-
-    def flush_block(
-        writer: csv.DictWriter,
-        out_handle,
-        block_rows: list[dict[str, str]],
-        block_start_idx: int,
-    ) -> None:
-        if not block_rows:
-            return
-
-        logger.info(
-            "Reverse-translating contiguous protein block: rows %d-%d (%d row(s)).",
-            block_start_idx,
-            block_start_idx + len(block_rows) - 1,
-            len(block_rows),
-        )
-
-        input_rows: list[dict[str, str]] = []
-        block_errors: list[str] = [""] * len(block_rows)
-        translated_target_indexes: list[int] = []
-
-        for offset, row in enumerate(block_rows):
-            row[assayed_variant_level_col] = "protein"
-            transcript_accession = _resolve_transcript_accession(
-                row,
-                mapped_hgvs_p_col=mapped_hgvs_p_col,
-                transcript_fallback_columns=transcript_fallback_columns,
-                uta_connection=uta_connection,
-            )
-            if not transcript_accession:
-                block_errors[offset] = "Unable to resolve transcript accession for protein reverse translation"
-                continue
-
-            input_rows.append(
-                {
-                    "transcript": transcript_accession,
-                    "hgvs_p": (row.get(mapped_hgvs_p_col) or "").strip(),
-                }
-            )
-            translated_target_indexes.append(offset)
-
-        translated_rows: list[dict[str, str]] = []
-        error_rows: list[dict[str, str]] = []
-        if input_rows:
-            try:
-                translated_rows, error_rows = _run_reverse_translate_batch(
-                    cli_path,
-                    input_rows,
-                    assembly=assembly,
-                    include_indels=include_indels,
-                    max_indel_size=max_indel_size,
-                    strict_ref_aa=strict_ref_aa,
-                    use_inv_notation=use_inv_notation,
-                    allow_length_changing_stop_candidates=allow_length_changing_stop_candidates,
-                )
-            except RuntimeError as exc:
-                for offset in translated_target_indexes:
-                    block_errors[offset] = str(exc)
-                translated_rows = []
-                error_rows = []
-
-        if input_rows and translated_rows and len(translated_rows) != len(input_rows):
-            mismatch_error = (
-                "reverse-translate-variants returned an unexpected number of rows "
-                f"({len(translated_rows)} for {len(input_rows)} inputs)"
-            )
-            for offset in translated_target_indexes:
-                if not block_errors[offset]:
-                    block_errors[offset] = mismatch_error
-            translated_rows = []
-            error_rows = []
-
-        error_messages_by_key: dict[tuple[str, str], list[str]] = defaultdict(list)
-        for error_row in error_rows:
-            error_key = (
-                (error_row.get("transcript") or "").strip(),
-                (error_row.get("hgvs_p") or "").strip(),
-            )
-            error_message = (error_row.get("error") or "").strip()
-            if error_message:
-                error_messages_by_key[error_key].append(error_message)
-
-        for input_row, translated_row, offset in zip(input_rows, translated_rows, translated_target_indexes):
-            row = block_rows[offset]
-            hgvs_c = (translated_row.get("hgvs_c") or "").strip()
-            hgvs_g = (translated_row.get("hgvs_g") or "").strip()
-            error_key = (input_row["transcript"], input_row["hgvs_p"])
-            if error_messages_by_key[error_key]:
-                block_errors[offset] = error_messages_by_key[error_key].pop(0)
-
-            # WT codon handling: append a "c.N_Mdelins{codon}" candidate for
-            # protein variants where ref_aa == alt_aa (e.g. p.Met1Met).
-            if wt_codon_mode != "none":
-                protein_hgvs = (row.get(mapped_hgvs_p_col) or "").strip()
-                aa_change = _parse_protein_hgvs_aa_change(protein_hgvs)
-                if aa_change is not None:
-                    ref_aa3, aa_pos, alt_aa3 = aa_change
-                    if ref_aa3 == alt_aa3:
-                        codon = _get_wt_codon_for_mode(
-                            ref_aa3, aa_pos, input_row["transcript"], wt_codon_mode, uta_connection
-                        )
-                        if codon is not None:
-                            wt_c = _build_wt_c_hgvs(input_row["transcript"], aa_pos, codon)
-                            # Avoid adding a duplicate if the synonymous search already
-                            # returned the same codon (possible when mode is "all").
-                            if wt_c not in set(_split_hgvs_candidates(hgvs_c)):
-                                wt_g = (
-                                    _do_map_c_to_g(wt_c, _wt_hgvs_parser, _wt_assembly_mapper)
-                                    if _wt_assembly_mapper is not None
-                                    else None
-                                )
-                                hgvs_c = f"{hgvs_c}|{wt_c}" if hgvs_c else wt_c
-                                if wt_g:
-                                    hgvs_g = f"{hgvs_g}|{wt_g}" if hgvs_g else wt_g
-
-            row[mapped_hgvs_c_col] = hgvs_c
-            row[mapped_hgvs_g_col] = hgvs_g
-            if not hgvs_c and not hgvs_g and not block_errors[offset]:
-                block_errors[offset] = "Reverse translation returned no candidate DNA variants"
-
-        for offset, row in enumerate(block_rows):
-            if block_errors[offset]:
-                row[reverse_translation_error_col] = _append_error(
-                    row.get(reverse_translation_error_col, ""),
-                    block_errors[offset],
-                )
-            _populate_derived_hgvs_columns(
-                row,
-                mapped_hgvs_g_col=mapped_hgvs_g_col,
-                mapped_hgvs_c_col=mapped_hgvs_c_col,
-                mapped_hgvs_g_chromosome_col=mapped_hgvs_g_chromosome_col,
-                mapped_hgvs_c_transcript_col=mapped_hgvs_c_transcript_col,
-                mapped_hgvs_g_start_col=mapped_hgvs_g_start_col,
-                mapped_hgvs_g_stop_col=mapped_hgvs_g_stop_col,
-                mapped_hgvs_g_ref_col=mapped_hgvs_g_ref_col,
-                mapped_hgvs_g_alt_col=mapped_hgvs_g_alt_col,
-                mapped_hgvs_c_start_col=mapped_hgvs_c_start_col,
-                mapped_hgvs_c_stop_col=mapped_hgvs_c_stop_col,
-                mapped_hgvs_c_ref_col=mapped_hgvs_c_ref_col,
-                mapped_hgvs_c_alt_col=mapped_hgvs_c_alt_col,
-                touches_intronic_region_col=touches_intronic_region_col,
-                spans_intron_col=spans_intron_col,
-                reverse_translation_warnings_col=reverse_translation_warnings_col,
+            process_rows(
+                block_rows,
+                transcripts,
+                coordinates,
+                config,
+                columns,
+                derive_coordinate_fields=True,
                 resolve_missing_ref_alleles=resolve_missing_ref_alleles,
             )
-            writer.writerow(row)
+            for row in block_rows:
+                writer.writerow(row)
             out_handle.flush()
 
-    with psycopg2.connect(**_build_pg_connection_kwargs(uta_db_url)) as uta_connection:
-        with open(input_file, newline="", encoding="utf-8") as in_fh, open(
-            output_file, "w", newline="", encoding="utf-8"
-        ) as out_fh:
+        with (
+            open(input_file, newline="", encoding="utf-8") as in_fh,
+            open(output_file, "w", newline="", encoding="utf-8") as out_fh,
+        ):
             reader = csv.DictReader(in_fh, delimiter=in_sep)
             in_fieldnames = list(reader.fieldnames or [])
             if not in_fieldnames:
                 raise ValueError(f"Input file {input_file!r} is empty or missing a header row.")
 
             out_fieldnames = list(in_fieldnames)
-            for col in (
-                mapped_hgvs_g_col,
-                mapped_hgvs_c_col,
-                mapped_hgvs_p_col,
-                assayed_variant_level_col,
-                mapped_hgvs_g_chromosome_col,
-                mapped_hgvs_c_transcript_col,
-                mapped_hgvs_g_start_col,
-                mapped_hgvs_g_stop_col,
-                mapped_hgvs_g_ref_col,
-                mapped_hgvs_g_alt_col,
-                mapped_hgvs_c_start_col,
-                mapped_hgvs_c_stop_col,
-                mapped_hgvs_c_ref_col,
-                mapped_hgvs_c_alt_col,
-                touches_intronic_region_col,
-                spans_intron_col,
-                reverse_translation_error_col,
-                reverse_translation_warnings_col,
-            ):
+            all_output_cols = (
+                columns.mapped_hgvs_g,
+                columns.mapped_hgvs_c,
+                columns.mapped_hgvs_p,
+                columns.assayed_variant_level,
+                columns.mapped_hgvs_g_chromosome,
+                columns.mapped_hgvs_c_transcript,
+                columns.mapped_hgvs_g_start,
+                columns.mapped_hgvs_g_stop,
+                columns.mapped_hgvs_g_ref,
+                columns.mapped_hgvs_g_alt,
+                columns.mapped_hgvs_c_start,
+                columns.mapped_hgvs_c_stop,
+                columns.mapped_hgvs_c_ref,
+                columns.mapped_hgvs_c_alt,
+                columns.touches_intronic_region,
+                columns.spans_intron,
+                columns.reverse_translation_error,
+                columns.reverse_translation_warnings,
+            )
+            for col in all_output_cols:
                 if col not in out_fieldnames:
                     out_fieldnames.append(col)
 
-            writer = csv.DictWriter(
-                out_fh,
-                fieldnames=out_fieldnames,
-                delimiter=out_sep,
-                extrasaction="ignore",
-            )
+            writer = csv.DictWriter(out_fh, fieldnames=out_fieldnames, delimiter=out_sep, extrasaction="ignore")
             writer.writeheader()
             out_fh.flush()
 
             pending_block: list[dict[str, str]] = []
             pending_block_start_idx = 0
-            n_rows = 0
-            n_protein_origin = 0
-            n_reverse_translated = 0
+            n_rows = n_protein_origin = n_translated = 0
 
             for idx, row in enumerate(reader):
                 if idx < skip:
                     continue
                 if limit > 0 and n_rows >= limit:
                     break
-                protein_origin, target_for_reverse_translation = _classify_row(
-                    row,
-                    mapped_hgvs_g_col=mapped_hgvs_g_col,
-                    mapped_hgvs_c_col=mapped_hgvs_c_col,
-                    mapped_hgvs_p_col=mapped_hgvs_p_col,
-                    assayed_variant_level_col=assayed_variant_level_col,
-                )
-                if protein_origin:
-                    row[assayed_variant_level_col] = "protein"
-                    n_protein_origin += 1
-                elif (row.get(mapped_hgvs_c_col) or "").strip() or (row.get(mapped_hgvs_g_col) or "").strip():
-                    row[assayed_variant_level_col] = "dna"
 
-                if target_for_reverse_translation:
+                protein_origin, target_for_translation = columns.assign_level(row)
+                if protein_origin:
+                    n_protein_origin += 1
+
+                if target_for_translation:
                     if not pending_block:
                         pending_block_start_idx = idx
                     pending_block.append(row)
-                    n_reverse_translated += 1
+                    n_translated += 1
                 else:
                     if pending_block:
                         flush_block(writer, out_fh, pending_block, pending_block_start_idx)
                         pending_block.clear()
-                    _populate_derived_hgvs_columns(
-                        row,
-                        mapped_hgvs_g_col=mapped_hgvs_g_col,
-                        mapped_hgvs_c_col=mapped_hgvs_c_col,
-                        mapped_hgvs_g_chromosome_col=mapped_hgvs_g_chromosome_col,
-                        mapped_hgvs_c_transcript_col=mapped_hgvs_c_transcript_col,
-                        mapped_hgvs_g_start_col=mapped_hgvs_g_start_col,
-                        mapped_hgvs_g_stop_col=mapped_hgvs_g_stop_col,
-                        mapped_hgvs_g_ref_col=mapped_hgvs_g_ref_col,
-                        mapped_hgvs_g_alt_col=mapped_hgvs_g_alt_col,
-                        mapped_hgvs_c_start_col=mapped_hgvs_c_start_col,
-                        mapped_hgvs_c_stop_col=mapped_hgvs_c_stop_col,
-                        mapped_hgvs_c_ref_col=mapped_hgvs_c_ref_col,
-                        mapped_hgvs_c_alt_col=mapped_hgvs_c_alt_col,
-                        touches_intronic_region_col=touches_intronic_region_col,
-                        spans_intron_col=spans_intron_col,
-                        reverse_translation_warnings_col=reverse_translation_warnings_col,
-                        resolve_missing_ref_alleles=resolve_missing_ref_alleles,
-                    )
+                    # Pass-through row: derive coordinate fields from existing hgvs values.
+                    columns.derive_passthrough_fields(row, resolve_missing_ref_alleles=resolve_missing_ref_alleles)
                     writer.writerow(row)
                     out_fh.flush()
 
@@ -842,7 +151,7 @@ def reverse_translate_protein_variants(
                 if n_rows % PROGRESS_EVERY_ROWS == 0:
                     elapsed = max(time.monotonic() - started, 1e-9)
                     logger.info(
-                        "Progress: %d rows processed (%d protein-origin, %d pending reverse translation, %.1f rows/s).",
+                        "Progress: %d rows processed (%d protein-origin, %d pending, %.1f rows/s).",
                         n_rows,
                         n_protein_origin,
                         len(pending_block),
@@ -854,118 +163,77 @@ def reverse_translate_protein_variants(
 
     elapsed = max(time.monotonic() - started, 1e-9)
     logger.info(
-        "Done. %d rows processed, %d protein-origin rows identified, %d protein-only rows reverse-translated (%.1f rows/s).",
+        "Done. %d rows processed, %d protein-origin, %d translated (%.1f rows/s).",
         n_rows,
         n_protein_origin,
-        n_reverse_translated,
+        n_translated,
         n_rows / elapsed,
     )
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Reverse-translate protein-only mapped variants into joined HGVS c./g. candidates.",
+        description="Construct the set of DNA variants protein-equivalent to each input variant.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("input_file", help="Input CSV/TSV file path.")
-    parser.add_argument("output_file", help="Output CSV/TSV file path.")
-    parser.add_argument("--mapped-hgvs-g", dest="mapped_hgvs_g_col", default="mapped_hgvs_g")
-    parser.add_argument("--mapped-hgvs-c", dest="mapped_hgvs_c_col", default="mapped_hgvs_c")
-    parser.add_argument("--mapped-hgvs-p", dest="mapped_hgvs_p_col", default="mapped_hgvs_p")
-    parser.add_argument("--reverse-translation-error", dest="reverse_translation_error_col", default="reverse_translation_error")
-    parser.add_argument("--reverse-translation-warnings", dest="reverse_translation_warnings_col", default="reverse_translation_warnings")
-    parser.add_argument(
-        "--assayed-variant-level",
-        dest="assayed_variant_level_col",
-        default="assayed_variant_level",
-        help="Output column name distinguishing dna vs protein assay level.",
+    parser.add_argument("input_file")
+    parser.add_argument("output_file")
+
+    col = parser.add_argument_group("column names")
+    col.add_argument("--mapped-hgvs-g", dest="mapped_hgvs_g", default="mapped_hgvs_g")
+    col.add_argument("--mapped-hgvs-c", dest="mapped_hgvs_c", default="mapped_hgvs_c")
+    col.add_argument("--mapped-hgvs-p", dest="mapped_hgvs_p", default="mapped_hgvs_p")
+    col.add_argument(
+        "--reverse-translation-error", dest="reverse_translation_error", default="reverse_translation_error"
     )
-    parser.add_argument("--mapped-hgvs-g-chromosome", dest="mapped_hgvs_g_chromosome_col", default="mapped_hgvs_g_chromosome")
-    parser.add_argument("--mapped-hgvs-c-transcript", dest="mapped_hgvs_c_transcript_col", default="mapped_hgvs_c_transcript")
-    parser.add_argument("--mapped-hgvs-g-start", dest="mapped_hgvs_g_start_col", default="mapped_hgvs_g_start")
-    parser.add_argument("--mapped-hgvs-g-stop", dest="mapped_hgvs_g_stop_col", default="mapped_hgvs_g_stop")
-    parser.add_argument("--mapped-hgvs-g-ref", dest="mapped_hgvs_g_ref_col", default="mapped_hgvs_g_ref")
-    parser.add_argument("--mapped-hgvs-g-alt", dest="mapped_hgvs_g_alt_col", default="mapped_hgvs_g_alt")
-    parser.add_argument("--mapped-hgvs-c-start", dest="mapped_hgvs_c_start_col", default="mapped_hgvs_c_start")
-    parser.add_argument("--mapped-hgvs-c-stop", dest="mapped_hgvs_c_stop_col", default="mapped_hgvs_c_stop")
-    parser.add_argument("--mapped-hgvs-c-ref", dest="mapped_hgvs_c_ref_col", default="mapped_hgvs_c_ref")
-    parser.add_argument("--mapped-hgvs-c-alt", dest="mapped_hgvs_c_alt_col", default="mapped_hgvs_c_alt")
-    parser.add_argument("--touches-intronic-region", dest="touches_intronic_region_col", default="touches_intronic_region")
-    parser.add_argument("--spans-intron", dest="spans_intron_col", default="spans_intron")
-    parser.add_argument(
-        "--resolve-missing-ref-alleles",
-        dest="resolve_missing_ref_alleles",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Fill missing ref allele for accession-backed del/delins-like HGVS via HGVS normalization.",
+    col.add_argument(
+        "--reverse-translation-warnings", dest="reverse_translation_warnings", default="reverse_translation_warnings"
     )
-    parser.add_argument(
+    col.add_argument("--assayed-variant-level", dest="assayed_variant_level", default="assayed_variant_level")
+    col.add_argument("--mapped-hgvs-g-chromosome", dest="mapped_hgvs_g_chromosome", default="mapped_hgvs_g_chromosome")
+    col.add_argument("--mapped-hgvs-c-transcript", dest="mapped_hgvs_c_transcript", default="mapped_hgvs_c_transcript")
+    col.add_argument("--mapped-hgvs-g-start", dest="mapped_hgvs_g_start", default="mapped_hgvs_g_start")
+    col.add_argument("--mapped-hgvs-g-stop", dest="mapped_hgvs_g_stop", default="mapped_hgvs_g_stop")
+    col.add_argument("--mapped-hgvs-g-ref", dest="mapped_hgvs_g_ref", default="mapped_hgvs_g_ref")
+    col.add_argument("--mapped-hgvs-g-alt", dest="mapped_hgvs_g_alt", default="mapped_hgvs_g_alt")
+    col.add_argument("--mapped-hgvs-c-start", dest="mapped_hgvs_c_start", default="mapped_hgvs_c_start")
+    col.add_argument("--mapped-hgvs-c-stop", dest="mapped_hgvs_c_stop", default="mapped_hgvs_c_stop")
+    col.add_argument("--mapped-hgvs-c-ref", dest="mapped_hgvs_c_ref", default="mapped_hgvs_c_ref")
+    col.add_argument("--mapped-hgvs-c-alt", dest="mapped_hgvs_c_alt", default="mapped_hgvs_c_alt")
+    col.add_argument("--touches-intronic-region", dest="touches_intronic_region", default="touches_intronic_region")
+    col.add_argument("--spans-intron", dest="spans_intron", default="spans_intron")
+    col.add_argument(
         "--transcript-fallback-column",
         dest="transcript_fallback_columns",
         action="append",
         default=[],
         metavar="COLUMN",
-        help="Additional column containing transcript-anchored HGVS values to mine for transcript accessions.",
     )
-    parser.add_argument("--assembly", default="GRCh38")
-    parser.add_argument("--include-indels", action="store_true", default=False)
-    parser.add_argument("--max-indel-size", type=int, default=3)
-    parser.add_argument(
-        "--no-strict-ref-aa",
-        dest="strict_ref_aa",
-        action="store_false",
-        default=True,
-        help="Disable reference amino-acid validation against the resolved transcript.",
-    )
-    parser.add_argument("--use-inv-notation", action="store_true", default=False)
-    parser.add_argument(
+
+    tx = parser.add_argument_group("translation")
+    tx.add_argument("--assembly", default="GRCh38")
+    tx.add_argument("--include-indels", action="store_true", default=False)
+    tx.add_argument("--max-indel-size", type=int, default=3)
+    tx.add_argument("--no-strict-ref-aa", dest="strict_ref_aa", action="store_false", default=True)
+    tx.add_argument("--use-inv-notation", action="store_true", default=False)
+    tx.add_argument(
         "--substitutions-and-delins-only",
         dest="allow_length_changing_stop_candidates",
         action="store_false",
         default=True,
-        help="For premature stops, suppress length-changing insertion/deletion candidates.",
     )
+    tx.add_argument("--wt-codon-mode", choices=["none", "unambiguous", "all"], default="none")
+
     parser.add_argument(
-        "--wt-codon-mode",
-        dest="wt_codon_mode",
-        choices=["none", "unambiguous", "all"],
-        default="none",
-        help=(
-            "Generate WT codon delins candidates for wild-type protein variants "
-            "(where ref AA == alt AA, e.g. p.Met1Met). "
-            "'none' (default): synonymous variants only. "
-            "'unambiguous': also emit a WT delins for Met and Trp, which have only one codon each. "
-            "'all': also emit a WT delins for every WT protein variant, querying UTA for "
-            "the actual codon when the amino acid has multiple codons. "
-            "Requires --include-indels."
-        ),
+        "--resolve-missing-ref-alleles",
+        dest="resolve_missing_ref_alleles",
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
-    parser.add_argument(
-        "--skip",
-        type=int,
-        default=0,
-        metavar="N",
-        help="Skip the first N input rows (after the header).",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=0,
-        metavar="N",
-        help="Stop after processing N rows (0 = no limit).",
-    )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-    )
-    parser.add_argument(
-        "--csv-field-size-limit",
-        type=int,
-        default=csv.field_size_limit(),
-        metavar="BYTES",
-        help="Maximum per-field character length for CSV/TSV parsing (default: %(default)s).",
-    )
+    parser.add_argument("--skip", type=int, default=0, metavar="N")
+    parser.add_argument("--limit", type=int, default=0, metavar="N")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    parser.add_argument("--csv-field-size-limit", type=int, default=csv.field_size_limit(), metavar="BYTES")
     return parser
 
 
@@ -977,36 +245,41 @@ def main(argv: Optional[list[str]] = None) -> None:
         datefmt="%H:%M:%S",
     )
     csv.field_size_limit(args.csv_field_size_limit)
+
     reverse_translate_protein_variants(
-        input_file=args.input_file,
-        output_file=args.output_file,
-        mapped_hgvs_g_col=args.mapped_hgvs_g_col,
-        mapped_hgvs_c_col=args.mapped_hgvs_c_col,
-        mapped_hgvs_p_col=args.mapped_hgvs_p_col,
-        reverse_translation_error_col=args.reverse_translation_error_col,
-        assayed_variant_level_col=args.assayed_variant_level_col,
-        mapped_hgvs_g_chromosome_col=args.mapped_hgvs_g_chromosome_col,
-        mapped_hgvs_c_transcript_col=args.mapped_hgvs_c_transcript_col,
-        mapped_hgvs_g_start_col=args.mapped_hgvs_g_start_col,
-        mapped_hgvs_g_stop_col=args.mapped_hgvs_g_stop_col,
-        mapped_hgvs_g_ref_col=args.mapped_hgvs_g_ref_col,
-        mapped_hgvs_g_alt_col=args.mapped_hgvs_g_alt_col,
-        mapped_hgvs_c_start_col=args.mapped_hgvs_c_start_col,
-        mapped_hgvs_c_stop_col=args.mapped_hgvs_c_stop_col,
-        mapped_hgvs_c_ref_col=args.mapped_hgvs_c_ref_col,
-        mapped_hgvs_c_alt_col=args.mapped_hgvs_c_alt_col,
-        touches_intronic_region_col=args.touches_intronic_region_col,
-        spans_intron_col=args.spans_intron_col,
-        reverse_translation_warnings_col=args.reverse_translation_warnings_col,
+        args.input_file,
+        args.output_file,
+        TranslationConfig(
+            wt_codon_mode=WtCodonMode(args.wt_codon_mode),
+            assembly=args.assembly,
+            include_indels=args.include_indels,
+            max_indel_size=args.max_indel_size,
+            strict_ref_aa=args.strict_ref_aa,
+            use_inv_notation=args.use_inv_notation,
+            allow_length_changing_stop_candidates=args.allow_length_changing_stop_candidates,
+        ),
+        ColumnConfig(
+            mapped_hgvs_p=args.mapped_hgvs_p,
+            mapped_hgvs_c=args.mapped_hgvs_c,
+            mapped_hgvs_g=args.mapped_hgvs_g,
+            transcript_fallback_columns=tuple(args.transcript_fallback_columns),
+            assayed_variant_level=args.assayed_variant_level,
+            reverse_translation_error=args.reverse_translation_error,
+            reverse_translation_warnings=args.reverse_translation_warnings,
+            mapped_hgvs_g_chromosome=args.mapped_hgvs_g_chromosome,
+            mapped_hgvs_g_start=args.mapped_hgvs_g_start,
+            mapped_hgvs_g_stop=args.mapped_hgvs_g_stop,
+            mapped_hgvs_g_ref=args.mapped_hgvs_g_ref,
+            mapped_hgvs_g_alt=args.mapped_hgvs_g_alt,
+            mapped_hgvs_c_transcript=args.mapped_hgvs_c_transcript,
+            mapped_hgvs_c_start=args.mapped_hgvs_c_start,
+            mapped_hgvs_c_stop=args.mapped_hgvs_c_stop,
+            mapped_hgvs_c_ref=args.mapped_hgvs_c_ref,
+            mapped_hgvs_c_alt=args.mapped_hgvs_c_alt,
+            touches_intronic_region=args.touches_intronic_region,
+            spans_intron=args.spans_intron,
+        ),
         resolve_missing_ref_alleles=args.resolve_missing_ref_alleles,
-        transcript_fallback_columns=tuple(args.transcript_fallback_columns),
-        assembly=args.assembly,
-        include_indels=args.include_indels,
-        max_indel_size=args.max_indel_size,
-        strict_ref_aa=args.strict_ref_aa,
-        use_inv_notation=args.use_inv_notation,
-        allow_length_changing_stop_candidates=args.allow_length_changing_stop_candidates,
-        wt_codon_mode=args.wt_codon_mode,
         skip=args.skip,
         limit=args.limit,
     )

@@ -17,7 +17,7 @@ Usage::
 
 Library usage::
 
-    from src.compare_columns import compare_columns
+    from compare_columns import compare_columns
 
     n_diffs = compare_columns(
         input_file="annotated.tsv",

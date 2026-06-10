@@ -61,7 +61,7 @@ from typing import Optional
 
 import requests
 
-from src.lib.clingen import resolve_clinvar_ids
+from variant_annotation.lib.clingen import resolve_clinvar_ids
 
 # ---------------------------------------------------------------------------
 # Constants
