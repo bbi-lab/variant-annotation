@@ -174,6 +174,66 @@ Protein-only rows that appear consecutively in the input are accumulated into a 
 
 ---
 
+## Library internals
+
+This section is for Python callers (mavedb-api or tests) that use the library
+directly rather than the CLI. See [architecture.md](architecture.md) for the
+broader library structure.
+
+### Public API
+
+```python
+from variant_annotation.lib.translation import (
+    construct_equivalent_variants,  # batch entry point — prefer over calling construct_one in a loop
+    construct_one,                  # single-variant convenience
+    CoordinateTranslator,           # protocol — satisfy with clients/coordinates.py
+    TranscriptSource,               # protocol — satisfy with clients/uta.py
+    TranslationConfig,              # behaviour knobs
+    TranslationResult,              # success output
+    TranslationError,               # failure/skip output
+    VariantInput,                   # input type
+    WtCodonMode,                    # enum for wt_codon_mode
+)
+```
+
+### Collapse → expand
+
+`construct_equivalent_variants` works in two phases. First, every input (p., c.,
+or g. HGVS) is collapsed to a `ProteinConsequence` — c./g. inputs are
+forward-translated, p. inputs resolve their transcript via UTA. Then all
+consequences are expanded via a single `reverse-translate-variants` subprocess
+call that returns the full candidate set. The single subprocess call is
+intentional: startup overhead is amortized across the whole batch. Prefer
+`construct_equivalent_variants` over calling `construct_one` in a loop.
+
+### TranslationError is not always a failure
+
+`TranslationError` covers two distinct cases. A genuine failure means something
+went wrong (transcript not found, subprocess crashed). A no-equivalence-class
+result means the variant is a deletion, insertion, frameshift, or other
+non-substitution — these produce no DNA candidates and surface as
+`TranslationError` with a specific message. Only substitution consequences
+(missense, synonymous, nonsense) have an equivalence class. Callers should
+classify variants by edit type before calling rather than pattern-matching error
+strings after.
+
+### TranslationResult.hgvs_p
+
+`TranslationResult.hgvs_p` is `None` for protein inputs — the caller already has
+the protein string. It is set only for c./g. inputs where the protein consequence
+was derived by forward translation during collapse.
+
+### WtCodonMode requires include_indels
+
+The WT codon candidate is expressed as an intra-codon delins
+(e.g. `NM_…:c.1_3delinsATG`), which is structurally an insertion/deletion.
+`UNAMBIGUOUS` and `ALL` therefore require `include_indels=True`;
+`TranslationConfig.__post_init__` enforces this. `UNAMBIGUOUS` adds only Met/Trp
+(single-codon amino acids) without any UTA call; `ALL` queries UTA for every
+synonymous variant via `codon_at`.
+
+---
+
 ## Troubleshooting
 
 **No candidates returned for a row**
