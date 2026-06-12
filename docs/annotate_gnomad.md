@@ -232,6 +232,27 @@ Histogram arrays (`--age-histograms`, `--allele-balance-histograms`) are stored 
 
 The cache is a superset: you can request a subset of histograms on any given annotation run, as long as all requested fields were included when the cache was built.
 
+### Redis result cache (all execution modes)
+
+In addition to the local Hail table cache, gnomAD lookup results can be cached in Redis so that repeated runs over overlapping variant sets skip the Hail JVM startup or Athena query round-trip entirely.
+
+The Redis cache stores fully resolved `GnomadRecord` values keyed by the variant's lookup key (`chrN:pos:ref:alt` in coordinates mode, or CAID in caid mode). It applies to all four execution paths: Hail coordinates, Hail CAID, Athena coordinates, and Athena CAID.
+
+**Environment variables:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `GNOMAD_CACHE_REDIS_ENABLED` | `1` (enabled) | Set to `0` / `false` to disable entirely |
+| `GNOMAD_CACHE_REDIS_URL` | `redis://redis:6379/0` | Redis connection URL; also falls back to the generic `REDIS_URL` variable |
+| `GNOMAD_CACHE_REDIS_PREFIX` | `gnomad:v1` | Key namespace prefix; bump this value to invalidate all cached entries after a gnomAD release upgrade |
+| `GNOMAD_CACHE_REDIS_TTL_SECONDS` | `604800` (7 days) | TTL for cached entries |
+
+**What is cached:** All fields of every matched gnomAD record — `allele_count`, `allele_number`, `allele_frequency`, `minor_allele_frequency`, `faf95_max`, `faf95_max_ancestry`, `filters`, `exome_filters`, `genome_filters`, `gene_symbols` — plus any histogram arrays (`bin_edges`, `bin_freq`, `n_smaller`, `n_larger` per histogram field) that were populated during the lookup.
+
+**When it helps most:** Athena mode, where each lookup requires at least one query execution round-trip; and any multi-run pipeline where the same or overlapping variant sets are annotated across different input files. In Hail mode it also avoids the JVM startup overhead for variant sets already seen.
+
+**Behaviour when Redis is unavailable:** If Redis is unreachable or the `redis` Python package is not installed, a one-time warning is logged and execution continues without caching. Lookups fall through to the normal Hail or Athena backend unchanged.
+
 ---
 
 ## CLI options

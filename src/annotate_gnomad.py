@@ -25,6 +25,21 @@ Default output columns:
   - <namespace>.<version>.faf95_max
   - <namespace>.<version>.faf95_max_ancestry
 
+Redis caching (optional):
+  Results from Hail/Athena lookups can be cached in Redis to speed up repeated
+  runs over overlapping variant sets.
+
+  GNOMAD_CACHE_REDIS_ENABLED
+      Set to ``0`` / ``false`` to disable Redis caching entirely (default: enabled).
+  GNOMAD_CACHE_REDIS_URL
+      Redis connection URL (default: ``redis://redis:6379/0``; also falls back to
+      the generic ``REDIS_URL`` variable).
+  GNOMAD_CACHE_REDIS_PREFIX
+      Key namespace prefix (default: ``gnomad:v1``).  Bump to invalidate all
+      cached entries after a significant gnomAD release.
+  GNOMAD_CACHE_REDIS_TTL_SECONDS
+      TTL for cached entries, in seconds (default: 604800 — 7 days).
+
 Usage:
     python -m src.annotate_gnomad input.tsv output.tsv [OPTIONS]
 """
@@ -34,6 +49,7 @@ from __future__ import annotations
 import argparse
 import csv
 from itertools import islice
+import json
 import logging
 import os
 import re
@@ -120,6 +136,183 @@ class GnomadRecord:
     histograms: dict = field(default_factory=dict)
 
 
+# ---------------------------------------------------------------------------
+# Redis cache for gnomAD lookups
+# ---------------------------------------------------------------------------
+
+GNOMAD_CACHE_REDIS_URL_DEFAULT = "redis://redis:6379/0"
+GNOMAD_CACHE_REDIS_PREFIX_DEFAULT = "gnomad:v1"
+GNOMAD_CACHE_REDIS_TTL_SECONDS_DEFAULT = 7 * 86400  # 7 days
+
+_GNOMAD_REDIS_CLIENT: Any = None
+_GNOMAD_REDIS_INIT_ATTEMPTED = False
+_GNOMAD_REDIS_UNAVAILABLE_LOGGED = False
+
+
+def _gnomad_env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _gnomad_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; using default=%d", name, raw, default)
+        return default
+
+
+def _gnomad_cache_enabled() -> bool:
+    return _gnomad_env_bool("GNOMAD_CACHE_REDIS_ENABLED", True)
+
+
+def _gnomad_cache_redis_url() -> str:
+    return (
+        os.environ.get("GNOMAD_CACHE_REDIS_URL")
+        or os.environ.get("REDIS_URL")
+        or GNOMAD_CACHE_REDIS_URL_DEFAULT
+    )
+
+
+def _gnomad_cache_prefix() -> str:
+    return (os.environ.get("GNOMAD_CACHE_REDIS_PREFIX") or GNOMAD_CACHE_REDIS_PREFIX_DEFAULT).strip()
+
+
+def _gnomad_cache_ttl() -> int:
+    return max(1, _gnomad_env_int("GNOMAD_CACHE_REDIS_TTL_SECONDS", GNOMAD_CACHE_REDIS_TTL_SECONDS_DEFAULT))
+
+
+def _gnomad_redis_cache_key(lookup_key: str) -> str:
+    return f"{_gnomad_cache_prefix()}:{lookup_key}"
+
+
+def _gnomad_get_redis_client(*, force: bool = False):
+    """Return a Redis client for gnomAD caching, or None if unavailable/disabled."""
+    global _GNOMAD_REDIS_CLIENT
+    global _GNOMAD_REDIS_INIT_ATTEMPTED
+    global _GNOMAD_REDIS_UNAVAILABLE_LOGGED
+
+    if not force and not _gnomad_cache_enabled():
+        return None
+    if _GNOMAD_REDIS_CLIENT is not None:
+        return _GNOMAD_REDIS_CLIENT
+    if _GNOMAD_REDIS_INIT_ATTEMPTED:
+        return None
+
+    _GNOMAD_REDIS_INIT_ATTEMPTED = True
+    try:
+        import redis  # type: ignore[import-not-found]
+
+        client = redis.Redis.from_url(_gnomad_cache_redis_url(), decode_responses=True)
+        client.ping()
+        _GNOMAD_REDIS_CLIENT = client
+        logger.info("gnomAD Redis cache connected: %s", _gnomad_cache_redis_url())
+        return _GNOMAD_REDIS_CLIENT
+    except Exception as exc:
+        if not _GNOMAD_REDIS_UNAVAILABLE_LOGGED:
+            logger.warning("gnomAD Redis cache unavailable; continuing without cache: %s", exc)
+            _GNOMAD_REDIS_UNAVAILABLE_LOGGED = True
+        return None
+
+
+def _gnomad_record_to_dict(record: GnomadRecord) -> dict:
+    hist_data: dict = {}
+    for field_name, hist in record.histograms.items():
+        if hist is None:
+            hist_data[field_name] = None
+        else:
+            hist_data[field_name] = {
+                "bin_edges": hist.bin_edges,
+                "bin_freq": hist.bin_freq,
+                "n_smaller": hist.n_smaller,
+                "n_larger": hist.n_larger,
+            }
+    return {
+        "caid": record.caid,
+        "allele_count": record.allele_count,
+        "allele_number": record.allele_number,
+        "allele_frequency": record.allele_frequency,
+        "minor_allele_frequency": record.minor_allele_frequency,
+        "faf95_max": record.faf95_max,
+        "faf95_max_ancestry": record.faf95_max_ancestry,
+        "filters": record.filters,
+        "exome_filters": record.exome_filters,
+        "genome_filters": record.genome_filters,
+        "gene_symbols": record.gene_symbols,
+        "histograms": hist_data,
+    }
+
+
+def _gnomad_record_from_dict(data: dict) -> GnomadRecord:
+    hist_raw = data.get("histograms") or {}
+    histograms: dict = {}
+    for field_name, h in hist_raw.items():
+        if h is None:
+            histograms[field_name] = None
+        else:
+            histograms[field_name] = HistogramData(
+                bin_edges=[float(e) for e in h.get("bin_edges", [])],
+                bin_freq=[int(f) for f in h.get("bin_freq", [])],
+                n_smaller=int(h.get("n_smaller", 0)),
+                n_larger=int(h.get("n_larger", 0)),
+            )
+    return GnomadRecord(
+        caid=str(data.get("caid", "")),
+        allele_count=int(data.get("allele_count", 0)),
+        allele_number=int(data.get("allele_number", 0)),
+        allele_frequency=float(data.get("allele_frequency", 0.0)),
+        minor_allele_frequency=float(data.get("minor_allele_frequency", 0.0)),
+        faf95_max=float(data["faf95_max"]) if data.get("faf95_max") is not None else None,
+        faf95_max_ancestry=str(data.get("faf95_max_ancestry", "")),
+        filters=str(data.get("filters", "")),
+        exome_filters=str(data.get("exome_filters", "")),
+        genome_filters=str(data.get("genome_filters", "")),
+        gene_symbols=str(data.get("gene_symbols", "")),
+        histograms=histograms,
+    )
+
+
+def _gnomad_cache_get_many(keys: list[str]) -> dict[str, GnomadRecord]:
+    """Batch-fetch gnomAD records from Redis. Returns only keys that had cache hits."""
+    client = _gnomad_get_redis_client()
+    if client is None or not keys:
+        return {}
+    redis_keys = [_gnomad_redis_cache_key(k) for k in keys]
+    try:
+        values = client.mget(redis_keys)
+    except Exception:
+        return {}
+    result: dict[str, GnomadRecord] = {}
+    for lookup_key, value in zip(keys, values):
+        if value is None:
+            continue
+        try:
+            result[lookup_key] = _gnomad_record_from_dict(json.loads(value))
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+            continue
+    return result
+
+
+def _gnomad_cache_set_many(records: dict[str, GnomadRecord]) -> None:
+    """Store a batch of lookup_key → GnomadRecord mappings in Redis."""
+    client = _gnomad_get_redis_client()
+    if client is None or not records:
+        return
+    try:
+        pipe = client.pipeline(transaction=False)
+        ttl = _gnomad_cache_ttl()
+        for lookup_key, record in records.items():
+            pipe.set(_gnomad_redis_cache_key(lookup_key), json.dumps(_gnomad_record_to_dict(record)), ex=ttl)
+        pipe.execute()
+    except Exception as exc:
+        logger.debug("gnomAD Redis cache write failed: %s", exc)
+
+
 def _import_hail():
     try:
         import hail as hl  # type: ignore
@@ -165,10 +358,19 @@ def _hail_init_kwargs(tmp_dir: Path, source_uri: str) -> dict[str, Any]:
     # even though no work is being done.  600s is generous enough not to fire
     # during normal GCS latency spikes.
     network_timeout = os.environ.get("SPARK_NETWORK_TIMEOUT", "600s").strip()
+    # GNOMAD_CACHE_PARTITIONS controls the sort output partition count for the
+    # key_by shuffle during cache writes.  Without this, Hail picks a count
+    # based on core count or data size heuristics (~500 for gnomAD v4.1),
+    # leaving the sort output larger than the naive_coalesced read phase.
+    # Setting spark.default.parallelism and spark.sql.shuffle.partitions to
+    # the same target aligns all three phases (read, sort, write) at 200.
+    cache_partitions = os.environ.get("GNOMAD_CACHE_PARTITIONS", "200").strip()
     base_spark_conf: dict[str, Any] = {
         "spark.local.dir": spark_local_dir,
         "spark.network.timeout": network_timeout,
         "spark.executor.heartbeatInterval": "60s",
+        "spark.default.parallelism": cache_partitions,
+        "spark.sql.shuffle.partitions": cache_partitions,
     }
     if not _is_gs_uri(source_uri):
         kwargs["spark_conf"] = base_spark_conf
@@ -1007,6 +1209,21 @@ def ensure_local_gnomad_ht(
                     "in the source table; gene filter skipped"
                 )
 
+        # Coalesce to reduce the number of Spark tasks for the write.
+        # The gnomAD joint v4.1 HT has ~9,800 partitions; naive_coalesce groups
+        # adjacent partitions without a shuffle so the write + key_by sort work on
+        # far fewer tasks. This also speeds up the subsequent filter().collect()
+        # lookup proportionally. Override via GNOMAD_CACHE_PARTITIONS env var.
+        _target_partitions = int(os.environ.get("GNOMAD_CACHE_PARTITIONS", "200"))
+        _source_n = source_ht.n_partitions()
+        if _source_n > _target_partitions:
+            logger.info(
+                "Coalescing source table from %d to %d partitions before cache write",
+                _source_n,
+                _target_partitions,
+            )
+            source_ht = source_ht.naive_coalesce(_target_partitions)
+
         progress_logger.set_stage("preparing local cache projection")
 
         # Resolve allele counts across known gnomAD schema variants:
@@ -1163,7 +1380,11 @@ def ensure_local_gnomad_ht(
                 + source_ht.alleles[1]
             )
             prepared = source_ht.select(gnomad_key=gnomad_key_expr, **common_select)
-            prepared = prepared.key_by(prepared.gnomad_key)
+            # key_by() with no arguments declares the table unkeyed, avoiding the
+            # sort/shuffle that key_by(gnomad_key) would require.  The sort index
+            # is never used — lookups do filter(literal.contains(gnomad_key)).collect()
+            # (a full scan), so the sort buys nothing and costs ~9,800 tasks.
+            prepared = prepared.key_by()
 
         logger.info("Writing local gnomAD cache table: %s", ht_path)
         progress_logger.set_stage("writing local cache table")
@@ -1236,6 +1457,13 @@ def load_gnomad_records_for_caids(
     if not caids:
         return {}
 
+    redis_hits = _gnomad_cache_get_many(list(caids))
+    if redis_hits:
+        logger.debug("gnomAD Redis cache: %d/%d CAID hits", len(redis_hits), len(caids))
+    caids_to_fetch = caids - set(redis_hits.keys())
+    if not caids_to_fetch:
+        return redis_hits
+
     hl = _import_hail()
     hail_tmp = cache_dir / "hail-tmp"
     hail_tmp.mkdir(parents=True, exist_ok=True)
@@ -1253,9 +1481,9 @@ def load_gnomad_records_for_caids(
             logger.info(
                 "gnomAD lookup strategy: caid-indexed local cache (case 1) — "
                 "filtering %d CAIDs directly",
-                len(caids),
+                len(caids_to_fetch),
             )
-            caid_literal = hl.literal(caids)
+            caid_literal = hl.literal(caids_to_fetch)
             key_expr = getattr(ht, key_field)
             filtered = ht.filter(caid_literal.contains(key_expr))
             rows = filtered.collect()
@@ -1265,21 +1493,21 @@ def load_gnomad_records_for_caids(
                 logger.info(
                     "gnomAD lookup strategy: pre-computed coordinate columns (case 2) — "
                     "resolved %d/%d CAIDs to gnomad_key",
-                    sum(1 for c in caids if c in caid_to_gnomad_key),
-                    len(caids),
+                    sum(1 for c in caids_to_fetch if c in caid_to_gnomad_key),
+                    len(caids_to_fetch),
                 )
-                resolved = {k: v for k, v in caid_to_gnomad_key.items() if k in caids}
+                resolved = {k: v for k, v in caid_to_gnomad_key.items() if k in caids_to_fetch}
             else:
                 logger.info(
                     "gnomAD lookup strategy: ClinGen Allele Registry API lookups (case 3) — "
                     "resolving %d CAIDs to GRCh38 coordinates",
-                    len(caids),
+                    len(caids_to_fetch),
                 )
                 from src.lib.clingen import resolve_grch38_coordinates  # local import to keep Hail optional
 
                 coord_cache: dict[str, Optional[tuple[str, int, str, str]]] = {}
                 resolved = {}
-                for caid in caids:
+                for caid in caids_to_fetch:
                     coords = resolve_grch38_coordinates(caid, coord_cache)
                     if coords is not None:
                         chrom, pos, ref, alt = coords
@@ -1346,6 +1574,8 @@ def load_gnomad_records_for_caids(
             gene_symbols=str(getattr(row, "vep_gene_symbols", "") or ""),
             histograms=histograms,
         )
+    _gnomad_cache_set_many(out)
+    out.update(redis_hits)
     return out
 
 
@@ -1363,8 +1593,15 @@ def load_gnomad_records_for_caids_athena(
     if not caids:
         return {}
 
+    redis_hits = _gnomad_cache_get_many(list(caids))
+    if redis_hits:
+        logger.debug("gnomAD Redis cache: %d/%d CAID hits (Athena)", len(redis_hits), len(caids))
+    caids_to_fetch = caids - set(redis_hits.keys())
+    if not caids_to_fetch:
+        return redis_hits
+
     rows = _load_athena_rows_for_caids(
-        sorted(caids),
+        sorted(caids_to_fetch),
         database=database,
         table=table,
         output_location=output_location,
@@ -1412,6 +1649,8 @@ def load_gnomad_records_for_caids_athena(
             faf95_max_ancestry=faf95_max_ancestry,
         )
 
+    _gnomad_cache_set_many(out)
+    out.update(redis_hits)
     return out
 
 
@@ -1441,9 +1680,16 @@ def load_gnomad_records_by_gnomad_keys_athena(
     if not gnomad_keys:
         return {}
 
+    redis_hits = _gnomad_cache_get_many(list(gnomad_keys))
+    if redis_hits:
+        logger.debug("gnomAD Redis cache: %d/%d coordinate key hits (Athena)", len(redis_hits), len(gnomad_keys))
+    keys_to_fetch = gnomad_keys - set(redis_hits.keys())
+    if not keys_to_fetch:
+        return redis_hits
+
     if query_strategy == "by-chromosome":
         rows = _load_athena_rows_for_coords_by_chrom(
-            sorted(gnomad_keys),
+            sorted(keys_to_fetch),
             database=database,
             table=table,
             output_location=output_location,
@@ -1454,10 +1700,10 @@ def load_gnomad_records_by_gnomad_keys_athena(
             max_allele_length=max_allele_length,
         )
         # Post-filter: keep only rows whose (contig, pos, ref, alt) match a requested key.
-        wanted_keys = gnomad_keys
+        wanted_keys = keys_to_fetch
     else:
         rows = _load_athena_rows_for_coords(
-            sorted(gnomad_keys),
+            sorted(keys_to_fetch),
             database=database,
             table=table,
             output_location=output_location,
@@ -1467,7 +1713,7 @@ def load_gnomad_records_by_gnomad_keys_athena(
             poll_seconds=poll_seconds,
             max_allele_length=max_allele_length,
         )
-        wanted_keys = gnomad_keys
+        wanted_keys = keys_to_fetch
 
     out: dict[str, GnomadRecord] = {}
     for row in rows:
@@ -1513,6 +1759,8 @@ def load_gnomad_records_by_gnomad_keys_athena(
             faf95_max_ancestry=faf95_max_ancestry,
         )
 
+    _gnomad_cache_set_many(out)
+    out.update(redis_hits)
     return out
 
 
@@ -1709,6 +1957,13 @@ def load_gnomad_records_by_gnomad_keys(
     if not gnomad_keys:
         return {}
 
+    redis_hits = _gnomad_cache_get_many(list(gnomad_keys))
+    if redis_hits:
+        logger.debug("gnomAD Redis cache: %d/%d coordinate key hits", len(redis_hits), len(gnomad_keys))
+    keys_to_fetch = gnomad_keys - set(redis_hits.keys())
+    if not keys_to_fetch:
+        return redis_hits
+
     hl = _import_hail()
     hail_tmp = cache_dir / "hail-tmp"
     hail_tmp.mkdir(parents=True, exist_ok=True)
@@ -1720,7 +1975,7 @@ def load_gnomad_records_by_gnomad_keys(
         except Exception:
             key_field = "gnomad_key"
 
-        key_literal = hl.literal(gnomad_keys)
+        key_literal = hl.literal(keys_to_fetch)
 
         hist_fields = histogram_field_names or []
 
@@ -1801,6 +2056,8 @@ def load_gnomad_records_by_gnomad_keys(
     finally:
         hl.stop()
 
+    _gnomad_cache_set_many(out)
+    out.update(redis_hits)
     return out
 
 

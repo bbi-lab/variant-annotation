@@ -403,6 +403,7 @@ Both flags treat a missing gnomAD match as "no annotation" (columns left empty) 
 - Supports custom DNA ID column via `--dna-clingen-allele-id-col` if needed
 - Cache refresh: use `--refresh-cache` flag to re-download the source table
 - Histogram columns (`--age-histograms`, `--allele-balance-histograms`) must be requested both when building the cache and when annotating; passing them to an older cache logs a warning and omits those columns
+- Lookup results are also cached in Redis between runs when Redis is available (`GNOMAD_CACHE_REDIS_ENABLED`); useful when annotating overlapping variant sets across multiple runs
 
 #### Athena execution mode (alternative to Hail)
 
@@ -438,6 +439,7 @@ src/scripts/run_annotate_gnomad.sh output_clinvar.tsv output_final.tsv \
 - Requires `boto3` (included in project dependencies via `pyproject.toml`); AWS credentials must be available in the standard boto3 credential chain (environment variables, instance profile, `~/.aws/credentials`, etc.)
 - Input rows are processed in batches; output is written and flushed after each batch, preserving input row order
 - CAID lookups are cached in memory across batches to avoid redundant Athena queries within a single run
+- Results are also persisted to Redis between runs when Redis is available (`GNOMAD_CACHE_REDIS_ENABLED`), avoiding Athena round-trips for variants seen in previous runs
 - `--download-only` and `--refresh-cache` flags are ignored in Athena mode (no local cache involved)
 - All six output columns are pipe-delimited and candidate-aligned (same format as Hail mode)
 
