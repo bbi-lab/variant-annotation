@@ -239,6 +239,8 @@ src/scripts/run_map_variants.sh input.tsv output.tsv \
 - Use `--max-clingen-concurrency 3` to reduce the chance of rate-limit errors from the ClinGen API for large inputs (default: 5)
 - Use `--skip N` to resume an interrupted run from row N
 - Use `--merge-existing prior_output.tsv` to reuse results from a previous partial run without re-processing matched rows
+- Use `--preferred-transcript NM_ACCESSION` (e.g. `--preferred-transcript NM_007194.4`) to force a specific MANE Select transcript for all groups when automatic selection picks the wrong one
+- Use `--preferred-transcript-col COLUMN` to specify the preferred transcript per row from a column in the input file; blank values fall back to automatic selection (or `--preferred-transcript` if also provided)
 - See [docs/map_variants.md](docs/map_variants.md) for all options, dependency setup, and troubleshooting
 - See [BLAT Error 137 Retry Strategy](#blat-error-137-retry-strategy) for handling memory issues
 

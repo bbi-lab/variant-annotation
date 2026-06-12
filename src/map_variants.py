@@ -1335,6 +1335,59 @@ def _try_import_dcd_mapping() -> dict:
     }
 
 
+async def _build_tx_select_from_nm(nm: str, target_sequence: str):
+    """Build a TxSelectResult from a caller-specified NM_ accession.
+
+    Resolves the protein accession by checking the MANE table first, then falling
+    back to a UTA query.  Retrieves the reference protein sequence from seqrepo.
+    Raises ``ValueError`` if the NM_ accession cannot be resolved.
+    """
+    from Bio.Seq import Seq  # noqa: PLC0415
+    from cool_seq_tool.schemas import TranscriptPriority  # noqa: PLC0415
+    from dcd_mapping.lookup import get_mane_transcripts, get_protein_accession, get_sequence  # noqa: PLC0415
+    from dcd_mapping.schemas import TxSelectResult  # noqa: PLC0415
+
+    # Prefer the MANE table to avoid UTA version mismatches.
+    np: Optional[str] = None
+    mane_hits = get_mane_transcripts([nm])
+    if mane_hits:
+        np = mane_hits[0].refseq_prot
+        logger.debug("Resolved %r → %r via MANE table.", nm, np)
+    else:
+        np = await get_protein_accession(nm)
+        if np:
+            logger.debug("Resolved %r → %r via UTA.", nm, np)
+
+    if not np:
+        raise ValueError(
+            f"Could not resolve protein accession for preferred transcript {nm!r}. "
+            "Check that the accession is in the MANE table or UTA "
+            "(include the version suffix, e.g. NM_007194.4)."
+        )
+    ref_seq = get_sequence(np)
+
+    # Translate DNA target to protein when necessary (mirrors dcd_mapping logic).
+    if len(set(target_sequence)) <= 4:
+        protein_seq = str(Seq(target_sequence).translate(table="1")).replace("*", "")
+    else:
+        protein_seq = target_sequence
+
+    is_full_match = bool(protein_seq) and protein_seq in ref_seq
+    start = ref_seq.find(protein_seq[:10]) if protein_seq else 0
+    if start < 0:
+        start = 0
+
+    return TxSelectResult(
+        nm=nm,
+        np=np,
+        start=start,
+        is_full_match=is_full_match,
+        sequence=ref_seq,
+        transcript_mode=TranscriptPriority.MANE_SELECT,
+        hgnc_symbol=None,
+    )
+
+
 def _is_dna_sequence(sequence: str) -> bool:
     """Return True if *sequence* appears to be nucleotide rather than protein."""
     nucleotide_chars = frozenset("ATGCNUatgcnuRYSWKMBDHVryswkmbdhv \t\n")
@@ -1410,6 +1463,7 @@ async def _run_dcd_mapping_pipeline(
     allow_row_fallback: bool = True,
     precomputed_align_result=None,
     precomputed_transcript=None,
+    preferred_transcript_nm: Optional[str] = None,
 ) -> tuple[list[tuple[int, Optional[str], str]], Optional[str], Optional[int]]:
     """Run the full dcd_mapping pipeline for one group of rows sharing a target sequence.
 
@@ -1492,58 +1546,80 @@ async def _run_dcd_mapping_pipeline(
             logger.debug("BLAT alignment failure details:", exc_info=True)
             return _fail_all(f"BLAT alignment failed: {_format_exc(exc)}")
 
-        logger.info("Selecting transcripts for group %r.", group_name)
-        try:
-            transcripts = await select_transcripts(metadata, records, alignment_results)
-        except Exception as exc:
-            logger.error(
-                "Transcript selection failed for group %r: %s",
+        if preferred_transcript_nm is not None:
+            logger.info(
+                "Using preferred transcript %r for group %r (skipping automatic selection).",
+                preferred_transcript_nm,
                 group_name,
-                _format_exc(exc),
             )
-            logger.debug("Transcript selection full-group failure details:", exc_info=True)
-
-            # Retry transcript selection with a single representative row. Some
-            # dcd_mapping paths can fail on large record sets even when one-row
-            # selection succeeds and can be reused for the full group.
             try:
-                representative_records = {group_name: score_rows[:1]}
-                transcripts = await select_transcripts(metadata, representative_records, alignment_results)
-                logger.info(
-                    "Transcript selection retry (single representative row) succeeded for group %r.",
+                preferred_tx = await _build_tx_select_from_nm(
+                    preferred_transcript_nm, target_sequence
+                )
+                transcripts = {group_name: preferred_tx}
+            except Exception as exc:
+                logger.warning(
+                    "Could not build TxSelectResult for preferred transcript %r (%s); "
+                    "falling back to automatic transcript selection for group %r.",
+                    preferred_transcript_nm,
+                    _format_exc(exc),
                     group_name,
                 )
-            except Exception as retry_exc:
+                preferred_transcript_nm = None  # clear so fall-through uses normal path
+
+        if preferred_transcript_nm is None:
+            logger.info("Selecting transcripts for group %r.", group_name)
+            try:
+                transcripts = await select_transcripts(metadata, records, alignment_results)
+            except Exception as exc:
                 logger.error(
-                    "Transcript selection retry failed for group %r: %s",
+                    "Transcript selection failed for group %r: %s",
                     group_name,
-                    _format_exc(retry_exc),
+                    _format_exc(exc),
                 )
-                logger.debug("Transcript selection retry failure details:", exc_info=True)
-                if allow_row_fallback and len(row_entries) > 1:
-                    logger.warning(
-                        "Falling back to per-row mapping for group %r after transcript selection failure.",
+                logger.debug("Transcript selection full-group failure details:", exc_info=True)
+
+                # Retry transcript selection with a single representative row. Some
+                # dcd_mapping paths can fail on large record sets even when one-row
+                # selection succeeds and can be reused for the full group.
+                try:
+                    representative_records = {group_name: score_rows[:1]}
+                    transcripts = await select_transcripts(metadata, representative_records, alignment_results)
+                    logger.info(
+                        "Transcript selection retry (single representative row) succeeded for group %r.",
                         group_name,
                     )
-                    merged_results: list[tuple[int, Optional[str], str, Optional[str], Optional[str]]] = []
-                    selected_transcript_nm: Optional[str] = None
-                    selected_strand: Optional[int] = None
-                    for orig_idx, hgvs_nt, hgvs_pro, case in row_entries:
-                        one_row_results, one_tx_nm, one_strand = await _run_dcd_mapping_pipeline(
-                            group_name=f"{group_name}#row{orig_idx}",
-                            target_sequence=target_sequence,
-                            row_entries=[(orig_idx, hgvs_nt, hgvs_pro, case)],
-                            dcd=dcd,
-                            allow_row_fallback=False,
+                except Exception as retry_exc:
+                    logger.error(
+                        "Transcript selection retry failed for group %r: %s",
+                        group_name,
+                        _format_exc(retry_exc),
+                    )
+                    logger.debug("Transcript selection retry failure details:", exc_info=True)
+                    if allow_row_fallback and len(row_entries) > 1:
+                        logger.warning(
+                            "Falling back to per-row mapping for group %r after transcript selection failure.",
+                            group_name,
                         )
-                        merged_results.extend(one_row_results)
-                        if selected_transcript_nm is None and one_tx_nm is not None:
-                            selected_transcript_nm = one_tx_nm
-                        if selected_strand is None and one_strand is not None:
-                            selected_strand = one_strand
-                    return merged_results, selected_transcript_nm, selected_strand
+                        merged_results: list[tuple[int, Optional[str], str, Optional[str], Optional[str]]] = []
+                        selected_transcript_nm: Optional[str] = None
+                        selected_strand: Optional[int] = None
+                        for orig_idx, hgvs_nt, hgvs_pro, case in row_entries:
+                            one_row_results, one_tx_nm, one_strand = await _run_dcd_mapping_pipeline(
+                                group_name=f"{group_name}#row{orig_idx}",
+                                target_sequence=target_sequence,
+                                row_entries=[(orig_idx, hgvs_nt, hgvs_pro, case)],
+                                dcd=dcd,
+                                allow_row_fallback=False,
+                            )
+                            merged_results.extend(one_row_results)
+                            if selected_transcript_nm is None and one_tx_nm is not None:
+                                selected_transcript_nm = one_tx_nm
+                            if selected_strand is None and one_strand is not None:
+                                selected_strand = one_strand
+                        return merged_results, selected_transcript_nm, selected_strand
 
-                return _fail_all(f"Transcript selection failed: {_format_exc(retry_exc)}")
+                    return _fail_all(f"Transcript selection failed: {_format_exc(retry_exc)}")
 
     transcript = transcripts.get(group_name)
     transcript_nm: Optional[str] = None
@@ -1717,6 +1793,8 @@ def map_variants(
     merge_existing_files: tuple[str, ...] = (),
     merge_match_columns: tuple[str, ...] = (),
     normalize_hgvs: bool = False,
+    preferred_transcript: Optional[str] = None,
+    preferred_transcript_col: Optional[str] = None,
 ) -> None:
     """Map variants in *input_file* to human-genome reference HGVS strings.
 
@@ -1763,6 +1841,16 @@ def map_variants(
         normalize_hgvs: If True, normalize relaxed case-2/3 HGVS inputs before
             case detection and mapping (for example ``A334C`` -> ``p.Ala334Cys``;
             ``123A>G`` -> ``c.123A>G``).
+        preferred_transcript: NM_ accession to use as the reference transcript for all
+            sequence-based groups (cases 2 and 3), overriding automatic MANE/UTA
+            selection.  Must include the version suffix (e.g. ``NM_007194.4``).  If the
+            accession cannot be resolved in UTA the mapper falls back to automatic
+            selection and emits a warning.
+        preferred_transcript_col: Optional column in the input file whose value
+            specifies the preferred NM_ accession for each sequence-based group.
+            Blank values are ignored; the global ``preferred_transcript`` is used as a
+            fallback when the column is blank or absent.  The column value is assumed to
+            be the same for all rows in a group (i.e. rows sharing a target sequence).
         preserve_order: Order guarantee for output rows. Options are:
             'no': Write immediately as results arrive; groups may appear
                 out-of-order. Fastest mode.
@@ -2075,6 +2163,15 @@ def map_variants(
             group_rows_by_idx = {r[0]: r[1] for r in group_rows}
             row_entries = [(r[0], r[2], r[3], r[4]) for r in group_rows]
 
+            # Per-group preferred transcript: column value takes precedence over global.
+            effective_preferred_transcript = preferred_transcript
+            if preferred_transcript_col:
+                for r in group_rows:
+                    col_val = (r[1].get(preferred_transcript_col) or "").strip()
+                    if col_val:
+                        effective_preferred_transcript = col_val
+                        break
+
             per_row = None
             transcript_nm = None
             strand: Optional[int] = None
@@ -2085,7 +2182,8 @@ def map_variants(
                 for attempt in range(1, dcd_max_retry_attempts + 1):
                     try:
                         per_row, transcript_nm, strand = sequence_loop.run_until_complete(
-                            _run_dcd_mapping_pipeline(group_name, target_seq, row_entries, dcd_for_groups)
+                            _run_dcd_mapping_pipeline(group_name, target_seq, row_entries, dcd_for_groups,
+                                                      preferred_transcript_nm=effective_preferred_transcript)
                         )
                         break
                     except Exception as exc:
@@ -2106,7 +2204,8 @@ def map_variants(
                                 chunk_name = f"{group_name}#retry{attempt}_chunk{start_idx // chunk_sz + 1}"
                                 try:
                                     chunk_per_row, chunk_tx, chunk_strand = sequence_loop.run_until_complete(
-                                        _run_dcd_mapping_pipeline(chunk_name, target_seq, chunk_entries, dcd_for_groups)
+                                        _run_dcd_mapping_pipeline(chunk_name, target_seq, chunk_entries, dcd_for_groups,
+                                                                  preferred_transcript_nm=effective_preferred_transcript)
                                     )
                                     per_row.extend(chunk_per_row)
                                     if transcript_nm is None:
@@ -2415,6 +2514,15 @@ def map_variants(
                     group_rows_by_idx = {r[0]: r[1] for r in group_rows}
                     row_entries = [(r[0], r[2], r[3], r[4]) for r in group_rows]
 
+                    # Per-group preferred transcript: column value takes precedence over global.
+                    effective_preferred_transcript = preferred_transcript
+                    if preferred_transcript_col:
+                        for r in group_rows:
+                            col_val = (r[1].get(preferred_transcript_col) or "").strip()
+                            if col_val:
+                                effective_preferred_transcript = col_val
+                                break
+
                     # Try to process the full group; retry with chunking on BLAT error 137
                     per_row = None
                     transcript_nm = None
@@ -2424,7 +2532,8 @@ def map_variants(
                     for attempt in range(1, dcd_max_retry_attempts + 1):
                         try:
                             per_row, transcript_nm, strand = loop.run_until_complete(
-                                _run_dcd_mapping_pipeline(group_name, target_seq, row_entries, dcd)
+                                _run_dcd_mapping_pipeline(group_name, target_seq, row_entries, dcd,
+                                                          preferred_transcript_nm=effective_preferred_transcript)
                             )
                             break  # Success; exit retry loop
                         except Exception as exc:
@@ -2447,7 +2556,8 @@ def map_variants(
                                     chunk_name = f"{group_name}#retry{attempt}_chunk{start_idx // chunk_sz + 1}"
                                     try:
                                         chunk_per_row, chunk_tx, chunk_strand = loop.run_until_complete(
-                                            _run_dcd_mapping_pipeline(chunk_name, target_seq, chunk_entries, dcd)
+                                            _run_dcd_mapping_pipeline(chunk_name, target_seq, chunk_entries, dcd,
+                                                                      preferred_transcript_nm=effective_preferred_transcript)
                                         )
                                         per_row.extend(chunk_per_row)
                                         if transcript_nm is None:
@@ -2866,6 +2976,29 @@ def map_variants(
     ),
 )
 @click.option(
+    "--preferred-transcript",
+    "preferred_transcript",
+    default=None,
+    metavar="NM_ACCESSION",
+    help=(
+        "NM_ accession (with version, e.g. NM_007194.4) to use as the reference "
+        "transcript for all sequence-based groups, overriding automatic MANE/UTA "
+        "selection.  Falls back to automatic selection if the accession cannot be "
+        "resolved in UTA."
+    ),
+)
+@click.option(
+    "--preferred-transcript-col",
+    "preferred_transcript_col",
+    default=None,
+    metavar="COLUMN",
+    help=(
+        "Column in the input file whose value specifies the preferred NM_ accession "
+        "for each sequence-based group.  Blank values are ignored.  "
+        "--preferred-transcript is used as a fallback when the column is blank."
+    ),
+)
+@click.option(
     "--verbose",
     "-v",
     is_flag=True,
@@ -2908,6 +3041,8 @@ def main(
     targets_file: Optional[str],
     target_name_col: str,
     normalize_hgvs: bool,
+    preferred_transcript: Optional[str],
+    preferred_transcript_col: Optional[str],
     verbose: bool,
     csv_field_size_limit: int,
 ) -> None:
@@ -2959,6 +3094,8 @@ def main(
         targets_file=targets_file,
         target_name_col=target_name_col,
         normalize_hgvs=normalize_hgvs,
+        preferred_transcript=preferred_transcript,
+        preferred_transcript_col=preferred_transcript_col,
     )
 
 

@@ -144,6 +144,42 @@ Columns specified in `--drop-columns` are excluded from the output entirely. In 
 | `--targets-file FILE` | — | Optional TSV/CSV file containing target sequences and other target-level columns. Joined to the input on the column specified by `--target-name`. Columns from the targets file are merged onto the input row before processing; input columns take precedence when both are present. |
 | `--target-name COLUMN` | `target_name` | Join column for `--targets-file`. |
 
+### Transcript selection
+
+By default, the mapper automatically selects the best reference transcript for each target sequence via BLAT alignment and the MANE/UTA transcript database. Occasionally this automatic selection is incorrect — typically because the version of a MANE Select transcript in the local UTA database does not match the version in the MANE summary file, causing the MANE filter to miss the correct transcript and fall back to a lower-priority one. The options below allow the correct transcript to be specified directly.
+
+| Option | Default | Description |
+|---|---|---|
+| `--preferred-transcript NM_ACCESSION` | — | NM_ accession (including version, e.g. `NM_007194.4`) to use as the reference transcript for **all** sequence-based groups, overriding automatic MANE/UTA selection. Falls back to automatic selection if the accession cannot be resolved; a warning is emitted. |
+| `--preferred-transcript-col COLUMN` | — | Column in the input file whose value specifies the preferred NM_ accession for each group. Blank values are ignored. `--preferred-transcript` is used as a fallback when the column is blank or absent. Assumed to be identical for all rows sharing a target sequence. |
+
+When both options are provided the column value takes precedence over the global flag for any group that has a non-blank column value.
+
+**Finding the correct NM_ accession.** The MANE Select transcript for a gene is the canonical choice. Look it up in the [NCBI MANE summary file](https://ftp.ncbi.nlm.nih.gov/refseq/MANE/MANE_human/current/) or on the gene's RefSeq page. Make sure to include the version suffix (e.g. `NM_007194.4`, not `NM_007194`); the mapper checks the MANE table first so the exact UTA version is not required.
+
+**Example — force CHEK2 MANE Select for all groups:**
+
+```bash
+python -m src.map_variants input.tsv output.tsv \
+    --preferred-transcript NM_007194.4
+```
+
+**Example — per-target column in the input file:**
+
+```
+raw_hgvs_nt   target_sequence   preferred_transcript
+c.470T>C      ATGTCTCGG...      NM_007194.4
+c.1100del     ATGTCTCGG...      NM_007194.4
+c.999G>A      ATGGCCAAG...
+```
+
+```bash
+python -m src.map_variants input.tsv output.tsv \
+    --preferred-transcript-col preferred_transcript
+```
+
+Rows without a value in the column (e.g. the third row above) fall back to automatic transcript selection.
+
 ### Row selection
 
 | Option | Default | Description |
@@ -315,6 +351,9 @@ If chunking still fails, the affected group is recorded in `mapping_error` and p
 
 **ClinGen returned no data**
 : Transient network errors are retried with exponential backoff. If ClinGen consistently returns nothing for a specific HGVS, the variant may not be registered; check the ClinGen Allele Registry directly.
+
+**Wrong protein reference selected (`mapped_hgvs_p` uses an unexpected NP_ accession)**
+: The mapper chooses the reference transcript automatically by aligning the target sequence via BLAT, querying UTA for overlapping transcripts, and then filtering those transcripts against the MANE summary file. If the version of the MANE Select transcript in the local UTA database does not exactly match the version stored in the MANE summary file (e.g. UTA has `NM_007194.3` while the MANE file has `NM_007194.4`), the MANE filter returns no results and the mapper falls back to selecting the longest overlapping transcript — which may not be the intended MANE Select. Use `--preferred-transcript` (or `--preferred-transcript-col`) to supply the correct NM_ accession directly. The MANE table is checked first, so providing the MANE-listed version (e.g. `NM_007194.4`) works even if that exact version is absent from UTA.
 
 **Ensembl ENST accessions**
 : If `raw_hgvs_nt` contains an ENST-prefixed HGVS (e.g. `ENST00000316054.9:c.1142G>A`), the script attempts to resolve a RefSeq NM_ accession via the Ensembl REST API before querying ClinGen. This requires internet access to `https://rest.ensembl.org`.
