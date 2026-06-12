@@ -44,7 +44,7 @@ For each `(hgvs_c, hgvs_g)` pair:
 2. If `hgvs_c` is blank or returns no ID, try `hgvs_g`.
 3. If both fail, leave the slot empty.
 
-ClinGen HTTP responses are cached in Redis (see [Caching](#caching)). An in-process `dict` further deduplicates identical HGVS strings within the same run without a second Redis round-trip.
+ClinGen HTTP responses are cached in Redis (see [Caching](#caching)). An in-process `dict` further deduplicates identical HGVS strings within the same run without a second Redis round-trip. The `--known-mappings-file` option pre-populates this in-process cache from a file, so those entries never touch Redis or ClinGen.
 
 ---
 
@@ -60,9 +60,19 @@ Cache prefix defaults to `clingen:v1`. Override with `CLINGEN_CACHE_PREFIX`.
 
 ### `--known-misses-file`
 
-An optional TSV file listing HGVS strings that are already known not to have a ClinGen record (one string per row under a `hgvs` header column). Matching strings are skipped without querying Redis or the ClinGen API. This is useful when re-running on a dataset where a prior run already established that certain HGVS strings yield no result — load the miss list from the prior run's output rather than waiting for Redis to warm up.
+An optional TSV file listing HGVS strings that are already known not to have a ClinGen record (one string per row under a `hgvs` header column). Matching strings are short-circuited before any Redis or ClinGen query. This is useful when re-running on a dataset where a prior run already established that certain HGVS strings yield no result — load the miss list from the prior run's output rather than waiting for Redis to warm up.
 
 The file can be generated from a prior pipeline output with a short script (see [Generating a known-misses file](#generating-a-known-misses-file)).
+
+### `--known-mappings-file`
+
+An optional two-column TSV file mapping HGVS strings to their ClinGen allele IDs. The file must have a header row; columns are identified by name (`hgvs` and `clingen_allele_id`) with positional fallback (columns 0 and 1). Rows with a blank CAID are silently skipped.
+
+Entries are loaded into the in-process lookup cache before any rows are processed, so they take precedence over both Redis and the ClinGen API. Neither a Redis read nor a ClinGen HTTP request is made for strings present in this file.
+
+This complements `--known-misses-file`: use `--known-misses-file` for HGVS strings confirmed to have no record, and `--known-mappings-file` for strings with a known answer. On large re-runs, supplying both files together can dramatically reduce network traffic and runtime.
+
+The file can be generated from a prior pipeline output (see [Generating a known-mappings file](#generating-a-known-mappings-file)).
 
 ---
 
@@ -98,7 +108,8 @@ The file can be generated from a prior pipeline output with a short script (see 
 | `--raw-hgvs-pro-col COL` | `raw_hgvs_pro` | Column used to detect protein-origin rows |
 | `--max-retries N` | `3` | Retries per ClinGen HTTP request |
 | `--max-workers N` | `8` | Concurrent worker threads |
-| `--known-misses-file FILE` | none | TSV of HGVS strings to skip without querying ClinGen |
+| `--known-misses-file FILE` | none | TSV of HGVS strings confirmed to have no ClinGen record; skipped before Redis or ClinGen |
+| `--known-mappings-file FILE` | none | Two-column TSV (`hgvs`, `clingen_allele_id`) pre-loaded into the in-process cache; takes precedence over Redis and ClinGen |
 | `--skip N` | `0` | Skip the first N data rows |
 | `--limit N` | no limit | Stop after processing N rows |
 | `--log-level` | `INFO` | Logging verbosity (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
@@ -161,6 +172,48 @@ with open(out_path, "w", newline="", encoding="utf-8") as fh:
 ```
 
 Pass the result as `--known-misses-file known_misses.tsv` on the next run.
+
+---
+
+## Generating a known-mappings file
+
+After running `add_dna_clingen_allele_ids`, you can extract rows that successfully resolved an allele ID for use as `--known-mappings-file` on a subsequent run:
+
+```python
+import csv
+
+csv.field_size_limit(10_000_000)
+
+in_path  = "output_clingen.tsv"
+out_path = "known_mappings.tsv"
+
+rows: list[tuple[str, str]] = []
+seen: set[str] = set()
+
+def add_mapping(hgvs: str, caid: str) -> None:
+    h = hgvs.strip()
+    c = caid.strip()
+    if h and c and h not in seen:
+        seen.add(h)
+        rows.append((h, c))
+
+with open(in_path, newline="", encoding="utf-8") as fh:
+    reader = csv.DictReader(fh, delimiter="\t")
+    for row in reader:
+        dna_ca_parts = (row.get("dna_clingen_allele_id") or "").split("|")
+        for col in ("mapped_hgvs_c", "mapped_hgvs_g"):
+            for hgvs, ca in zip((row.get(col) or "").split("|"), dna_ca_parts):
+                if hgvs.strip() and ca.strip():
+                    add_mapping(hgvs, ca)
+
+with open(out_path, "w", newline="", encoding="utf-8") as fh:
+    writer = csv.writer(fh, delimiter="\t", lineterminator="\n")
+    writer.writerow(["hgvs", "clingen_allele_id"])
+    for h, c in rows:
+        writer.writerow([h, c])
+```
+
+Pass the result as `--known-mappings-file known_mappings.tsv` on the next run. Combine with `--known-misses-file` to cover both sides of the lookup result space.
 
 ---
 

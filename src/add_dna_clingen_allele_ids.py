@@ -108,6 +108,39 @@ def _candidate_pairs(hgvs_c: str, hgvs_g: str) -> list[tuple[str, str]]:
     return list(zip(c_parts, g_parts))
 
 
+def _load_known_mappings(path: str) -> dict[str, str]:
+    """Load a two-column HGVS→CAID TSV (with header) into a dict.
+
+    Rows with a blank CAID are silently skipped; they contribute nothing to a
+    positive cache hit and can be handled by the normal lookup pipeline (or by
+    a separate known-misses file).
+    """
+    import csv as _csv
+    mappings: dict[str, str] = {}
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = _csv.reader(fh, delimiter="\t")
+        header = next(reader, None)
+        if header is None:
+            return mappings
+        try:
+            hgvs_col = header.index("hgvs")
+        except ValueError:
+            hgvs_col = 0
+        try:
+            caid_col = header.index("clingen_allele_id")
+        except ValueError:
+            caid_col = 1
+        for row in reader:
+            if len(row) <= max(hgvs_col, caid_col):
+                continue
+            hgvs = row[hgvs_col].strip()
+            caid = row[caid_col].strip()
+            if hgvs and caid:
+                mappings[hgvs] = caid
+    logger.info("Loaded %d known HGVS→CAID mappings from %s", len(mappings), path)
+    return mappings
+
+
 def _load_known_misses(path: str) -> frozenset[str]:
     """Load a single-column HGVS file (with header) into a frozenset."""
     import csv as _csv
@@ -144,6 +177,12 @@ def _lookup_allele_id_for_candidate(
     for hgvs in (hgvs_c, hgvs_g):
         query = (hgvs or "").strip()
         if not query:
+            continue
+
+        # Short-circuit before touching Redis or ClinGen. The check inside
+        # _query_clingen_by_hgvs happens only after a Redis miss, so known
+        # misses would still pay a Redis round-trip without this guard.
+        if known_misses and query in known_misses:
             continue
 
         if cache_lock is None:
@@ -315,6 +354,7 @@ def add_dna_clingen_allele_ids(
     skip: int = 0,
     limit: Optional[int] = None,
     known_misses_file: Optional[str] = None,
+    known_mappings_file: Optional[str] = None,
 ) -> None:
     """Read input table, add DNA-level ClinGen ID column, write output table.
 
@@ -334,6 +374,8 @@ def add_dna_clingen_allele_ids(
     out_sep = _detect_separator(output_path)
 
     lookup_cache: dict[str, str] = {}
+    if known_mappings_file:
+        lookup_cache.update(_load_known_mappings(known_mappings_file))
     cache_lock = Lock()
     populated = 0
     written = 0
@@ -464,9 +506,19 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="FILE",
         help=(
-            "(Temporary) Path to a single-column TSV file listing HGVS strings "
-            "known to return no ClinGen allele ID. Matching strings are treated "
-            "as confirmed misses without querying ClinGen or writing to Redis."
+            "Path to a single-column TSV file listing HGVS strings known to "
+            "return no ClinGen allele ID. Matching strings are treated as "
+            "confirmed misses without querying ClinGen or Redis."
+        ),
+    )
+    p.add_argument(
+        "--known-mappings-file",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Path to a two-column TSV file (hgvs, clingen_allele_id) "
+            "used as a file-based HGVS→CAID cache. Entries are pre-loaded into the "
+            "lookup cache and take precedence over Redis and ClinGen queries."
         ),
     )
     p.add_argument(
@@ -523,6 +575,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         skip=args.skip,
         limit=args.limit,
         known_misses_file=args.known_misses_file,
+        known_mappings_file=args.known_mappings_file,
     )
 
 
