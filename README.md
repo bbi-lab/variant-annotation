@@ -716,6 +716,107 @@ services:
 
 This ensures caches survive container restarts and are shared across runs.
 
+## Redis Caching
+
+Several pipeline scripts use Redis to cache API responses between runs, avoiding redundant network requests when the same variant is processed multiple times (e.g. across incremental runs or overlapping datasets). All caching degrades gracefully: if Redis is unreachable or disabled, scripts continue without caching.
+
+The Redis service is started automatically by Docker Compose and is available at `redis://redis:6379/0` inside the container network.
+
+### ClinGen Allele Registry
+
+**Used by:** `map_variants` (steps 1 & 3 combined), `add_dna_clingen_allele_ids`, `annotate_clinvar`
+**Implementation:** `src/lib/clingen.py`
+
+Two types of ClinGen requests are cached:
+
+| Request type | Endpoint | Redis key | Value stored |
+|---|---|---|---|
+| HGVS lookup | `GET /allele?hgvs=<HGVS>` | `clingen:v1:hgvs:<HGVS>` | Allele ID string (e.g. `CA123456`) |
+| Allele ID lookup | `GET /allele/<CA_ID>` | `clingen:v1:allele:<CA_ID>` | Full JSON response body |
+
+A successful HGVS lookup writes **both** keys: the mapping key (`hgvs:`) pointing at the allele ID, and the allele key (`allele:`) holding the complete response. The full response is cached rather than just the allele ID because multiple callers extract different fields from the same record — `annotate_clinvar` needs `externalRecords.ClinVarVariations` and `externalRecords.ClinVarAlleles`, while coordinate-resolution helpers need `genomicAlleles`. Caching the full body under the allele ID means any caller, whether it arrived via HGVS or directly by allele ID, can be served from a single Redis entry.
+
+The two-key design also handles partial eviction gracefully: if the `hgvs:` key is still present but the `allele:` key was evicted, the code detects this and re-fetches by allele ID without re-querying by HGVS.
+
+`map_variants` additionally caches `dcd_mapping` HGVS normalization results:
+
+| Redis key | Value stored |
+|---|---|
+| `clingen:v1:genomic_hgvs:<HGVS>` | Normalized genomic HGVS string |
+
+This key is populated by a patch applied to `dcd_mapping`'s internal `fetch_clingen_genomic_hgvs()` call, which itself queries ClinGen during variant normalization for accession-referenced inputs.
+
+Both hits and misses (404s, placeholder IDs) are cached. Misses are stored as the sentinel `__MISS__`. Default TTL is 86,400 s (1 day) for both.
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `CLINGEN_CACHE_ENABLED` | `true` | Set to `0`/`false` to disable |
+| `CLINGEN_CACHE_REDIS_URL` | `redis://redis:6379/0` | Falls back to `REDIS_URL` |
+| `CLINGEN_CACHE_PREFIX` | `clingen:v1` | Bump version suffix to invalidate all entries |
+| `CLINGEN_CACHE_TTL_SECONDS` | `86400` | TTL for hit entries |
+| `CLINGEN_CACHE_MISS_TTL_SECONDS` | `86400` | TTL for miss sentinels |
+
+Use `src/scripts/run_clear_clingen_cache.sh` to delete all ClinGen cache keys and force fresh API lookups.
+
+### VEP (Ensembl REST API)
+
+**Used by:** `annotate_vep`
+**Implementation:** `src/annotate_vep.py`
+
+VEP consequences are cached per HGVS string. Each entry stores the full consequence result as a small JSON object:
+
+| Redis key | Value stored |
+|---|---|
+| `vep:v1:<HGVS>` | `{"c": "<most_severe>", "cs": ["<term>", ...], "s": "<source>"}` |
+
+Where `c` is the most-severe consequence, `cs` is the full list of consequences from the matched transcript (or `null` for genomic/protein inputs), and `s` is the source tag (`"transcript"`, `"most_severe"`, etc.). Storing the full consequence list avoids a second API call if downstream code needs it.
+
+Results that failed with a transient API error (`source == "api_error"`) are **not** cached, so they are retried on the next run. All other results — including definitive misses — are cached with the sentinel `__MISS__`.
+
+Reads and writes use Redis pipeline operations (`MGET`/`SET`) to minimise round-trips when processing large batches.
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `VEP_CACHE_ENABLED` | `true` | Set to `0`/`false` to disable |
+| `VEP_CACHE_REDIS_URL` | `redis://redis:6379/0` | Falls back to `REDIS_URL` |
+| `VEP_CACHE_PREFIX` | `vep:v1` | Bump version suffix after a major Ensembl release |
+| `VEP_CACHE_TTL_SECONDS` | `86400` | TTL for hit entries |
+| `VEP_CACHE_MISS_TTL_SECONDS` | `86400` | TTL for miss sentinels |
+
+### gnomAD
+
+**Used by:** `annotate_gnomad` (both Hail and Athena modes)
+**Implementation:** `src/annotate_gnomad.py`
+
+Full gnomAD records are cached per ClinGen allele ID (CAID), or per genomic coordinate string in coordinate-lookup mode:
+
+| Redis key | Value stored |
+|---|---|
+| `gnomad:v1:<CAID>` | JSON-serialized `GnomadRecord` |
+
+Each cached record includes allele counts and frequencies, filtering allele frequencies, per-callset QC filter flags, VEP gene symbols, and any histogram data (age/allele-balance distributions) that was present when the record was fetched. Storing the full record avoids re-querying the Hail table or Athena for any field combination, regardless of which `--age-histograms` / `--allele-balance-histograms` flags the current run uses.
+
+Only successful lookups are cached; variants not found in gnomAD are not stored (no miss sentinel). The default TTL is 604,800 s (7 days), reflecting that gnomAD releases are infrequent.
+
+Reads and writes use Redis pipeline operations for batch efficiency.
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `GNOMAD_CACHE_REDIS_ENABLED` | `true` | Set to `0`/`false` to disable |
+| `GNOMAD_CACHE_REDIS_URL` | `redis://redis:6379/0` | Falls back to `REDIS_URL` |
+| `GNOMAD_CACHE_REDIS_PREFIX` | `gnomad:v1` | Bump version suffix after a gnomAD release |
+| `GNOMAD_CACHE_REDIS_TTL_SECONDS` | `604800` | TTL for all cached entries (7 days) |
+
+### Summary
+
+| Script | Key prefix | Cached value | TTL (hit/miss) |
+|---|---|---|---|
+| ClinGen (HGVS lookup) | `clingen:v1:hgvs:` | Allele ID string | 1 day / 1 day |
+| ClinGen (allele record) | `clingen:v1:allele:` | Full JSON response | 1 day / 1 day |
+| ClinGen (genomic HGVS norm.) | `clingen:v1:genomic_hgvs:` | Normalized HGVS string | 1 day / 1 day |
+| VEP | `vep:v1:` | Consequence + source JSON | 1 day / 1 day |
+| gnomAD | `gnomad:v1:` | Full GnomadRecord JSON | 7 days / not cached |
+
 ## Bundled Utilities
 
 The following tools are included alongside the main pipeline for data inspection, cross-validation, and TSV manipulation. They are not annotation steps.
