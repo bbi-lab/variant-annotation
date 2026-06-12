@@ -247,7 +247,7 @@ The Redis cache stores fully resolved `GnomadRecord` values keyed by the variant
 | `GNOMAD_CACHE_REDIS_PREFIX` | `gnomad:v1` | Key namespace prefix; bump this value to invalidate all cached entries after a gnomAD release upgrade |
 | `GNOMAD_CACHE_REDIS_TTL_SECONDS` | `604800` (7 days) | TTL for cached entries |
 
-**What is cached:** All fields of every matched gnomAD record — `allele_count`, `allele_number`, `allele_frequency`, `minor_allele_frequency`, `faf95_max`, `faf95_max_ancestry`, `filters`, `exome_filters`, `genome_filters`, `gene_symbols` — plus any histogram arrays (`bin_edges`, `bin_freq`, `n_smaller`, `n_larger` per histogram field) that were populated during the lookup.
+**What is cached:** All fields of every matched gnomAD record — `allele_count`, `allele_number`, `allele_frequency`, `minor_allele_frequency`, `faf95_max`, `faf95_max_ancestry`, `filters`, `exome_filters`, `genome_filters`, `gene_symbols` — plus any histogram arrays (`bin_edges`, `bin_freq`, `n_smaller`, `n_larger` per histogram field) that were populated during the lookup. Variants confirmed absent from gnomAD are cached as miss sentinels so future runs skip re-querying them entirely.
 
 **When it helps most:** Athena mode, where each lookup requires at least one query execution round-trip; and any multi-run pipeline where the same or overlapping variant sets are annotated across different input files. In Hail mode it also avoids the JVM startup overhead for variant sets already seen.
 

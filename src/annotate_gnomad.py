@@ -147,6 +147,7 @@ GNOMAD_CACHE_REDIS_TTL_SECONDS_DEFAULT = 7 * 86400  # 7 days
 _GNOMAD_REDIS_CLIENT: Any = None
 _GNOMAD_REDIS_INIT_ATTEMPTED = False
 _GNOMAD_REDIS_UNAVAILABLE_LOGGED = False
+_GNOMAD_MISS_SENTINEL = "__MISS__"
 
 
 def _gnomad_env_bool(name: str, default: bool) -> bool:
@@ -277,8 +278,14 @@ def _gnomad_record_from_dict(data: dict) -> GnomadRecord:
     )
 
 
-def _gnomad_cache_get_many(keys: list[str]) -> dict[str, GnomadRecord]:
-    """Batch-fetch gnomAD records from Redis. Returns only keys that had cache hits."""
+def _gnomad_cache_get_many(keys: list[str]) -> dict[str, Optional[GnomadRecord]]:
+    """Batch-fetch gnomAD records from Redis.
+
+    Returns a dict covering only keys that were found in the cache:
+    - GnomadRecord value → confirmed hit from a previous run.
+    - None value → confirmed miss; the variant is absent from gnomAD.
+    Keys absent from the returned dict were not cached and must be looked up.
+    """
     client = _gnomad_get_redis_client()
     if client is None or not keys:
         return {}
@@ -287,9 +294,12 @@ def _gnomad_cache_get_many(keys: list[str]) -> dict[str, GnomadRecord]:
         values = client.mget(redis_keys)
     except Exception:
         return {}
-    result: dict[str, GnomadRecord] = {}
+    result: dict[str, Optional[GnomadRecord]] = {}
     for lookup_key, value in zip(keys, values):
         if value is None:
+            continue
+        if value == _GNOMAD_MISS_SENTINEL:
+            result[lookup_key] = None
             continue
         try:
             result[lookup_key] = _gnomad_record_from_dict(json.loads(value))
@@ -298,8 +308,12 @@ def _gnomad_cache_get_many(keys: list[str]) -> dict[str, GnomadRecord]:
     return result
 
 
-def _gnomad_cache_set_many(records: dict[str, GnomadRecord]) -> None:
-    """Store a batch of lookup_key → GnomadRecord mappings in Redis."""
+def _gnomad_cache_set_many(records: dict[str, Optional[GnomadRecord]]) -> None:
+    """Store a batch of lookup_key → GnomadRecord mappings in Redis.
+
+    Pass None as the value to store a miss sentinel — a confirmed absence that
+    prevents re-querying the same key in future runs.
+    """
     client = _gnomad_get_redis_client()
     if client is None or not records:
         return
@@ -307,7 +321,11 @@ def _gnomad_cache_set_many(records: dict[str, GnomadRecord]) -> None:
         pipe = client.pipeline(transaction=False)
         ttl = _gnomad_cache_ttl()
         for lookup_key, record in records.items():
-            pipe.set(_gnomad_redis_cache_key(lookup_key), json.dumps(_gnomad_record_to_dict(record)), ex=ttl)
+            key = _gnomad_redis_cache_key(lookup_key)
+            if record is None:
+                pipe.set(key, _GNOMAD_MISS_SENTINEL, ex=ttl)
+            else:
+                pipe.set(key, json.dumps(_gnomad_record_to_dict(record)), ex=ttl)
         pipe.execute()
     except Exception as exc:
         logger.debug("gnomAD Redis cache write failed: %s", exc)
@@ -1457,10 +1475,14 @@ def load_gnomad_records_for_caids(
     if not caids:
         return {}
 
-    redis_hits = _gnomad_cache_get_many(list(caids))
-    if redis_hits:
-        logger.debug("gnomAD Redis cache: %d/%d CAID hits", len(redis_hits), len(caids))
-    caids_to_fetch = caids - set(redis_hits.keys())
+    redis_result = _gnomad_cache_get_many(list(caids))
+    redis_hits = {k: v for k, v in redis_result.items() if v is not None}
+    if redis_result:
+        logger.debug(
+            "gnomAD Redis cache: %d hits, %d known misses (of %d CAIDs)",
+            len(redis_hits), len(redis_result) - len(redis_hits), len(caids),
+        )
+    caids_to_fetch = caids - set(redis_result.keys())
     if not caids_to_fetch:
         return redis_hits
 
@@ -1574,7 +1596,10 @@ def load_gnomad_records_for_caids(
             gene_symbols=str(getattr(row, "vep_gene_symbols", "") or ""),
             histograms=histograms,
         )
-    _gnomad_cache_set_many(out)
+    to_cache: dict[str, Optional[GnomadRecord]] = dict(out)
+    for miss_key in caids_to_fetch - set(out.keys()):
+        to_cache[miss_key] = None
+    _gnomad_cache_set_many(to_cache)
     out.update(redis_hits)
     return out
 
@@ -1593,10 +1618,14 @@ def load_gnomad_records_for_caids_athena(
     if not caids:
         return {}
 
-    redis_hits = _gnomad_cache_get_many(list(caids))
-    if redis_hits:
-        logger.debug("gnomAD Redis cache: %d/%d CAID hits (Athena)", len(redis_hits), len(caids))
-    caids_to_fetch = caids - set(redis_hits.keys())
+    redis_result = _gnomad_cache_get_many(list(caids))
+    redis_hits = {k: v for k, v in redis_result.items() if v is not None}
+    if redis_result:
+        logger.debug(
+            "gnomAD Redis cache: %d hits, %d known misses (of %d CAIDs) (Athena)",
+            len(redis_hits), len(redis_result) - len(redis_hits), len(caids),
+        )
+    caids_to_fetch = caids - set(redis_result.keys())
     if not caids_to_fetch:
         return redis_hits
 
@@ -1649,7 +1678,10 @@ def load_gnomad_records_for_caids_athena(
             faf95_max_ancestry=faf95_max_ancestry,
         )
 
-    _gnomad_cache_set_many(out)
+    to_cache: dict[str, Optional[GnomadRecord]] = dict(out)
+    for miss_key in caids_to_fetch - set(out.keys()):
+        to_cache[miss_key] = None
+    _gnomad_cache_set_many(to_cache)
     out.update(redis_hits)
     return out
 
@@ -1680,10 +1712,14 @@ def load_gnomad_records_by_gnomad_keys_athena(
     if not gnomad_keys:
         return {}
 
-    redis_hits = _gnomad_cache_get_many(list(gnomad_keys))
-    if redis_hits:
-        logger.debug("gnomAD Redis cache: %d/%d coordinate key hits (Athena)", len(redis_hits), len(gnomad_keys))
-    keys_to_fetch = gnomad_keys - set(redis_hits.keys())
+    redis_result = _gnomad_cache_get_many(list(gnomad_keys))
+    redis_hits = {k: v for k, v in redis_result.items() if v is not None}
+    if redis_result:
+        logger.debug(
+            "gnomAD Redis cache: %d hits, %d known misses (of %d coordinate keys) (Athena)",
+            len(redis_hits), len(redis_result) - len(redis_hits), len(gnomad_keys),
+        )
+    keys_to_fetch = gnomad_keys - set(redis_result.keys())
     if not keys_to_fetch:
         return redis_hits
 
@@ -1759,7 +1795,10 @@ def load_gnomad_records_by_gnomad_keys_athena(
             faf95_max_ancestry=faf95_max_ancestry,
         )
 
-    _gnomad_cache_set_many(out)
+    to_cache: dict[str, Optional[GnomadRecord]] = dict(out)
+    for miss_key in keys_to_fetch - set(out.keys()):
+        to_cache[miss_key] = None
+    _gnomad_cache_set_many(to_cache)
     out.update(redis_hits)
     return out
 
@@ -1957,10 +1996,14 @@ def load_gnomad_records_by_gnomad_keys(
     if not gnomad_keys:
         return {}
 
-    redis_hits = _gnomad_cache_get_many(list(gnomad_keys))
-    if redis_hits:
-        logger.debug("gnomAD Redis cache: %d/%d coordinate key hits", len(redis_hits), len(gnomad_keys))
-    keys_to_fetch = gnomad_keys - set(redis_hits.keys())
+    redis_result = _gnomad_cache_get_many(list(gnomad_keys))
+    redis_hits = {k: v for k, v in redis_result.items() if v is not None}
+    if redis_result:
+        logger.debug(
+            "gnomAD Redis cache: %d hits, %d known misses (of %d coordinate keys)",
+            len(redis_hits), len(redis_result) - len(redis_hits), len(gnomad_keys),
+        )
+    keys_to_fetch = gnomad_keys - set(redis_result.keys())
     if not keys_to_fetch:
         return redis_hits
 
@@ -2056,7 +2099,10 @@ def load_gnomad_records_by_gnomad_keys(
     finally:
         hl.stop()
 
-    _gnomad_cache_set_many(out)
+    to_cache: dict[str, Optional[GnomadRecord]] = dict(out)
+    for miss_key in keys_to_fetch - set(out.keys()):
+        to_cache[miss_key] = None
+    _gnomad_cache_set_many(to_cache)
     out.update(redis_hits)
     return out
 
