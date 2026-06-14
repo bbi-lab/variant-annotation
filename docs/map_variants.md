@@ -146,16 +146,38 @@ Columns specified in `--drop-columns` are excluded from the output entirely. In 
 
 ### Transcript selection
 
-By default, the mapper automatically selects the best reference transcript for each target sequence via BLAT alignment and the MANE/UTA transcript database. Occasionally this automatic selection is incorrect — typically because the version of a MANE Select transcript in the local UTA database does not match the version in the MANE summary file, causing the MANE filter to miss the correct transcript and fall back to a lower-priority one. The options below allow the correct transcript to be specified directly.
+#### How automatic selection works
+
+For each sequence-based group (cases 2 and 3), the mapper runs the following pipeline once per group to select the reference NM_ transcript and its corresponding NP_ protein:
+
+1. **BLAT alignment.** The target sequence is aligned to GRCh38 via BLAT, producing one or more hit regions expressed as chromosomal coordinates.
+
+2. **Overlapping transcript lookup.** Each hit region is queried against the UTA `tx_exon_aln_v` view to find all RefSeq transcripts (excluding non-coding `NR_` accessions) whose exons overlap the aligned coordinates. Transcripts are grouped by HGNC gene symbol.
+
+3. **MANE selection, per gene.** For each gene the list of overlapping transcripts is filtered against the MANE summary table (bundled with `cool_seq_tool`). The filter is an **exact version match** on the NM_ accession (e.g. `NM_007194.4`). If one or more MANE transcripts match, **MANE Select** is preferred over MANE Plus Clinical.
+
+4. **Longest-transcript fallback.** If no overlapping transcript for a gene is found in the MANE table, the transcript with the longest nucleotide sequence in SeqRepo is chosen as the fallback.
+
+5. **Cross-gene similarity tiebreak.** When transcripts from more than one gene survive steps 3–4, the target sequence is translated to protein and compared against each candidate's reference protein using a local Smith–Waterman alignment (BLOSUM62). The candidate with the highest alignment score is selected.
+
+6. **Protein reference lookup.** The selected NM_ accession is resolved to an NP_ protein accession via UTA (`associated_accessions` table), and the protein sequence is fetched from SeqRepo. The `start` offset and `is_full_match` flag are computed by searching for the target protein within the reference protein sequence.
+
+The selected NM_ accession is then passed to the ClinGen Allele Registry query: when ClinGen returns a `transcriptAlleles` array, the allele whose HGVS string begins with the selected NM_ (exact match including version) is used to populate `mapped_hgvs_c` and `mapped_hgvs_p`.
+
+#### Override options
+
+The `--preferred-transcript` and `--preferred-transcript-col` options bypass steps 3–4 above. BLAT alignment still runs (it is required for VRS mapping), but `select_transcripts` is skipped and the supplied NM_ is used directly.
+
+When resolving the NP_ for an override, the mapper checks the MANE table first (so the exact UTA version is not required), then falls back to a UTA lookup. If neither source can resolve the accession, automatic selection is used and a warning is emitted.
 
 | Option | Default | Description |
 |---|---|---|
-| `--preferred-transcript NM_ACCESSION` | — | NM_ accession (including version, e.g. `NM_007194.4`) to use as the reference transcript for **all** sequence-based groups, overriding automatic MANE/UTA selection. Falls back to automatic selection if the accession cannot be resolved; a warning is emitted. |
+| `--preferred-transcript NM_ACCESSION` | — | NM_ accession (including version, e.g. `NM_007194.4`) to use as the reference transcript for **all** sequence-based groups, overriding automatic MANE/UTA selection. |
 | `--preferred-transcript-col COLUMN` | — | Column in the input file whose value specifies the preferred NM_ accession for each group. Blank values are ignored. `--preferred-transcript` is used as a fallback when the column is blank or absent. Assumed to be identical for all rows sharing a target sequence. |
 
 When both options are provided the column value takes precedence over the global flag for any group that has a non-blank column value.
 
-**Finding the correct NM_ accession.** The MANE Select transcript for a gene is the canonical choice. Look it up in the [NCBI MANE summary file](https://ftp.ncbi.nlm.nih.gov/refseq/MANE/MANE_human/current/) or on the gene's RefSeq page. Make sure to include the version suffix (e.g. `NM_007194.4`, not `NM_007194`); the mapper checks the MANE table first so the exact UTA version is not required.
+**Finding the correct NM_ accession.** The MANE Select transcript is the canonical choice for most protein-coding genes. Look it up in the [NCBI MANE summary file](https://ftp.ncbi.nlm.nih.gov/refseq/MANE/MANE_human/current/) or on the gene's RefSeq page. Include the version suffix (e.g. `NM_007194.4`, not `NM_007194`).
 
 **Example — force CHEK2 MANE Select for all groups:**
 
@@ -179,6 +201,26 @@ python -m src.map_variants input.tsv output.tsv \
 ```
 
 Rows without a value in the column (e.g. the third row above) fall back to automatic transcript selection.
+
+#### Pitfalls during transcript selection
+
+**UTA/MANE version mismatch → wrong isoform via longest-transcript fallback.**
+The MANE filter in step 3 requires an exact NM_ version match. If the local UTA database was built from an older RefSeq release it may contain `NM_007194.3` while the bundled MANE summary records `NM_007194.4`. The filter returns nothing, and the fallback (step 4) selects the longest transcript by raw nucleotide length — which may be a shorter-coding alternative isoform with a longer UTR, or a completely different gene product. The symptom is a `mapped_hgvs_p` referencing an unexpected `NP_` accession. **Fix:** supply the MANE-listed version with `--preferred-transcript`; the mapper's MANE-first lookup resolves the NP_ correctly even though UTA has the older version.
+
+**Longest-transcript fallback selects the wrong isoform.**
+Even when no version mismatch is involved, a gene may have multiple RefSeq transcripts that are not in the MANE table (older provisional or RefSeqGene entries). The fallback picks by nucleotide length, not by protein similarity. An alternative isoform with extra UTR sequence or a retained intron can easily be longer than the canonical coding transcript without encoding the expected protein. **Fix:** use `--preferred-transcript` whenever you know the intended transcript.
+
+**BLAT alignment spans a multi-gene locus.**
+BLAT hit regions cover chromosomal intervals, not exon-precise boundaries. When a target maps near a region where two or more genes overlap (e.g. opposite-strand gene pairs, or pseudogene clusters), step 2 may return transcripts from multiple HGNC symbols. The similarity tiebreak in step 5 is generally robust, but a very short target sequence or one with low-complexity sequence may not provide enough signal to distinguish between genes. **Diagnosis:** check `mapping_warnings` and the INFO logs at `--verbose` for the selected transcript and HGNC symbol; if the wrong gene is chosen, supply the correct NM_ via `--preferred-transcript`.
+
+**Partial or domain-fragment target sequence.**
+MAVE experiments sometimes cover only one domain of a gene rather than the full protein. If the target encodes fewer than ~30 amino acids, the Smith–Waterman similarity score used in the cross-gene tiebreak may not reliably distinguish between the intended gene and a structurally similar one. Additionally, a very short amino-acid prefix is used to compute the `start` offset; if that prefix is not unique within the reference protein, the computed offset may be wrong. Protein mapping (`mapped_hgvs_p`) is still likely to be correct for the chosen transcript, but positional offsets embedded in `mapped_hgvs_c` may be shifted. **Fix:** verify `is_full_match` and `start` in the debug logs, and supply the correct NM_ if automatic selection chooses the wrong gene.
+
+**DNA target with ≤4 unique nucleotide symbols classified as protein.**
+The mapper decides whether a target sequence is DNA or protein by counting unique characters: ≤4 unique characters → DNA (translate before comparison); >4 → protein (use as-is). A purely synthetic or highly repetitive nucleotide sequence composed of only three or four bases (e.g. a polyA or AT-repeat construct) would be treated as DNA and translated. Conversely, a short peptide sequence that happens to contain only the letters A, T, G, C would be treated as a nucleotide sequence and translated to a nonsense protein before similarity scoring. Both edge cases are uncommon in real MAVE data but are worth noting for constructed or synthetic targets.
+
+**Engineered background mutations in the target.**
+Some MAVE experiments use a target sequence that already carries one or more missense variants relative to the canonical reference (a "mutation-corrected" or "polymorphism-matched" background). BLAT alignment and gene selection are unaffected because the nucleotide divergence is small. However, the protein similarity score between the engineered target and the wildtype reference protein will be slightly lower than for a perfect wildtype sequence. In practice this rarely causes misselection — only if another transcript or gene happens to match the engineered sequence better than the wildtype does. If you suspect this is happening, check whether `is_full_match` is `True` for the selected transcript.
 
 ### Row selection
 

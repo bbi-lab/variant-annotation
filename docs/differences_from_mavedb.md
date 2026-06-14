@@ -25,6 +25,21 @@ This is the most significant semantic difference.
 
 **This pipeline:** The transcript accession is extracted per row from `raw_hgvs_nt` (e.g. `NM_000277.3` from `NM_000277.3:c.1218G>A`). Different rows may use different transcripts. Multi-target inputs (multiple gene groups with different sequences/accessions) are naturally supported.
 
+#### Preferred-transcript overrides (this pipeline only)
+
+Automatic transcript selection can fail when the local UTA database and the bundled MANE summary file record different NM_ versions for the same gene (e.g. UTA has `NM_007194.3` but the MANE table has `NM_007194.4`). Because the MANE filter uses exact version matching, the mismatch causes it to fall through to a longest-transcript fallback that may select a different isoform and therefore a wrong NP_ protein reference.
+
+MaveDB has no mechanism to override transcript selection at run time. In the worker model, the transcript accession is determined from fields already stored in the database (`target_accession` or `cdna.sequence_accessions` in `post_mapped_metadata`); a bad automatic selection would require re-running the full mapping job with a corrected database.
+
+This pipeline adds two override options for sequence-based groups:
+
+- **`--preferred-transcript NM_ACCESSION`** — applies a single NM_ accession to all sequence-based groups in the run.
+- **`--preferred-transcript-col COLUMN`** — reads the preferred NM_ from a column in the input file, allowing different groups to specify different transcripts. Blank values fall back to `--preferred-transcript` (if set) or automatic selection.
+
+When an override is supplied, the mapper skips `select_transcripts` (steps 3–5 of the automatic pipeline) and resolves the NP_ protein accession by checking the MANE table first, then UTA. This means a MANE-listed accession such as `NM_007194.4` resolves correctly even if UTA only has `NM_007194.3`. BLAT alignment is still performed (it is required for VRS coordinate mapping). If the accession cannot be resolved in either source, automatic selection is used and a warning is emitted.
+
+See [map_variants.md — Transcript selection](map_variants.md#transcript-selection) for the full algorithm description and known pitfalls.
+
 ### VRS metadata persisted
 
 **MaveDB:** Stores full `pre_mapped` and `post_mapped` VRS JSON objects in `MappedVariant`. Also stores per-target alignment QC statistics (`TargetGeneMapping`: alignment score, percent identity, mismatch count, gap count, etc.) and the `mapping_api_version` (dcd_mapping tool version).
