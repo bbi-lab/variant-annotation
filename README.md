@@ -599,10 +599,10 @@ src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
 ```
 
 **Notes:**
-- At least one of `--revel-file`, `--alphamissense-file`, or `--dbnsfp-file` must be provided.
+- At least one predictor source must be provided: `--revel-file` or `--revel-cache-file` for REVEL, `--alphamissense-file` or `--alphamissense-cache-file` for AlphaMissense, or `--dbnsfp-file` for MutPred2.
 - All currently supported predictors score missense SNVs only; other variant types receive empty annotation columns.
 - REVEL and AlphaMissense scores are pipe-aligned to the input candidates. MutPred2 emits a single maximum score (protein-level model).
-- Requires `tabix` (htslib) on `$PATH`.
+- Requires `tabix` (htslib) on `$PATH` only when a tabix-indexed file (`--revel-file`, `--alphamissense-file`, `--dbnsfp-file`) is configured.
 
 ### Step 12: Flatten DNA Variants (Optional)
 

@@ -82,6 +82,33 @@ For rows with pipe-delimited HGVS candidates (from step 2 reverse translation), 
 
 ---
 
+## File-based consequence cache
+
+A pre-built TSV of VEP consequences can be loaded at startup with `--vep-file-cache FILE`. Entries from the file populate the consequence cache before Redis is consulted, so file-cache hits bypass both Redis and the VEP API entirely. This is useful for offline use, reproducibility, or pre-seeding a fresh run from a prior annotated output.
+
+### File format
+
+Tab-separated, with a header row. Column names use the same namespace prefix as the current run (`--vep-namespace`, default `vep`):
+
+| Column | Description |
+|---|---|
+| `hgvs` | Input HGVS string (cache key) |
+| `{prefix}.most_severe_mutational_consequence` | Most-severe consequence term; blank for a confirmed miss |
+| `{prefix}.mutational_consequences` | `^`-delimited list of all consequence terms; may be blank |
+| `{prefix}.consequence_source` | `transcript`, `most_severe`, `no_change`, or an `api_error:...` value |
+| `{prefix}.access_date` | ISO date string from the original annotation run; propagated to output |
+| `{prefix}.error` | Original error message; re-encoded into `consequence_source` on load |
+
+A row with a blank `most_severe_mutational_consequence` is treated as a confirmed miss and will not be re-queried. A non-blank `{prefix}.error` value is used to reconstruct the `api_error:...` source token so `annotate_row` emits it correctly.
+
+The file format matches the output produced by a prior `annotate_vep` run, so an existing annotated TSV can be cut, de-duplicated by `hgvs`, and fed directly back in.
+
+### Access dates from the file cache
+
+When a candidate is resolved from the file cache, the `{prefix}.access_date` value from the file is written to the output rather than today's date. This preserves provenance when replaying annotations from an older run.
+
+---
+
 ## Redis caching
 
 VEP API responses are cached in Redis as `(most_severe, all_consequences, source)` triples per HGVS string. Misses (VEP returned nothing) are stored under a sentinel so repeated no-hit queries don't re-query the API. API errors are not cached and will be retried. Cache entries from prior versions that lack the `all_consequences` field are silently discarded on read and re-queried.
@@ -107,6 +134,7 @@ VEP API responses are cached in Redis as `(most_severe, all_consequences, source
 | `--vep-workers N` | `VEP_WORKERS` | `8` | Concurrent VEP/Recoder batch requests |
 | `--row-batch-size N` | `VEP_ROW_BATCH_SIZE` | `1000` | Input rows per lookup/write batch |
 | `--vep-timeout-seconds N` | `VEP_TIMEOUT_SECONDS` | `60` | HTTP timeout per API request |
+| `--vep-file-cache FILE` | — | — | TSV of pre-computed VEP consequences; entries pre-populate the consequence cache and take precedence over Redis and the VEP API |
 | `--keep-existing` | — | off | Skip rows already annotated (non-empty `vep.most_severe_mutational_consequence`); only annotate blank rows |
 | `--skip N` | — | `0` | Skip first N data rows |
 | `--limit N` | — | no limit | Stop after N rows |

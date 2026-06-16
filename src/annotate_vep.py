@@ -357,17 +357,15 @@ def _vep_get_redis_client(*, force: bool = False):
         return None
 
 
-def _vep_cache_get_many(hgvs_list: list[str]) -> dict[str, tuple[Optional[str], Optional[list[str]], str]]:
+def _vep_cache_get_many(hgvs_list: list[str]) -> dict[str, tuple[Optional[str], Optional[list[str]], str, str]]:
     """Batch-fetch VEP consequences from Redis.
 
     Returns a dict containing only the HGVS strings that were found in the
-    cache.  Each value is a ``(most_severe, all_consequences, source)`` tuple.
-    ``most_severe`` is ``None`` for a stored miss.  ``all_consequences`` is the
-    full list of consequence terms from the matched transcript entry, or ``None``
-    when only the most-severe consequence was available.  Cache entries written
-    by earlier versions of this script (which lack the ``cs`` field) are
-    silently discarded so they will be re-queried and overwritten in the new
-    format.
+    cache.  Each value is a ``(most_severe, all_consequences, source, access_date)``
+    tuple.  ``access_date`` is always ``""`` for Redis-sourced entries (the
+    original query date is not stored in Redis).  Cache entries written by
+    earlier versions of this script (which lack the ``cs`` field) are silently
+    discarded so they will be re-queried and overwritten in the new format.
     """
     client = _vep_get_redis_client()
     if client is None or not hgvs_list:
@@ -377,12 +375,12 @@ def _vep_cache_get_many(hgvs_list: list[str]) -> dict[str, tuple[Optional[str], 
         values = client.mget(keys)
     except Exception:
         return {}
-    result: dict[str, tuple[Optional[str], Optional[list[str]], str]] = {}
+    result: dict[str, tuple[Optional[str], Optional[list[str]], str, str]] = {}
     for hgvs, value in zip(hgvs_list, values):
         if value is None:
             continue
         if value == _VEP_MISS_SENTINEL:
-            result[hgvs] = (None, None, "most_severe")
+            result[hgvs] = (None, None, "most_severe", "")
         else:
             try:
                 parsed = json.loads(value)
@@ -391,14 +389,14 @@ def _vep_cache_get_many(hgvs_list: list[str]) -> dict[str, tuple[Optional[str], 
                     # is re-queried and overwritten in the new format.
                     continue
                 cs = parsed.get("cs") or None
-                result[hgvs] = (parsed.get("c"), cs, parsed.get("s", "most_severe"))
+                result[hgvs] = (parsed.get("c"), cs, parsed.get("s", "most_severe"), "")
             except (json.JSONDecodeError, AttributeError):
                 # Unrecognised format — discard.
                 continue
     return result
 
 
-def _vep_cache_set_many(results: dict[str, tuple[Optional[str], Optional[list[str]], str]]) -> None:
+def _vep_cache_set_many(results: dict[str, tuple[Optional[str], Optional[list[str]], str, str]]) -> None:
     """Store a batch of HGVS → (most_severe, all_consequences, source) mappings in Redis.
 
     ``None`` consequences (VEP returned nothing) are stored under a sentinel
@@ -413,7 +411,7 @@ def _vep_cache_set_many(results: dict[str, tuple[Optional[str], Optional[list[st
         return
     try:
         pipe = client.pipeline(transaction=False)
-        for hgvs, (consequence, all_consequences, source) in results.items():
+        for hgvs, (consequence, all_consequences, source, *_) in results.items():
             if source == "api_error":
                 continue
             key = _vep_cache_key(hgvs)
@@ -424,6 +422,59 @@ def _vep_cache_set_many(results: dict[str, tuple[Optional[str], Optional[list[st
         pipe.execute()
     except Exception as exc:
         logger.debug("VEP Redis cache write failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# File-based consequence cache
+# ---------------------------------------------------------------------------
+
+
+def _load_vep_file_cache(
+    path: str,
+    col_prefix: str,
+) -> dict[str, tuple[Optional[str], Optional[list[str]], str, str]]:
+    """Load a TSV of pre-computed VEP consequences into a consequence-cache dict.
+
+    Expected columns (header required) use the same namespace-prefixed names
+    produced by ``annotate_row``:
+        hgvs                                      – input HGVS string
+        {prefix}.most_severe_mutational_consequence
+        {prefix}.mutational_consequences          – ``^``-delimited; may be blank
+        {prefix}.consequence_source
+        {prefix}.access_date                      – ISO date string; may be blank
+        {prefix}.error                            – preserved as-is; may be blank
+
+    Rows with a blank ``hgvs`` are silently skipped.  Rows with a blank
+    ``most_severe_mutational_consequence`` are stored as confirmed misses and
+    will not be sent to Redis or the VEP API.  A non-blank ``error`` value is
+    re-encoded into ``source`` so that ``annotate_row`` emits it correctly.
+    """
+    cache: dict[str, tuple[Optional[str], Optional[list[str]], str, str]] = {}
+    p = col_prefix
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        if reader.fieldnames is None:
+            return cache
+        for row in reader:
+            hgvs = row.get("hgvs", "").strip()
+            if not hgvs:
+                continue
+            most_severe = row.get(f"{p}.most_severe_mutational_consequence", "").strip() or None
+            all_cons_raw = row.get(f"{p}.mutational_consequences", "").strip()
+            all_cons: Optional[list[str]] = (
+                [t.strip() for t in all_cons_raw.split("^") if t.strip()]
+                if all_cons_raw
+                else None
+            )
+            source = row.get(f"{p}.consequence_source", "").strip()
+            error = row.get(f"{p}.error", "").strip()
+            if error and not source:
+                source = error  # restore "api_error:..." as source
+            source = source or "most_severe"
+            access_date = row.get(f"{p}.access_date", "").strip()
+            cache[hgvs] = (most_severe, all_cons, source, access_date)
+    logger.info("Loaded %d VEP file-cache entries from %s", len(cache), path)
+    return cache
 
 
 # ---------------------------------------------------------------------------
@@ -512,7 +563,7 @@ def _vep_lookup_batch(
     api_url: str,
     timeout_seconds: int,
     refseq: bool = False,
-) -> tuple[dict[str, tuple[Optional[str], Optional[list[str]], str]], Optional[str]]:
+) -> tuple[dict[str, tuple[Optional[str], Optional[list[str]], str, str]], Optional[str]]:
     """Look up a batch of HGVS strings against the VEP API.
 
     Returns ``(results, error_message)``.  On a batch-level request failure
@@ -520,7 +571,7 @@ def _vep_lookup_batch(
     of the failure.  On success *error_message* is ``None``.
     """
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    out: dict[str, tuple[Optional[str], Optional[list[str]], str]] = {}
+    out: dict[str, tuple[Optional[str], Optional[list[str]], str, str]] = {}
     body: dict[str, Any] = {"hgvs_notations": hgvs_strings}
     if refseq:
         body["refseq"] = 1
@@ -551,11 +602,11 @@ def _vep_lookup_batch(
                 tc_id = (tc.get("transcript_id") or "").split(".")[0]
                 if tc_id == transcript_accession:
                     terms = tc.get("consequence_terms") or []
-                    out[hgvs] = (_pick_most_severe_from_terms(terms), list(terms) if terms else None, "transcript")
+                    out[hgvs] = (_pick_most_severe_from_terms(terms), list(terms) if terms else None, "transcript", "")
                     matched = True
                     break
         if not matched:
-            out[hgvs] = (entry.get("most_severe_consequence"), None, "most_severe")
+            out[hgvs] = (entry.get("most_severe_consequence"), None, "most_severe", "")
     return out, None
 
 
@@ -566,7 +617,7 @@ def _run_batches_concurrent(
     timeout_seconds: int,
     batch_size: int,
     max_workers: int,
-) -> tuple[dict[str, tuple[Optional[str], Optional[list[str]], str]], dict[str, str]]:
+) -> tuple[dict[str, tuple[Optional[str], Optional[list[str]], str, str]], dict[str, str]]:
     """Submit all VEP batches concurrently and merge results.
 
     Returns ``(results, failed_errors)`` where *failed_errors* maps each HGVS
@@ -586,7 +637,7 @@ def _run_batches_concurrent(
         batches.append((other_hgvs[i : i + batch_size], False))
     if not batches:
         return {}, {}
-    result: dict[str, tuple[Optional[str], Optional[list[str]], str]] = {}
+    result: dict[str, tuple[Optional[str], Optional[list[str]], str, str]] = {}
     failed_errors: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=min(max_workers, len(batches))) as pool:
         futures = {
@@ -612,8 +663,8 @@ def get_functional_consequence(
     timeout_seconds: int,
     batch_size: int,
     max_workers: int = 1,
-) -> dict[str, tuple[Optional[str], Optional[list[str]], str]]:
-    """Return HGVS -> (most_severe, all_consequences, source) with recoder fallback.
+) -> dict[str, tuple[Optional[str], Optional[list[str]], str, str]]:
+    """Return HGVS -> (most_severe, all_consequences, source, access_date) with recoder fallback.
 
     ``most_severe`` is the single most-severe VEP consequence term, or ``None``
     when VEP returned no result.  ``all_consequences`` is the full list of
@@ -629,7 +680,7 @@ def get_functional_consequence(
     3) VEP lookup for recoded genomic HGVS (also concurrent)
     4) Choose the most severe consequence by fixed priority order
     """
-    result: dict[str, tuple[Optional[str], Optional[list[str]], str]] = {}
+    result: dict[str, tuple[Optional[str], Optional[list[str]], str, str]] = {}
     if not hgvs_strings:
         return result
 
@@ -656,19 +707,19 @@ def get_functional_consequence(
         # on the next run.
         for missing in missing_hgvs:
             error = batch1_errors.get(missing) or recoder_error
-            result[missing] = (None, None, f"api_error:{error}" if error else "api_error")
+            result[missing] = (None, None, f"api_error:{error}" if error else "api_error", "")
         return result
 
     for missing in missing_hgvs:
         if missing not in recoded:
             # Recoder succeeded but found no genomic equivalent — genuine miss.
-            result[missing] = (None, None, "most_severe")
+            result[missing] = (None, None, "most_severe", "")
 
     all_recoded_hgvs: list[str] = []
     for input_hgvs in missing_hgvs:
         all_recoded_hgvs.extend(recoded.get(input_hgvs, []))
 
-    recoded_results: dict[str, tuple[Optional[str], Optional[list[str]], str]] = {}
+    recoded_results: dict[str, tuple[Optional[str], Optional[list[str]], str, str]] = {}
     batch2_errors: dict[str, str] = {}
     if all_recoded_hgvs:
         recoded_results, batch2_errors = _run_batches_concurrent(
@@ -687,11 +738,11 @@ def get_functional_consequence(
             err: Optional[str] = next((batch2_errors[rh] for rh in recoded_hgvs_list if rh in batch2_errors), None)
             if not err:
                 err = batch1_errors.get(input_hgvs)
-            result[input_hgvs] = (None, None, f"api_error:{err}" if err else "api_error")
+            result[input_hgvs] = (None, None, f"api_error:{err}" if err else "api_error", "")
         else:
-            consequences = [cons for cons, _cs, _src in found.values()]
+            consequences = [cons for cons, _cs, _src, *_ in found.values()]
             chosen = _pick_most_severe_from_terms([c for c in consequences if c])
-            result[input_hgvs] = (chosen, None, "most_severe")
+            result[input_hgvs] = (chosen, None, "most_severe", "")
 
     return result
 
@@ -707,7 +758,7 @@ def _get_hgvs_for_row(row: dict[str, str], hgvs_cols: list[str]) -> str:
 
 def annotate_row(
     row: dict[str, str],
-    consequence_cache: dict[str, tuple[Optional[str], Optional[list[str]], str]],
+    consequence_cache: dict[str, tuple[Optional[str], Optional[list[str]], str, str]],
     *,
     col_prefix: str,
     hgvs_cols: list[str],
@@ -759,9 +810,10 @@ def annotate_row(
                 source_values.append("")
                 error_values.append("")
             continue
-        most_severe, all_consequences, source = cached
+        most_severe, all_consequences, source, cached_date = cached
+        entry_date = cached_date or access_date
         if source.startswith("api_error"):
-            access_values.append(access_date)
+            access_values.append(entry_date)
             if _is_unchanged_transcript_delins(hgvs):
                 consequences_values.append("no_change")
                 most_severe_values.append("no_change")
@@ -775,7 +827,7 @@ def annotate_row(
             continue
         most_severe_str = most_severe or ""
         if not most_severe_str and _is_unchanged_transcript_delins(hgvs):
-            access_values.append(access_date)
+            access_values.append(entry_date)
             consequences_values.append("no_change")
             most_severe_values.append("no_change")
             source_values.append("no_change")
@@ -791,7 +843,7 @@ def annotate_row(
             cs_str = most_severe_str
         consequences_values.append(cs_str)
         most_severe_values.append(most_severe_str)
-        access_values.append(access_date)
+        access_values.append(entry_date)
         source_values.append(source if most_severe_str or cs_str else "")
         error_values.append("")
 
@@ -878,6 +930,17 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Maximum per-field character length for CSV/TSV parsing (default: %(default)s).",
     )
     p.add_argument(
+        "--vep-file-cache",
+        default=None,
+        metavar="FILE",
+        help=(
+            "Path to a TSV file with pre-computed VEP consequences (columns: hgvs, "
+            "most_severe_consequence, all_consequences, consequence_source). Entries "
+            "are pre-loaded into the consequence cache and take precedence over Redis "
+            "and the VEP API."
+        ),
+    )
+    p.add_argument(
         "--keep-existing",
         action="store_true",
         default=False,
@@ -933,7 +996,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         f"{prefix}.error",
     ]
 
-    consequence_cache: dict[str, tuple[Optional[str], Optional[list[str]], str]] = {}
+    consequence_cache: dict[str, tuple[Optional[str], Optional[list[str]], str, str]] = {}
+    if args.vep_file_cache:
+        consequence_cache.update(_load_vep_file_cache(args.vep_file_cache, prefix))
     total_rows = 0
     kept_rows = 0
     newly_resolved_rows = 0
@@ -1024,7 +1089,7 @@ def _process_batch(
     rows: list[dict[str, str]],
     writer: csv.DictWriter,
     out_fh: TextIO,
-    consequence_cache: dict[str, tuple[Optional[str], Optional[list[str]], str]],
+    consequence_cache: dict[str, tuple[Optional[str], Optional[list[str]], str, str]],
     *,
     hgvs_cols: list[str],
     col_prefix: str,

@@ -403,6 +403,38 @@ def _lookup_alphamissense(
 
 
 # ---------------------------------------------------------------------------
+# File-based caches
+# ---------------------------------------------------------------------------
+
+
+def _load_revel_file_cache(path: str) -> dict[str, str]:
+    """Load a two-column TSV (hgvs, revel.score) into an HGVS → score dict."""
+    cache: dict[str, str] = {}
+    with open(path, newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh, delimiter="\t"):
+            h = row.get("hgvs", "").strip()
+            s = row.get("revel.score", "").strip()
+            if h and s:
+                cache[h] = s
+    logger.info("Loaded %d REVEL file-cache entries from %s", len(cache), path)
+    return cache
+
+
+def _load_alphamissense_file_cache(path: str) -> dict[str, tuple[str, str]]:
+    """Load a three-column TSV into an HGVS → (pathogenicity, class) dict."""
+    cache: dict[str, tuple[str, str]] = {}
+    with open(path, newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh, delimiter="\t"):
+            h  = row.get("hgvs", "").strip()
+            ap = row.get("alphamissense.pathogenicity", "").strip()
+            ac = row.get("alphamissense.class", "").strip()
+            if h and (ap or ac):
+                cache[h] = (ap, ac)
+    logger.info("Loaded %d AlphaMissense file-cache entries from %s", len(cache), path)
+    return cache
+
+
+# ---------------------------------------------------------------------------
 # Row-level annotation
 # ---------------------------------------------------------------------------
 
@@ -411,72 +443,87 @@ def annotate_row(
     *,
     nc_to_chrom: dict[str, str],
     mapped_hgvs_g_col: str,
+    mapped_hgvs_c_col: Optional[str] = None,
     revel_path: Optional[Path],
     alphamissense_path: Optional[Path],
     dbnsfp_path: Optional[Path] = None,
     revel_cache: dict[tuple[str, int, str, str], Optional[str]],
     am_cache: dict[tuple[str, int, str, str], Optional[tuple[str, str]]],
     mutpred2_cache: Optional[dict[tuple[str, int, str, str], Optional[str]]] = None,
+    revel_file_cache: Optional[dict[str, str]] = None,
+    am_file_cache: Optional[dict[str, tuple[str, str]]] = None,
 ) -> dict[str, str]:
     """Return annotation columns for a single row.
 
-    Output values are pipe-aligned to the pipe-delimited candidates in the
-    ``mapped_hgvs_g_col`` input column.  Non-SNV candidates produce empty
-    strings in every score column.
+    Output values are pipe-aligned to the candidates.  For REVEL and
+    AlphaMissense each candidate is resolved by checking the file cache
+    (keyed on the c-string from *mapped_hgvs_c_col*) first, then falling back
+    to a tabix lookup via the g-string from *mapped_hgvs_g_col*.  Non-SNV
+    candidates that are absent from the file cache produce empty strings.
     """
-    candidates = _split_pipe((row.get(mapped_hgvs_g_col) or "").strip())
+    g_candidates = _split_pipe((row.get(mapped_hgvs_g_col) or "").strip())
+    c_candidates = (
+        _split_pipe((row.get(mapped_hgvs_c_col) or "").strip())
+        if mapped_hgvs_c_col
+        else []
+    )
+
+    n = max(len(g_candidates), len(c_candidates))
+    g_candidates += [""] * (n - len(g_candidates))
+    c_candidates += [""] * (n - len(c_candidates))
+
+    revel_enabled = revel_path is not None or revel_file_cache is not None
+    am_enabled = alphamissense_path is not None or am_file_cache is not None
 
     revel_vals: list[str] = []
     am_path_vals: list[str] = []
     am_class_vals: list[str] = []
     mutpred2_vals: list[str] = []
 
-    # Use a local throwaway cache if the caller didn't supply one (preserves
-    # backward-compatibility; cross-row deduplication requires a real dict).
     _mp2_cache: dict[tuple[str, int, str, str], Optional[str]] = (
         mutpred2_cache if mutpred2_cache is not None else {}
     )
 
-    for hgvs in candidates:
-        snv = _snv_from_hgvs_g(hgvs, nc_to_chrom) if hgvs else None
+    for hgvs_g, hgvs_c in zip(g_candidates, c_candidates):
+        snv = _snv_from_hgvs_g(hgvs_g, nc_to_chrom) if hgvs_g else None
 
-        if snv is not None and revel_path is not None:
-            chrom, pos, ref, alt = snv
-            r = _lookup_revel(revel_path, chrom, pos, ref, alt, revel_cache)
+        if revel_enabled:
+            r: Optional[str] = None
+            if hgvs_c and revel_file_cache is not None:
+                r = revel_file_cache.get(hgvs_c)
+            if r is None and snv is not None and revel_path is not None:
+                chrom, pos, ref, alt = snv
+                r = _lookup_revel(revel_path, chrom, pos, ref, alt, revel_cache)
             revel_vals.append(r or "")
-        else:
-            revel_vals.append("")
 
-        if snv is not None and alphamissense_path is not None:
-            chrom, pos, ref, alt = snv
-            a = _lookup_alphamissense(alphamissense_path, chrom, pos, ref, alt, am_cache)
+        if am_enabled:
+            a: Optional[tuple[str, str]] = None
+            if hgvs_c and am_file_cache is not None:
+                a = am_file_cache.get(hgvs_c)
+            if a is None and snv is not None and alphamissense_path is not None:
+                chrom, pos, ref, alt = snv
+                a = _lookup_alphamissense(alphamissense_path, chrom, pos, ref, alt, am_cache)
             if a is not None:
                 am_path_vals.append(a[0])
                 am_class_vals.append(a[1])
             else:
                 am_path_vals.append("")
                 am_class_vals.append("")
-        else:
-            am_path_vals.append("")
-            am_class_vals.append("")
 
         if snv is not None and dbnsfp_path is not None:
             chrom, pos, ref, alt = snv
             m = _lookup_mutpred2(dbnsfp_path, chrom, pos, ref, alt, _mp2_cache)
             if m is not None:
                 mutpred2_vals.append(m)
-        # (non-SNV candidates are simply skipped for the protein-level score)
 
-    sep = "|" if len(candidates) > 1 else ""
+    sep = "|" if n > 1 else ""
     out: dict[str, str] = {}
-    if revel_path is not None:
+    if revel_enabled:
         out["revel.score"] = sep.join(revel_vals)
-    if alphamissense_path is not None:
+    if am_enabled:
         out["alphamissense.pathogenicity"] = sep.join(am_path_vals)
         out["alphamissense.class"] = sep.join(am_class_vals)
     if dbnsfp_path is not None:
-        # MutPred2 is protein-level: all candidates encode the same amino acid
-        # substitution, so emit the single best score across candidates.
         if mutpred2_vals:
             best_mp2 = max(mutpred2_vals, key=float)
         else:
@@ -529,9 +576,36 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--revel-cache-file",
+        default=os.environ.get("REVEL_CACHE_FILE"),
+        metavar="PATH",
+        help=(
+            "Path to a two-column TSV (hgvs, revel.score) used as a file-based "
+            "REVEL cache. Looked up before tabix. Defaults to REVEL_CACHE_FILE env var."
+        ),
+    )
+    p.add_argument(
+        "--alphamissense-cache-file",
+        default=os.environ.get("ALPHAMISSENSE_CACHE_FILE"),
+        metavar="PATH",
+        help=(
+            "Path to a three-column TSV (hgvs, alphamissense.pathogenicity, "
+            "alphamissense.class) used as a file-based AlphaMissense cache. "
+            "Looked up before tabix. Defaults to ALPHAMISSENSE_CACHE_FILE env var."
+        ),
+    )
+    p.add_argument(
         "--mapped-hgvs-g-col",
         default="mapped_hgvs_g",
         help="Input column containing pipe-delimited genomic HGVS values (default: mapped_hgvs_g)",
+    )
+    p.add_argument(
+        "--mapped-hgvs-c-col",
+        default="mapped_hgvs_c",
+        help=(
+            "Input column containing pipe-delimited transcript HGVS values used as "
+            "keys for file-based caches (default: mapped_hgvs_c)"
+        ),
     )
     p.add_argument(
         "--skip",
@@ -573,10 +647,21 @@ def main(argv: Optional[list[str]] = None) -> None:
     am_path = Path(args.alphamissense_file) if args.alphamissense_file else None
     dbnsfp_path = Path(args.dbnsfp_file) if args.dbnsfp_file else None
 
-    if revel_path is None and am_path is None and dbnsfp_path is None:
+    revel_file_cache: Optional[dict[str, str]] = None
+    if args.revel_cache_file:
+        revel_file_cache = _load_revel_file_cache(args.revel_cache_file)
+
+    am_file_cache: Optional[dict[str, tuple[str, str]]] = None
+    if args.alphamissense_cache_file:
+        am_file_cache = _load_alphamissense_file_cache(args.alphamissense_cache_file)
+
+    revel_enabled = revel_path is not None or revel_file_cache is not None
+    am_enabled = am_path is not None or am_file_cache is not None
+
+    if not revel_enabled and not am_enabled and dbnsfp_path is None:
         logger.error(
-            "At least one of --revel-file, --alphamissense-file, or --dbnsfp-file "
-            "must be provided."
+            "At least one of --revel-file, --revel-cache-file, --alphamissense-file, "
+            "--alphamissense-cache-file, or --dbnsfp-file must be provided."
         )
         raise SystemExit(1)
 
@@ -590,19 +675,20 @@ def main(argv: Optional[list[str]] = None) -> None:
         logger.error("dbNSFP file not found: %s", dbnsfp_path)
         raise SystemExit(1)
 
-    # Check that tabix is available.
-    if subprocess.run(["tabix", "--version"], capture_output=True, check=False).returncode not in (0, 1):
-        logger.error("tabix executable not found; install htslib.")
-        raise SystemExit(1)
+    # Only require tabix when at least one tabix-indexed file is configured.
+    if revel_path is not None or am_path is not None or dbnsfp_path is not None:
+        if subprocess.run(["tabix", "--version"], capture_output=True, check=False).returncode not in (0, 1):
+            logger.error("tabix executable not found; install htslib.")
+            raise SystemExit(1)
 
     input_path = Path(args.input_file)
     output_path = Path(args.output_file)
     delim = "\t" if input_path.suffix.lower() in (".tsv", ".txt") else ","
 
     ann_cols: list[str] = []
-    if revel_path is not None:
+    if revel_enabled:
         ann_cols.extend(REVEL_COLS)
-    if am_path is not None:
+    if am_enabled:
         ann_cols.extend(ALPHAMISSENSE_COLS)
     if dbnsfp_path is not None:
         ann_cols.extend(DBNSFP_COLS)
@@ -647,20 +733,23 @@ def main(argv: Optional[list[str]] = None) -> None:
                 row,
                 nc_to_chrom=NC_TO_CHROM_GRCH38,
                 mapped_hgvs_g_col=args.mapped_hgvs_g_col,
+                mapped_hgvs_c_col=args.mapped_hgvs_c_col,
                 revel_path=revel_path,
                 alphamissense_path=am_path,
                 dbnsfp_path=dbnsfp_path,
                 revel_cache=revel_cache,
                 am_cache=am_cache,
                 mutpred2_cache=mutpred2_cache,
+                revel_file_cache=revel_file_cache,
+                am_file_cache=am_file_cache,
             )
             row.update(ann)
             writer.writerow(row)
 
             processed += 1
-            if revel_path is not None and row.get("revel.score"):
+            if revel_enabled and row.get("revel.score"):
                 scored_revel += 1
-            if am_path is not None and row.get("alphamissense.pathogenicity"):
+            if am_enabled and row.get("alphamissense.pathogenicity"):
                 scored_am += 1
             if dbnsfp_path is not None and row.get("mutpred2.score"):
                 scored_mutpred2 += 1
