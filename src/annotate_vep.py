@@ -77,6 +77,7 @@ Relevant environment variables:
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import csv
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
@@ -412,7 +413,7 @@ def _vep_cache_set_many(results: dict[str, tuple[Optional[str], Optional[list[st
     try:
         pipe = client.pipeline(transaction=False)
         for hgvs, (consequence, all_consequences, source, *_) in results.items():
-            if source == "api_error":
+            if source.startswith("api_error") or source.startswith("vep_error"):
                 continue
             key = _vep_cache_key(hgvs)
             if consequence is not None:
@@ -593,6 +594,11 @@ def _vep_lookup_batch(
     for entry in response.json():
         hgvs = entry.get("input")
         if not hgvs:
+            continue
+        vep_error = entry.get("error")
+        if vep_error:
+            sanitized = _sanitize_for_tsv(str(vep_error))
+            out[hgvs] = (None, None, f"vep_error:{sanitized}", "")
             continue
         transcript_accession = _extract_transcript_accession(hgvs)
         transcript_consequences = entry.get("transcript_consequences") or []
@@ -812,7 +818,7 @@ def annotate_row(
             continue
         most_severe, all_consequences, source, cached_date = cached
         entry_date = cached_date or access_date
-        if source.startswith("api_error"):
+        if source.startswith("api_error") or source.startswith("vep_error"):
             access_values.append(entry_date)
             if _is_unchanged_transcript_delins(hgvs):
                 consequences_values.append("no_change")
@@ -846,6 +852,40 @@ def annotate_row(
         access_values.append(entry_date)
         source_values.append(source if most_severe_str or cs_str else "")
         error_values.append("")
+
+    # For positions that have a VEP/API error and no consequence, fill from the
+    # most-common (consequences, most_severe) tuple among valid sibling candidates.
+    errored_positions = [
+        i for i in range(len(most_severe_values))
+        if not most_severe_values[i] and error_values[i]
+    ]
+    valid_positions = [
+        i for i in range(len(most_severe_values))
+        if most_severe_values[i]
+    ]
+    if errored_positions and valid_positions:
+        tuple_counts: Counter[tuple[str, str]] = Counter(
+            (consequences_values[i], most_severe_values[i])
+            for i in valid_positions
+        )
+        # Most frequent tuple; ties broken deterministically by (consequences, most_severe)
+        chosen_cs, chosen_ms = sorted(
+            tuple_counts.keys(),
+            key=lambda t: (-tuple_counts[t], t[0], t[1]),
+        )[0]
+        chosen_date = access_date
+        chosen_source = ""
+        for i in valid_positions:
+            if consequences_values[i] == chosen_cs and most_severe_values[i] == chosen_ms:
+                chosen_date = access_values[i]
+                chosen_source = source_values[i]
+                break
+        for i in errored_positions:
+            consequences_values[i] = chosen_cs
+            most_severe_values[i] = chosen_ms
+            access_values[i] = chosen_date
+            source_values[i] = chosen_source
+            # error_values[i] is preserved
 
     out[consequences_col] = "|".join(consequences_values)
     out[most_severe_col] = "|".join(most_severe_values)
