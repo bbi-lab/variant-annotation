@@ -57,7 +57,8 @@ The script detects three mutually exclusive cases from the `raw_hgvs_nt` and `ra
 2. `dcd_mapping` aligns the `target_sequence` to GRCh38, selects transcripts, and performs VRS mapping for every row in the batch.
 3. The assay-level HGVS from VRS mapping is queried in ClinGen to populate all three output columns.
 4. Multi-variant intra-codon haplotypes (e.g. `c.[1A>G;3G>T]`) are normalised to a `delins` expression before mapping when all components fall within one codon.
-5. With `--normalize-hgvs`, bare nucleotide expressions without `c.` prefix (e.g. `1218G>A`, `[1A>G;3G>T]`) are promoted to `c.` form before processing.
+5. When the VRS mapper determines that an input allele is identical to the reference sequence it returns a non-standard identity expression such as `NC_000007.14:g.144548593CCT=`. This is automatically reformatted as a `delins` where the inserted sequence equals the deleted reference (e.g. `NC_000007.14:g.144548593_144548595delinsCCT`) so that `mapped_hgvs_g` contains valid HGVS. ClinGen does not hold records for reference alleles, so `mapped_hgvs_c` and `mapped_hgvs_p` will be empty and `mapping_error` will contain `ClinGen returned no data`. See [No-change alleles](#no-change-alleles) below.
+6. With `--normalize-hgvs`, bare nucleotide expressions without `c.` prefix (e.g. `1218G>A`, `[1A>G;3G>T]`) are promoted to `c.` form before processing.
 
 **Requirements:** `target_sequence` column (or `--targets-file`). `dcd_mapping` must be installed with its data dependencies.
 
@@ -389,6 +390,32 @@ If chunking still fails, the affected group is recorded in `mapping_error` and p
 
 ---
 
+## No-change alleles
+
+A no-change allele is a `delins` (or substitution) whose inserted sequence is identical to the reference bases at that position — effectively a wildtype codon expressed in variant notation. These arise intentionally when `reverse_translate_protein_variants` is run with `--wt-codon-mode unambiguous` or `--wt-codon-mode all`: amino acids encoded by a single codon (Met, Trp) have no truly variant synonymous form, so the only possible DNA representation is the wildtype codon itself.
+
+**VRS output.** When the VRS mapper detects that an input allele is identical to the reference it emits a non-standard identity expression, e.g.:
+
+```
+NC_000007.14:g.144548593CCT=
+```
+
+The trailing `=` means "no change." The bases before `=` are the reference sequence (here the reverse complement of the CDS codon, because the gene is on the minus strand). This is not valid HGVS and ClinGen rejects it.
+
+**Reformatting.** The pipeline detects any assay-level HGVS ending in `=` and rewrites it as an equivalent `delins` where the inserted sequence equals the deleted reference:
+
+```
+NC_000007.14:g.144548593_144548595delinsCCT
+```
+
+This is valid HGVS and is written to `mapped_hgvs_g`.
+
+**ClinGen.** ClinGen does not hold records for reference alleles, so querying with the reformatted `delins` returns no data. `mapped_hgvs_c` and `mapped_hgvs_p` will be empty, and `mapping_error` will contain `ClinGen returned no data for 'NC_000007.14:g.144548593_144548595delinsCCT'`. This is expected and harmless.
+
+**Edge case.** If the identity expression has no embedded bases (e.g. a bare `g.100=` with no reference sequence), the reformatting cannot be completed. In that case `mapping_error` will contain `VRS produced unformattable identity allele` and all mapped columns will be empty.
+
+---
+
 ## Troubleshooting
 
 **`dcd_mapping` not found**
@@ -398,7 +425,7 @@ If chunking still fails, the affected group is recorded in `mapping_error` and p
 : The row will receive `mapping_error = "target_sequence is required for case N but column 'target_sequence' is missing or blank"`. Supply the sequence directly in the input file or via `--targets-file`.
 
 **ClinGen returned no data**
-: Transient network errors are retried with exponential backoff. If ClinGen consistently returns nothing for a specific HGVS, the variant may not be registered; check the ClinGen Allele Registry directly.
+: Transient network errors are retried with exponential backoff. If ClinGen consistently returns nothing for a specific HGVS, the variant may not be registered; check the ClinGen Allele Registry directly. For no-change alleles (e.g. a `delinsXXX` where XXX equals the reference sequence), this error is expected — ClinGen has no record for reference alleles. See [No-change alleles](#no-change-alleles).
 
 **Wrong protein reference selected (`mapped_hgvs_p` uses an unexpected NP_ accession)**
 : The mapper chooses the reference transcript automatically by aligning the target sequence via BLAT, querying UTA for overlapping transcripts, and then filtering those transcripts against the MANE summary file. If the version of the MANE Select transcript in the local UTA database does not exactly match the version stored in the MANE summary file (e.g. UTA has `NM_007194.3` while the MANE file has `NM_007194.4`), the MANE filter returns no results and the mapper falls back to selecting the longest overlapping transcript — which may not be the intended MANE Select. Use `--preferred-transcript` (or `--preferred-transcript-col`) to supply the correct NM_ accession directly. The MANE table is checked first, so providing the MANE-listed version (e.g. `NM_007194.4`) works even if that exact version is absent from UTA.

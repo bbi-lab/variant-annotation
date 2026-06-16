@@ -64,6 +64,16 @@ See [map_variants.md — Transcript selection](map_variants.md#transcript-select
 
 **This pipeline:** Intra-codon c.-haplotypes are detected and normalized to a `delins` expression (e.g. `c.1_3delinsGA`) before VRS mapping. The normalization is attempted only when all component substitutions fall within the same codon.
 
+### VRS identity alleles (no-change variants)
+
+**MaveDB:** No special handling. If dcd_mapping returns a non-standard identity expression (e.g. `NC_000007.14:g.144548593CCT=`) for a variant that is identical to the reference sequence, it is stored as-is in the `hgvs_assay_level` field of `MappedVariant`. The separate `populate_hgvs_for_score_set` job then queries ClinGen by allele ID rather than by HGVS string; an identity expression that ClinGen rejected would simply leave the variant with no allele ID and no populated HGVS columns — effectively silently dropped.
+
+MaveDB does not perform reverse translation, so it does not encounter no-change variants generated from single-codon amino acids.
+
+**This pipeline:** Any assay-level HGVS ending in `=` is detected and reformatted as a `delins` where the inserted sequence equals the deleted reference (e.g. `NC_000007.14:g.144548593_144548595delinsCCT`). This produces valid HGVS for `mapped_hgvs_g`. ClinGen is queried with the reformatted string but has no record for reference alleles, so `mapped_hgvs_c` and `mapped_hgvs_p` will be empty and `mapping_error` will contain `ClinGen returned no data`. No-change variants arise intentionally when `reverse_translate_protein_variants` is run with `--wt-codon-mode unambiguous` (always for Met and Trp, which have only one codon) or `--wt-codon-mode all`.
+
+See [map_variants.md — No-change alleles](map_variants.md#no-change-alleles) for full details.
+
 ### Protein HGVS normalization
 
 **MaveDB:** Variants arrive at the mapping job already validated and normalized by the `create_variants_for_score_set` job upstream. One-letter protein HGVS codes are not expected at this stage.

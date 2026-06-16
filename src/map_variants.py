@@ -266,6 +266,13 @@ _CASE1_RAW_HGVS_NT_RE = re.compile(
 # Matches bare c.-haplotype expressions for case-2 rows, for example
 # ``c.[1A>G;3G>T]``.
 _CASE2_C_HAPLOTYPE_RE = re.compile(r"^c\.\[(?P<body>[^\]]+)\]$")
+
+# Matches the non-standard genomic identity expression dcd_mapping emits for
+# no-change alleles, e.g. "NC_000007.14:g.144548593CCT=".
+# Groups: (1) prefix through "g.", (2) start position, (3) reference bases.
+_VRS_IDENTITY_G_RE = re.compile(
+    r"^((?:NC_|NG_|NT_|NW_)[^:]+:g\.)(\d+)([ACGTacgt]+)=$"
+)
 _CASE2_C_SUB_RE = re.compile(r"^(?P<coord>\d+)(?P<ref>[ACGTN])>(?P<alt>[ACGTN])$")
 _MAPPED_C_SUB_RE = re.compile(
     r"^(?:(?P<accession>[^:]+):)?c\.(?P<coord>\d+)(?P<ref>[ACGTN])>(?P<alt>[ACGTN])$"
@@ -1455,6 +1462,30 @@ def _hgvs_from_annotation(annotation) -> Optional[str]:
     return None
 
 
+def _reformat_identity_hgvs_as_delins(hgvs: str) -> Optional[str]:
+    """Reformat a VRS genomic identity expression as an equivalent delins.
+
+    dcd_mapping emits non-standard strings like ``NC_000007.14:g.144548593CCT=``
+    for alleles that are identical to the reference (e.g. a delins that inserts
+    the same bases that are already present).  This function converts them to a
+    proper HGVS delins where ref == alt, e.g.
+    ``NC_000007.14:g.144548593_144548595delinsCCT``, which is both valid HGVS
+    and unambiguous for downstream consumers such as ClinGen.
+
+    Returns ``None`` when the string does not match the expected pattern (e.g.
+    no embedded bases before ``=``).
+    """
+    m = _VRS_IDENTITY_G_RE.match(hgvs.rstrip())
+    if not m:
+        return None
+    prefix, pos_str, bases = m.group(1), m.group(2), m.group(3)
+    start = int(pos_str)
+    end = start + len(bases) - 1
+    if start == end:
+        return f"{prefix}{start}delins{bases}"
+    return f"{prefix}{start}_{end}delins{bases}"
+
+
 async def _run_dcd_mapping_pipeline(
     group_name: str,
     target_sequence: str,
@@ -1672,6 +1703,40 @@ async def _run_dcd_mapping_pipeline(
             continue
         hgvs_assay = _hgvs_from_annotation(ann)
         dna_digest, protein_digest = _vrs_digest_from_annotation(ann)
+
+        # dcd_mapping emits a non-standard identity expression (e.g.
+        # "NC_000007.14:g.144548593CCT=") when the input allele is identical to
+        # the reference sequence — for example, a reverse-translated no-change
+        # amino acid that encodes only one codon.  The "=" form is not valid
+        # HGVS and ClinGen rejects it.  Reformat it as an equivalent delins
+        # (ref == alt) so the rest of the pipeline can treat it normally.
+        if hgvs_assay and hgvs_assay.rstrip().endswith("="):
+            reformatted = _reformat_identity_hgvs_as_delins(hgvs_assay)
+            if reformatted:
+                logger.debug(
+                    "Row %s: reformatted VRS identity allele %r → %r.",
+                    orig_idx,
+                    hgvs_assay,
+                    reformatted,
+                )
+                hgvs_assay = reformatted
+            else:
+                row_hgvs_nt_for_log = row_entry_by_idx.get(orig_idx, ("", "", 0))[0]
+                logger.warning(
+                    "Row %s: VRS mapper produced identity allele %r for input %r "
+                    "with no embedded bases; cannot reformat as delins.",
+                    orig_idx,
+                    hgvs_assay,
+                    row_hgvs_nt_for_log,
+                )
+                per_row.append((
+                    orig_idx,
+                    None,
+                    f"VRS produced unformattable identity allele {hgvs_assay!r}",
+                    dna_digest,
+                    protein_digest,
+                ))
+                continue
 
         # Fallback for unsupported multi-variant DNA haplotypes: if dcd_mapping
         # produced no assay-level HGVS for a case-2 row, try rewriting supported
@@ -2271,11 +2336,12 @@ def map_variants(
                             _assay_is_protein = (
                                 hgvs_assay.startswith("p.") or ":p." in hgvs_assay
                             )
+                            _assay_is_identity = hgvs_assay.rstrip().endswith("=")
                             _record_result(
                                 orig_idx,
                                 row,
                                 None,
-                                None if _assay_is_protein else hgvs_assay,
+                                None if (_assay_is_protein or _assay_is_identity) else hgvs_assay,
                                 hgvs_assay if _assay_is_protein else None,
                                 f"ClinGen returned no data for {hgvs_assay!r}",
                                 dna_vrs_digest=dna_digest,
