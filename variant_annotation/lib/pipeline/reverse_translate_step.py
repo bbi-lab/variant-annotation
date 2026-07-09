@@ -100,10 +100,18 @@ class ColumnConfig:
     # --- write methods ---
 
     def write_result(self, row: dict, result: TranslationResult) -> None:
-        """Merge a successful TranslationResult back into a row dict."""
+        """Merge a successful TranslationResult back into a row dict.
+
+        The coding and genomic columns are written index-aligned across the
+        equivalence class: candidate i's coding and genomic expressions occupy
+        position i in their respective pipe-joined columns, with an empty
+        genomic cell where that candidate's projection failed (hgvs_g is None).
+        This keeps the two columns the same length so downstream position-based
+        pairing is safe.
+        """
         row[self.assayed_variant_level] = "protein"
-        row[self.mapped_hgvs_c] = "|".join(result.hgvs_c_candidates)
-        row[self.mapped_hgvs_g] = "|".join(result.hgvs_g_candidates)
+        row[self.mapped_hgvs_c] = "|".join(p.hgvs_c for p in result.projection_pairs)
+        row[self.mapped_hgvs_g] = "|".join(p.hgvs_g or "" for p in result.projection_pairs)
         if result.hgvs_p:
             row[self.mapped_hgvs_p] = result.hgvs_p
 
@@ -194,11 +202,16 @@ def process_rows(
             result = result_by_index[i]
             columns.write_result(row, result)
             if derive_coordinate_fields:
+                # Feed derive_fields the same index-aligned pair order write_result
+                # uses: pair i's coding and genomic expressions at position i,
+                # empty string where the genomic projection failed. Empty genomic
+                # cells parse to blank coordinate slots, keeping the derived
+                # coordinate columns aligned with the candidate columns.
                 columns.write_fields(
                     row,
                     derive_fields(
-                        result.hgvs_c_candidates,
-                        result.hgvs_g_candidates,
+                        [p.hgvs_c for p in result.projection_pairs],
+                        [p.hgvs_g or "" for p in result.projection_pairs],
                         resolve_missing_ref_alleles=resolve_missing_ref_alleles,
                     ),
                 )

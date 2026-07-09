@@ -34,6 +34,7 @@ from ..accessions import (
 from ..consequence import ProteinConsequence
 from ._ports import CoordinateTranslator, TranscriptSource
 from .types import (
+    ProjectionPair,
     TranslationConfig,
     TranslationError,
     TranslationResult,
@@ -42,6 +43,10 @@ from .types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Delimiter passed to reverse-translate-variants (--join-delimiter) to pipe-join
+# each candidate column, and used to split the columns back apart row-wise.
+_JOIN_DELIMITER = "|"
 
 _WT_UNAMBIGUOUS_CODONS: dict[str, str] = {
     "Met": "ATG",
@@ -89,10 +94,15 @@ def _find_reverse_translate_cli() -> str:
 
 @dataclass
 class _BatchOutputRow:
-    """Parsed output for one consequence from the reverse-translate-variants subprocess."""
+    """Parsed output for one consequence from the reverse-translate-variants subprocess.
 
-    hgvs_c: list[str]
-    hgvs_g: list[str]
+    projection_pairs holds the consequence's fanned-out equivalence class as
+    ProjectionPair objects — one per coding candidate, carrying its genomic
+    projection and variant type. The pairing is parsed straight from the CLI's
+    position-aligned columns, never re-derived by index.
+    """
+
+    projection_pairs: list[ProjectionPair]
 
 
 @dataclass
@@ -104,15 +114,58 @@ class _BatchErrorRow:
     error: str
 
 
+def _split_aligned(value: str) -> list[str]:
+    """Split a join-delimited candidate column into its per-candidate cells.
+
+    Unlike a naive filter-empties split, this preserves empty cells: an empty
+    genomic cell is a meaningful position holder (a candidate whose c→g
+    projection failed), so the columns must stay index-aligned. An entirely
+    blank column means zero candidates and returns an empty list.
+    """
+    return value.split(_JOIN_DELIMITER) if value.strip() else []
+
+
+def _parse_projection_pairs(row: dict[str, str]) -> list[ProjectionPair]:
+    """Parse one CLI output row into position-aligned ProjectionPair objects.
+
+    The reverse-translate-variants CLI (run with --one-row-per-input) emits the
+    equivalence class as parallel pipe-joined columns — variant_type[i],
+    hgvs_c[i] and hgvs_g[i] all describe candidate i. We zip them column-wise so
+    each candidate's fields land in a single pair. A pair is keyed by its coding
+    expression; an empty genomic cell becomes hgvs_g=None (projection failed)
+    rather than shifting subsequent candidates out of alignment.
+    """
+    coding = _split_aligned(row.get("hgvs_c") or "")
+    genomic = _split_aligned(row.get("hgvs_g") or "")
+    variant_types = _split_aligned(row.get("variant_type") or "")
+
+    pairs: list[ProjectionPair] = []
+    for i, hgvs_c in enumerate(coding):
+        hgvs_c = hgvs_c.strip()
+        # A candidate with no coding expression is not a pair; skip it
+        # without disturbing the alignment of the remaining candidates.
+        if not hgvs_c:
+            continue
+
+        hgvs_g = genomic[i].strip() if i < len(genomic) else ""
+        variant_type = variant_types[i].strip() if i < len(variant_types) else ""
+        pairs.append(
+            ProjectionPair(
+                hgvs_c=hgvs_c,
+                hgvs_g=hgvs_g or None,
+                variant_type=variant_type or None,
+            )
+        )
+
+    return pairs
+
+
 def _run_reverse_translate_batch(
     cli_path: str,
     consequences: list[ProteinConsequence],
     *,
     config: TranslationConfig,
 ) -> tuple[list[_BatchOutputRow], list[_BatchErrorRow]]:
-    def _parse_pipe(value: str) -> list[str]:
-        return [p.strip() for p in value.split("|") if p.strip()] if value.strip() else []
-
     with tempfile.TemporaryDirectory(prefix="equiv_construct_") as tmp:
         tmp_path = Path(tmp)
         input_path = tmp_path / "input.tsv"
@@ -164,12 +217,7 @@ def _run_reverse_translate_batch(
         if output_path.is_file():
             with open(output_path, newline="", encoding="utf-8") as fh:
                 for row in csv.DictReader(fh, delimiter="\t"):
-                    output_rows.append(
-                        _BatchOutputRow(
-                            hgvs_c=_parse_pipe(row.get("hgvs_c") or ""),
-                            hgvs_g=_parse_pipe(row.get("hgvs_g") or ""),
-                        )
-                    )
+                    output_rows.append(_BatchOutputRow(projection_pairs=_parse_projection_pairs(row)))
 
         error_rows: list[_BatchErrorRow] = []
         if errors_path.is_file() and errors_path.stat().st_size > 0:
@@ -272,43 +320,49 @@ def _get_wt_codon(
 
 
 def _apply_wt_codon(
-    c_candidates: list[str],
-    g_candidates: list[str],
+    pairs: list[ProjectionPair],
     consequence: ProteinConsequence,
     *,
     config: TranslationConfig,
     transcripts: TranscriptSource,
     coordinates: CoordinateTranslator,
-) -> tuple[list[str], list[str]]:
-    """Append WT codon delins candidate when applicable. Operates on lists throughout."""
+) -> list[ProjectionPair]:
+    """Append the WT-codon delins projection pair when applicable.
+
+    The WT codon is a synonymous intra-codon delins (the reference codon spelled
+    out) that the reverse-translate tool does not itself emit. We add it as a
+    whole ProjectionPair — coding expression, its genomic projection (None if
+    c→g fails), and variant_type "delins" — so the coding/genomic pairing is
+    added atomically. Appending one paired object (rather than pushing onto two
+    independent lists) makes the coding/genomic desync impossible by
+    construction: a failed genomic projection yields hgvs_g=None on the same
+    pair, never a shorter genomic list.
+    """
     if config.wt_codon_mode is WtCodonMode.NONE:
-        return c_candidates, g_candidates
+        return pairs
 
     aa_change = _parse_protein_aa_change(consequence.hgvs_p)
     if aa_change is None:
-        return c_candidates, g_candidates
+        return pairs
 
     ref_aa3, aa_pos, alt_aa3 = aa_change
     if ref_aa3 != alt_aa3:
-        return c_candidates, g_candidates
+        return pairs
 
     codon = _get_wt_codon(ref_aa3, aa_pos, consequence.transcript, config.wt_codon_mode, transcripts)
     if codon is None:
-        return c_candidates, g_candidates
+        return pairs
 
     wt_c = _build_wt_c_hgvs(consequence.transcript, aa_pos, codon)
-    if wt_c in set(c_candidates):
-        return c_candidates, g_candidates
+    if any(pair.hgvs_c == wt_c for pair in pairs):
+        return pairs
 
     try:
         wt_g = coordinates.c_to_g(wt_c)
     except Exception:
         wt_g = None
 
-    return (
-        c_candidates + [wt_c],
-        g_candidates + ([wt_g] if wt_g else []),
-    )
+    return pairs + [ProjectionPair(hgvs_c=wt_c, hgvs_g=wt_g or None, variant_type="delins")]
 
 
 def _build_result(
@@ -321,9 +375,8 @@ def _build_result(
     transcripts: TranscriptSource,
     coordinates: CoordinateTranslator,
 ) -> TranslationResult | TranslationError:
-    c_candidates, g_candidates = _apply_wt_codon(
-        output_row.hgvs_c,
-        output_row.hgvs_g,
+    pairs = _apply_wt_codon(
+        output_row.projection_pairs,
         consequence,
         config=config,
         transcripts=transcripts,
@@ -331,7 +384,7 @@ def _build_result(
     )
     error = error_messages[0] if error_messages else None
 
-    if not c_candidates and not g_candidates:
+    if not pairs:
         return TranslationError(
             input=inp,
             error=error or "Reverse translation returned no candidate DNA variants",
@@ -340,8 +393,7 @@ def _build_result(
     hgvs_p_out = consequence.hgvs_p if _classify_kind(inp.hgvs) is not _Kind.PROTEIN else None
     return TranslationResult(
         input=inp,
-        hgvs_c_candidates=c_candidates,
-        hgvs_g_candidates=g_candidates,
+        projection_pairs=pairs,
         hgvs_p=hgvs_p_out,
     )
 

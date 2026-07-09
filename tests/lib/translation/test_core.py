@@ -1,6 +1,7 @@
 import pytest
 
 from variant_annotation.lib.translation.types import (
+    ProjectionPair,
     TranslationConfig,
     TranslationResult,
     TranslationError,
@@ -154,7 +155,10 @@ def test_construct_one_returns_result_for_single_input(monkeypatch):
     monkeypatch.setattr(
         _core,
         "_run_reverse_translate_batch",
-        lambda cli, cons, *, config: ([_core._BatchOutputRow(hgvs_c=["NM_000001.1:c.1A>G"], hgvs_g=[])], []),
+        lambda cli, cons, *, config: (
+            [_core._BatchOutputRow(projection_pairs=[ProjectionPair(hgvs_c="NM_000001.1:c.1A>G", hgvs_g=None)])],
+            [],
+        ),
     )
 
     result = _core.construct_one(
@@ -163,7 +167,7 @@ def test_construct_one_returns_result_for_single_input(monkeypatch):
         coordinates=_StubCoordinates(),
     )
     assert isinstance(result, TranslationResult)
-    assert result.hgvs_c_candidates == ["NM_000001.1:c.1A>G"]
+    assert [c.hgvs_c for c in result.projection_pairs] == ["NM_000001.1:c.1A>G"]
 
 
 def test_wt_codon_member_added_for_parenthesized_synonymous(monkeypatch):
@@ -175,7 +179,10 @@ def test_wt_codon_member_added_for_parenthesized_synonymous(monkeypatch):
     monkeypatch.setattr(
         _core,
         "_run_reverse_translate_batch",
-        lambda cli, cons, *, config: ([_core._BatchOutputRow(hgvs_c=["NM_000059.4:c.7005T>C"], hgvs_g=[])], []),
+        lambda cli, cons, *, config: (
+            [_core._BatchOutputRow(projection_pairs=[ProjectionPair(hgvs_c="NM_000059.4:c.7005T>C", hgvs_g=None)])],
+            [],
+        ),
     )
 
     class _Transcripts:
@@ -202,8 +209,11 @@ def test_wt_codon_member_added_for_parenthesized_synonymous(monkeypatch):
         config=TranslationConfig(wt_codon_mode=WtCodonMode.ALL, include_indels=True),
     )
     assert isinstance(result, TranslationResult)
-    assert "NM_000059.4:c.7003_7005delinsTTT" in result.hgvs_c_candidates
-    assert "NC_000013.11:g.32346894delinsTTT" in result.hgvs_g_candidates
+    # The WT codon rides in as a whole projection pair: its coding and genomic
+    # expressions live on the same object (never on two independently-appended lists).
+    wt = next(c for c in result.projection_pairs if c.hgvs_c == "NM_000059.4:c.7003_7005delinsTTT")
+    assert wt.hgvs_g == "NC_000013.11:g.32346894delinsTTT"
+    assert wt.variant_type == "delins"
 
 
 def test_construct_one_returns_error_for_unresolvable_input():
@@ -214,3 +224,136 @@ def test_construct_one_returns_error_for_unresolvable_input():
     )
     assert isinstance(result, TranslationError)
     assert "Unrecognised" in result.error
+
+
+# ---------------------------------------------------------------------------
+# _parse_projection_pairs — row-wise, position-aligned parse (A2)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_projection_pairs_degenerate_consequence_yields_n_pairs():
+    # A degenerate protein consequence fans out into N coding candidates, each
+    # paired with its genomic projection and variant type, in CLI column order.
+    from variant_annotation.lib.translation._core import _parse_projection_pairs
+
+    row = {
+        "variant_type": "snv|snv|snv",
+        "hgvs_c": "NM_1:c.1A>G|NM_1:c.1A>C|NM_1:c.1A>T",
+        "hgvs_g": "NC_1:g.1A>G|NC_1:g.1A>C|NC_1:g.1A>T",
+    }
+    candidates = _parse_projection_pairs(row)
+
+    assert [c.hgvs_c for c in candidates] == ["NM_1:c.1A>G", "NM_1:c.1A>C", "NM_1:c.1A>T"]
+    assert [c.hgvs_g for c in candidates] == ["NC_1:g.1A>G", "NC_1:g.1A>C", "NC_1:g.1A>T"]
+    assert all(c.variant_type == "snv" for c in candidates)
+
+
+def test_parse_projection_pairs_projection_failed_is_none_not_desync():
+    # The bug this refactor fixes: a candidate whose genomic projection failed
+    # leaves an empty g cell. Under the old filter-empties split the g list went
+    # short and every later candidate paired with the wrong g. Row-wise parsing
+    # keeps the coding candidate with hgvs_g=None and preserves alignment of the
+    # candidates on either side.
+    from variant_annotation.lib.translation._core import _parse_projection_pairs
+
+    row = {
+        "variant_type": "snv|snv|snv",
+        "hgvs_c": "NM_1:c.1A>G|NM_1:c.1A>C|NM_1:c.1A>T",
+        "hgvs_g": "NC_1:g.1A>G||NC_1:g.1A>T",  # middle candidate's projection failed
+    }
+    candidates = _parse_projection_pairs(row)
+
+    assert len(candidates) == 3
+    assert candidates[0].hgvs_c == "NM_1:c.1A>G" and candidates[0].hgvs_g == "NC_1:g.1A>G"
+    assert candidates[1].hgvs_c == "NM_1:c.1A>C" and candidates[1].hgvs_g is None
+    assert candidates[2].hgvs_c == "NM_1:c.1A>T" and candidates[2].hgvs_g == "NC_1:g.1A>T"
+
+
+def test_parse_projection_pairs_no_candidates_is_empty():
+    from variant_annotation.lib.translation._core import _parse_projection_pairs
+
+    assert _parse_projection_pairs({"variant_type": "", "hgvs_c": "", "hgvs_g": ""}) == []
+
+
+# ---------------------------------------------------------------------------
+# _apply_wt_codon — WT-genomic-fails preserves alignment by construction (A3)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_wt_codon_genomic_failure_yields_paired_none_not_desync():
+    # Regression for the latent desync: when the WT codon's c->g projection
+    # fails, the coding candidate must still be appended with hgvs_g=None as a
+    # single projection pair -- never a coding entry with no matching genomic
+    # entry (which the old two-list append produced).
+    from variant_annotation.lib.translation._core import _apply_wt_codon
+    from variant_annotation.lib.consequence import ProteinConsequence
+
+    class _Transcripts:
+        def transcript_for_protein(self, acc):
+            return None
+
+        def codon_at(self, tx, pos):
+            return "TTT"
+
+    class _Coordinates:
+        def c_to_p(self, c):
+            raise NotImplementedError
+
+        def g_to_c(self, g, tx):
+            raise NotImplementedError
+
+        def c_to_g(self, c):
+            raise RuntimeError("intronic projection unavailable")
+
+    existing = [ProjectionPair(hgvs_c="NM_000059.4:c.7005T>C", hgvs_g="NC_000013.11:g.32346894T>C")]
+    out = _apply_wt_codon(
+        existing,
+        ProteinConsequence(hgvs_p="NP_000050.3:p.(Phe2335=)", transcript="NM_000059.4"),
+        config=TranslationConfig(wt_codon_mode=WtCodonMode.ALL, include_indels=True),
+        transcripts=_Transcripts(),
+        coordinates=_Coordinates(),
+    )
+
+    assert len(out) == 2
+    wt = out[-1]
+    assert wt.hgvs_c == "NM_000059.4:c.7003_7005delinsTTT"
+    assert wt.hgvs_g is None  # projection failed, but the pair object is intact
+    assert wt.variant_type == "delins"
+
+
+def test_construct_equivalent_variants_end_to_end_returns_projection_pairs(monkeypatch):
+    # End-to-end (subprocess stubbed): the equivalence class arrives as
+    # ProjectionPair objects, projection-failed members carrying hgvs_g=None.
+    from variant_annotation.lib.translation import _core
+
+    monkeypatch.setattr(_core, "_find_reverse_translate_cli", lambda: "/bin/true")
+    monkeypatch.setattr(
+        _core,
+        "_run_reverse_translate_batch",
+        lambda cli, cons, *, config: (
+            [
+                _core._BatchOutputRow(
+                    projection_pairs=[
+                        ProjectionPair(hgvs_c="NM_1:c.3G>A", hgvs_g="NC_1:g.3G>A", variant_type="snv"),
+                        ProjectionPair(hgvs_c="NM_1:c.3G>T", hgvs_g=None, variant_type="snv"),
+                    ]
+                )
+            ],
+            [],
+        ),
+    )
+
+    results, errors = _core.construct_equivalent_variants(
+        [VariantInput(hgvs="NP_1:p.Trp1Cys", transcript="NM_1")],
+        transcripts=_StubTranscripts(),
+        coordinates=_StubCoordinates(),
+    )
+    assert errors == []
+    assert len(results) == 1
+    candidates = results[0].projection_pairs
+    assert [(c.hgvs_c, c.hgvs_g) for c in candidates] == [
+        ("NM_1:c.3G>A", "NC_1:g.3G>A"),
+        ("NM_1:c.3G>T", None),
+    ]
+    # Protein input -> protein apex is authoritative, not re-emitted as a derived member.
+    assert results[0].hgvs_p is None
