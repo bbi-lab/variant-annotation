@@ -58,6 +58,7 @@ line-ending = "lf"
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["variant_annotation*"]
 
 [tool.pytest.ini_options]
 pythonpath = [".","src"]
