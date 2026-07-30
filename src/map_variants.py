@@ -1717,7 +1717,10 @@ async def _run_dcd_mapping_pipeline(
         # amino acid that encodes only one codon.  The "=" form is not valid
         # HGVS and ClinGen rejects it.  Reformat it as an equivalent delins
         # (ref == alt) so the rest of the pipeline can treat it normally.
-        if hgvs_assay and hgvs_assay.rstrip().endswith("="):
+        # Normal HGVS identity alleles (e.g. "NP_000518.1:p.Ser65=") also end
+        # with "=" but _reformat_identity_hgvs_as_delins returns None for them
+        # (the regex requires embedded DNA bases), so they pass through unchanged.
+        if hgvs_assay:
             reformatted = _reformat_identity_hgvs_as_delins(hgvs_assay)
             if reformatted:
                 logger.debug(
@@ -1727,23 +1730,6 @@ async def _run_dcd_mapping_pipeline(
                     reformatted,
                 )
                 hgvs_assay = reformatted
-            else:
-                row_hgvs_nt_for_log = row_entry_by_idx.get(orig_idx, ("", "", 0))[0]
-                logger.warning(
-                    "Row %s: VRS mapper produced identity allele %r for input %r "
-                    "with no embedded bases; cannot reformat as delins.",
-                    orig_idx,
-                    hgvs_assay,
-                    row_hgvs_nt_for_log,
-                )
-                per_row.append((
-                    orig_idx,
-                    None,
-                    f"VRS produced unformattable identity allele {hgvs_assay!r}",
-                    dna_digest,
-                    protein_digest,
-                ))
-                continue
 
         # Fallback for unsupported multi-variant DNA haplotypes: if dcd_mapping
         # produced no assay-level HGVS for a case-2 row, try rewriting supported
