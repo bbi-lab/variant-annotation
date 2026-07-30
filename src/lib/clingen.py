@@ -469,8 +469,14 @@ def query_clingen_by_hgvs(
                 if allele_id:
                     _cache_set(_allele_cache_key(allele_id), json.dumps(data))
                     _cache_set(map_key, allele_id)
-                else:
-                    _cache_set(map_key, _CACHE_MISS_SENTINEL, miss=True)
+                # else: blank-node allele (@id is "_:CA" or "_:PA") — the
+                # registry recognises the variant but hasn't assigned a
+                # permanent ID yet (e.g. a protein change that maps to multiple
+                # possible codon substitutions).  Do NOT write a miss sentinel:
+                # the response body contains valid genomic/transcript data that
+                # callers need.  Omitting the cache entry means subsequent calls
+                # will re-query ClinGen rather than returning None from a stale
+                # miss sentinel.
                 return data
             if resp.status_code == 404:
                 if log_404:

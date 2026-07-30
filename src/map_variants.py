@@ -754,9 +754,16 @@ def _clingen_allele_type(data: dict) -> str:
     """Return 'CA', 'PA', or 'unknown' for the allele type encoded in *data*."""
     at_id: str = data.get("@id", "") or ""
     fragment = at_id.rstrip("/").rsplit("/", 1)[-1]
-    if fragment.startswith("CA"):
+    # Real alleles have a fragment like "CA3057219219" or "PA3074801526".
+    # Blank-node alleles (e.g. @id="_:CA" or "@id="_:PA") appear when ClinGen
+    # recognises a variant but has not yet assigned a permanent allele ID — for
+    # example when a protein-level change maps to multiple possible codon
+    # encodings.  Detect blank-node CA/PA alleles by checking for the
+    # authoritative payload key ("genomicAlleles" or "aminoAcidAlleles") rather
+    # than relying on the @id fragment alone.
+    if fragment.startswith("CA") or "genomicAlleles" in data:
         return "CA"
-    if fragment.startswith("PA"):
+    if fragment.startswith("PA") or "aminoAcidAlleles" in data:
         return "PA"
     return "unknown"
 
