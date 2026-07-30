@@ -73,7 +73,7 @@ The joined file draws from both sources:
 
 **From A:** `ID`, `clinvar_sig_2018`, `clinvar_sig_2025`, `gnomad_MAF`, `has_spliceai`, `Uuid_ClinGen_repo`, `auth_reported_func_class`, `consequence`, `AM_score`, `MutPred2`, `REVEL`
 
-**From B:** `dataset_name`, `gene_symbol`, `variant_urn`, `raw_hgvs_nt`, `raw_hgvs_pro`, `mapped_hgvs_g`, `mapped_hgvs_c`, `mapped_hgvs_p`, `mapping_error`, `reverse_translation_error`, `clingen_allele_id`, `dna_clingen_allele_id`, `score`, ClinVar columns (2018/2025/2026), `gnomad.v4_1.minor_allele_frequency`, `spliceai.max_delta_score`, `clingen_evidence_repository.Uuid`, `mavedb.primary_calibration.functional_class`, `vep.mutational_consequence`, `alphamissense.pathogenicity`, `mutpred2.score`, `revel.score`
+**From B:** `dataset_name`, `gene_symbol`, `variant_urn`, `raw_hgvs_nt`, `raw_hgvs_pro`, `mapped_hgvs_g`, `mapped_hgvs_c`, `mapped_hgvs_p`, `mapping_error`, `reverse_translation_error`, `clingen_allele_id`, `dna_clingen_allele_id`, `score`, ClinVar columns (2018/2025/2026), `gnomad.v4_1.minor_allele_frequency`, `spliceai.max_delta_score`, `clingen_evidence_repository.Uuid`, `mavedb.primary_calibration.functional_class_label`, `vep.mutational_consequence`, `alphamissense.pathogenicity`, `mutpred2.score`, `revel.score`
 
 `has_spliceai` is a derived boolean added to A: `True` if any of the four SpliceAI DS columns (`spliceAI_DS_AG`, `spliceAI_DS_AL`, `spliceAI_DS_DG`, `spliceAI_DS_DL`) is non-empty.
 

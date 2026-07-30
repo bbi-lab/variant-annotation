@@ -844,7 +844,7 @@ def main() -> None:
         "gnomad.v4_1.minor_allele_frequency",
         "spliceai.max_delta_score",
         "clingen_evidence_repository.Uuid",
-        "mavedb.primary_calibration.functional_class",
+        "mavedb.primary_calibration.functional_class_label",
         "vep.mutational_consequence",
         "alphamissense.pathogenicity",
         "mutpred2.score",
