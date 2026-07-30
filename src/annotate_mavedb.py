@@ -22,7 +22,7 @@ For each variant row, the script:
      calibration (``GET /api/v1/score-calibrations/{urn}/variants``) and
      looks up the current variant by URN.
 
-5. Writes six annotation columns per row.
+5. Writes eight annotation columns per row.
 
 Output columns
 --------------
@@ -33,9 +33,15 @@ Output columns
   ``mavedb.primary_calibration.name``
       Title of the primary calibration (empty if none).
 
-  ``mavedb.primary_calibration.functional_class``
+  ``mavedb.primary_calibration.functional_class_label``
       Label of the functional classification that matches the variant's score
       under the primary calibration (empty when unclassified or no calibration).
+
+  ``mavedb.primary_calibration.functional_classification``
+      The ``functionalClassification`` value (e.g. ``normal``, ``abnormal``,
+      ``not_specified``) reported by the MaveDB API for the matching
+      classification under the primary calibration (empty when unclassified
+      or no calibration).
 
   ``mavedb.investigator_provided_calibration.urn``
       URN of the investigator-provided calibration (empty if none).
@@ -43,9 +49,14 @@ Output columns
   ``mavedb.investigator_provided_calibration.name``
       Title of the investigator-provided calibration (empty if none).
 
-  ``mavedb.investigator_provided_calibration.functional_class``
+  ``mavedb.investigator_provided_calibration.functional_class_label``
       Label of the matching classification under the investigator-provided
       calibration (empty when unclassified or no calibration).
+
+  ``mavedb.investigator_provided_calibration.functional_classification``
+      The ``functionalClassification`` value reported by the MaveDB API for
+      the matching classification under the investigator-provided calibration
+      (empty when unclassified or no calibration).
 
 When no calibration is explicitly marked ``primary``, the script falls back
 first to the investigator-provided calibration, then to the first
@@ -93,11 +104,13 @@ OUTPUT_COLS = [
     "mavedb.primary_calibration.urn",
     "mavedb.primary_calibration.name",
     "mavedb.primary_calibration.url",
-    "mavedb.primary_calibration.functional_class",
+    "mavedb.primary_calibration.functional_class_label",
+    "mavedb.primary_calibration.functional_classification",
     "mavedb.investigator_provided_calibration.urn",
     "mavedb.investigator_provided_calibration.name",
     "mavedb.investigator_provided_calibration.url",
-    "mavedb.investigator_provided_calibration.functional_class",
+    "mavedb.investigator_provided_calibration.functional_class_label",
+    "mavedb.investigator_provided_calibration.functional_classification",
 ]
 
 
@@ -176,9 +189,14 @@ def fetch_calibration_variant_class_ids(
 def classify_score_range(
     score: float,
     functional_classifications: list[dict[str, Any]],
-) -> str:
-    """Return the label of the first range-based functional classification that
-    contains *score*, or an empty string if no range matches.
+) -> tuple[str, str]:
+    """Return ``(label, functional_classification)`` of the first range-based
+    functional classification that contains *score*, or ``("", "")`` if no
+    range matches.
+
+    ``functional_classification`` is the ``functionalClassification`` value
+    reported by the MaveDB API (e.g. ``normal``, ``abnormal``,
+    ``not_specified``), distinct from the free-text ``label``.
 
     Bounds are evaluated using the per-entry ``inclusiveLowerBound`` and
     ``inclusiveUpperBound`` flags (defaulting to ``True`` and ``False``
@@ -199,8 +217,8 @@ def classify_score_range(
         upper_ok = (score <= hi) if inc_upper else (score < hi)
 
         if lower_ok and upper_ok:
-            return fc.get("label", "")
-    return ""
+            return fc.get("label", ""), fc.get("functionalClassification", "")
+    return "", ""
 
 
 def classify_variant(
@@ -210,9 +228,13 @@ def classify_variant(
     api_url: str,
     session: requests.Session,
     class_id_cache: dict[str, dict[str, int]],
-) -> tuple[str, str, str]:
-    """Return ``(calibration_urn, calibration_name, functional_class_label)``
-    for *variant_urn* under *calibration*.
+) -> tuple[str, str, str, str]:
+    """Return ``(calibration_urn, calibration_name, functional_class_label,
+    functional_classification)`` for *variant_urn* under *calibration*.
+
+    ``functional_classification`` is the ``functionalClassification`` value
+    reported by the MaveDB API (e.g. ``normal``, ``abnormal``,
+    ``not_specified``), distinct from the free-text ``functional_class_label``.
 
     For range-based calibrations the classification is computed locally using
     *score_str*.  For class-based calibrations the variant-to-class mapping is
@@ -223,22 +245,22 @@ def classify_variant(
     fcs: list[dict[str, Any]] = calibration.get("functionalClassifications") or []
 
     if not fcs:
-        return cal_urn, cal_name, ""
+        return cal_urn, cal_name, "", ""
 
     first_fc = fcs[0]
     if first_fc.get("range") is not None:
         # Range-based calibration – classify locally.
         if not score_str:
-            return cal_urn, cal_name, ""
+            return cal_urn, cal_name, "", ""
         try:
             score = float(score_str)
         except ValueError:
             logger.warning(
                 "Non-numeric score %r for variant %s; cannot classify.", score_str, variant_urn
             )
-            return cal_urn, cal_name, ""
-        label = classify_score_range(score, fcs)
-        return cal_urn, cal_name, label
+            return cal_urn, cal_name, "", ""
+        label, classification = classify_score_range(score, fcs)
+        return cal_urn, cal_name, label, classification
     else:
         # Class-based calibration – look up variant assignment from API.
         if cal_urn not in class_id_cache:
@@ -254,11 +276,11 @@ def classify_variant(
 
         fc_id = class_id_cache[cal_urn].get(variant_urn)
         if fc_id is None:
-            return cal_urn, cal_name, ""
+            return cal_urn, cal_name, "", ""
         for fc in fcs:
             if fc.get("id") == fc_id:
-                return cal_urn, cal_name, fc.get("label", "")
-        return cal_urn, cal_name, ""
+                return cal_urn, cal_name, fc.get("label", ""), fc.get("functionalClassification", "")
+        return cal_urn, cal_name, "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +298,7 @@ def annotate_row(
     calibration_cache: dict[str, list[dict[str, Any]]],
     class_id_cache: dict[str, dict[str, int]],
 ) -> dict[str, str]:
-    """Return the six MaveDB annotation columns for one input *row*.
+    """Return the eight MaveDB annotation columns for one input *row*.
 
     All output values default to empty strings.  Caches calibration lists in
     *calibration_cache* (keyed by score set URN) and class-based variant
@@ -317,22 +339,24 @@ def annotate_row(
     cal_url = f"{MAVEDB_FRONTEND_URL}/score-sets/{ss_urn}"
 
     if primary_cal is not None:
-        urn, name, fc_label = classify_variant(
+        urn, name, fc_label, fc_classification = classify_variant(
             variant_urn, score_str, primary_cal, api_url, session, class_id_cache
         )
         out["mavedb.primary_calibration.urn"] = urn
         out["mavedb.primary_calibration.name"] = name
         out["mavedb.primary_calibration.url"] = cal_url
-        out["mavedb.primary_calibration.functional_class"] = fc_label
+        out["mavedb.primary_calibration.functional_class_label"] = fc_label
+        out["mavedb.primary_calibration.functional_classification"] = fc_classification
 
     if inv_cal is not None:
-        urn, name, fc_label = classify_variant(
+        urn, name, fc_label, fc_classification = classify_variant(
             variant_urn, score_str, inv_cal, api_url, session, class_id_cache
         )
         out["mavedb.investigator_provided_calibration.urn"] = urn
         out["mavedb.investigator_provided_calibration.name"] = name
         out["mavedb.investigator_provided_calibration.url"] = cal_url
-        out["mavedb.investigator_provided_calibration.functional_class"] = fc_label
+        out["mavedb.investigator_provided_calibration.functional_class_label"] = fc_label
+        out["mavedb.investigator_provided_calibration.functional_classification"] = fc_classification
 
     return out
 

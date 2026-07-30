@@ -53,46 +53,49 @@ def test_score_set_urn_from_variant_urn_hash_only():
 # ---------------------------------------------------------------------------
 
 
-def _make_fc(label: str, lower, upper, inc_lower=True, inc_upper=False) -> dict[str, Any]:
+def _make_fc(
+    label: str, lower, upper, inc_lower=True, inc_upper=False, functional_classification=""
+) -> dict[str, Any]:
     return {
         "id": 1,
         "label": label,
         "range": [lower, upper],
         "inclusiveLowerBound": inc_lower,
         "inclusiveUpperBound": inc_upper,
+        "functionalClassification": functional_classification,
     }
 
 
 def test_classify_score_range_matches_first():
     fcs = [
-        _make_fc("Abnormal", None, 0.5),
-        _make_fc("Functional", 0.5, None),
+        _make_fc("Abnormal", None, 0.5, functional_classification="abnormal"),
+        _make_fc("Functional", 0.5, None, functional_classification="normal"),
     ]
-    assert classify_score_range(0.3, fcs) == "Abnormal"
+    assert classify_score_range(0.3, fcs) == ("Abnormal", "abnormal")
 
 
 def test_classify_score_range_matches_second():
     fcs = [
-        _make_fc("Abnormal", None, 0.5),
-        _make_fc("Functional", 0.5, None),
+        _make_fc("Abnormal", None, 0.5, functional_classification="abnormal"),
+        _make_fc("Functional", 0.5, None, functional_classification="normal"),
     ]
     # Default: lower inclusive, upper exclusive → 0.5 belongs to Functional
-    assert classify_score_range(0.5, fcs) == "Functional"
+    assert classify_score_range(0.5, fcs) == ("Functional", "normal")
 
 
 def test_classify_score_range_exclusive_upper():
     fcs = [_make_fc("Tier1", 0.0, 1.0, inc_lower=True, inc_upper=False)]
-    assert classify_score_range(1.0, fcs) == ""
+    assert classify_score_range(1.0, fcs) == ("", "")
 
 
 def test_classify_score_range_inclusive_upper():
     fcs = [_make_fc("Tier1", 0.0, 1.0, inc_lower=True, inc_upper=True)]
-    assert classify_score_range(1.0, fcs) == "Tier1"
+    assert classify_score_range(1.0, fcs) == ("Tier1", "")
 
 
 def test_classify_score_range_no_match():
     fcs = [_make_fc("Band", 0.5, 0.9)]
-    assert classify_score_range(0.95, fcs) == ""
+    assert classify_score_range(0.95, fcs) == ("", "")
 
 
 def test_classify_score_range_skips_class_based():
@@ -100,11 +103,11 @@ def test_classify_score_range_skips_class_based():
         {"id": 1, "label": "SomeClass", "range": None, "class": "CategoryA"},
         _make_fc("Functional", 0.8, None),
     ]
-    assert classify_score_range(0.9, fcs) == "Functional"
+    assert classify_score_range(0.9, fcs) == ("Functional", "")
 
 
 def test_classify_score_range_empty_list():
-    assert classify_score_range(0.5, []) == ""
+    assert classify_score_range(0.5, []) == ("", "")
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +214,7 @@ def _make_range_calibration(cal_urn="urn:mavedb:cal-1", title="My Cal") -> dict[
                 "range": [None, 0.5],
                 "inclusiveLowerBound": True,
                 "inclusiveUpperBound": False,
+                "functionalClassification": "abnormal",
             },
             {
                 "id": 2,
@@ -218,6 +222,7 @@ def _make_range_calibration(cal_urn="urn:mavedb:cal-1", title="My Cal") -> dict[
                 "range": [0.5, None],
                 "inclusiveLowerBound": True,
                 "inclusiveUpperBound": False,
+                "functionalClassification": "normal",
             },
         ],
     }
@@ -230,8 +235,20 @@ def _make_class_calibration(cal_urn="urn:mavedb:cal-2", title="Class Cal") -> di
         "primary": False,
         "investigatorProvided": True,
         "functionalClassifications": [
-            {"id": 10, "label": "Pathogenic", "range": None, "class": "P"},
-            {"id": 11, "label": "Benign", "range": None, "class": "B"},
+            {
+                "id": 10,
+                "label": "Pathogenic",
+                "range": None,
+                "class": "P",
+                "functionalClassification": "abnormal",
+            },
+            {
+                "id": 11,
+                "label": "Benign",
+                "range": None,
+                "class": "B",
+                "functionalClassification": "normal",
+            },
         ],
     }
 
@@ -240,12 +257,13 @@ def test_classify_variant_range_based_match():
     cal = _make_range_calibration()
     session = MagicMock()
     cache: dict = {}
-    urn, name, label = classify_variant(
+    urn, name, label, classification = classify_variant(
         "urn:mavedb:00000001-a-1#5", "0.3", cal, "https://api.mavedb.org", session, cache
     )
     assert urn == "urn:mavedb:cal-1"
     assert name == "My Cal"
     assert label == "Abnormal"
+    assert classification == "abnormal"
     session.get.assert_not_called()
 
 
@@ -253,20 +271,22 @@ def test_classify_variant_range_based_no_match():
     cal = _make_range_calibration()
     session = MagicMock()
     cache: dict = {}
-    _, _, label = classify_variant(
+    _, _, label, classification = classify_variant(
         "urn:mavedb:00000001-a-1#5", "0.75", cal, "https://api.mavedb.org", session, cache
     )
     assert label == "Functional"
+    assert classification == "normal"
 
 
 def test_classify_variant_range_based_empty_score():
     cal = _make_range_calibration()
     session = MagicMock()
     cache: dict = {}
-    _, _, label = classify_variant(
+    _, _, label, classification = classify_variant(
         "urn:mavedb:00000001-a-1#5", "", cal, "https://api.mavedb.org", session, cache
     )
     assert label == ""
+    assert classification == ""
     session.get.assert_not_called()
 
 
@@ -274,10 +294,11 @@ def test_classify_variant_range_based_non_numeric_score():
     cal = _make_range_calibration()
     session = MagicMock()
     cache: dict = {}
-    _, _, label = classify_variant(
+    _, _, label, classification = classify_variant(
         "urn:mavedb:00000001-a-1#5", "NA", cal, "https://api.mavedb.org", session, cache
     )
     assert label == ""
+    assert classification == ""
 
 
 def test_classify_variant_class_based_found(monkeypatch):
@@ -289,10 +310,11 @@ def test_classify_variant_class_based_found(monkeypatch):
         "src.annotate_mavedb.fetch_calibration_variant_class_ids",
         lambda api_url, cal_urn, sess: {"urn:mavedb:00000001-a-1#5": 10},
     )
-    _, _, label = classify_variant(
+    _, _, label, classification = classify_variant(
         "urn:mavedb:00000001-a-1#5", "", cal, "https://api.mavedb.org", session, cache
     )
     assert label == "Pathogenic"
+    assert classification == "abnormal"
 
 
 def test_classify_variant_class_based_not_found(monkeypatch):
@@ -304,10 +326,11 @@ def test_classify_variant_class_based_not_found(monkeypatch):
         "src.annotate_mavedb.fetch_calibration_variant_class_ids",
         lambda api_url, cal_urn, sess: {},
     )
-    _, _, label = classify_variant(
+    _, _, label, classification = classify_variant(
         "urn:mavedb:00000001-a-1#99", "", cal, "https://api.mavedb.org", session, cache
     )
     assert label == ""
+    assert classification == ""
 
 
 def test_classify_variant_class_based_uses_cache(monkeypatch):
@@ -321,10 +344,11 @@ def test_classify_variant_class_based_uses_cache(monkeypatch):
         "src.annotate_mavedb.fetch_calibration_variant_class_ids",
         lambda *a, **kw: fetch_called.append(True) or {},
     )
-    _, _, label = classify_variant(
+    _, _, label, classification = classify_variant(
         "urn:mavedb:00000001-a-1#5", "", cal, "https://api.mavedb.org", session, cache
     )
     assert label == "Benign"
+    assert classification == "normal"
     assert fetch_called == []  # cache hit → no fetch
 
 
@@ -332,12 +356,13 @@ def test_classify_variant_no_functional_classifications():
     cal = {"urn": "urn:mavedb:cal-empty", "title": "Empty", "functionalClassifications": []}
     session = MagicMock()
     cache: dict = {}
-    urn, name, label = classify_variant(
+    urn, name, label, classification = classify_variant(
         "urn:mavedb:00000001-a-1#1", "0.5", cal, "https://api.mavedb.org", session, cache
     )
     assert urn == "urn:mavedb:cal-empty"
     assert name == "Empty"
     assert label == ""
+    assert classification == ""
 
 
 def test_classify_variant_api_error_class_based(monkeypatch):
@@ -349,10 +374,11 @@ def test_classify_variant_api_error_class_based(monkeypatch):
         "src.annotate_mavedb.fetch_calibration_variant_class_ids",
         MagicMock(side_effect=requests.RequestException("timeout")),
     )
-    _, _, label = classify_variant(
+    _, _, label, classification = classify_variant(
         "urn:mavedb:00000001-a-1#5", "", cal, "https://api.mavedb.org", session, cache
     )
     assert label == ""
+    assert classification == ""
     # Cache populated with empty dict so subsequent calls skip the fetch.
     assert cache["urn:mavedb:cal-2"] == {}
 
@@ -378,6 +404,7 @@ def _make_calibrations(*, primary=True, investigator=True) -> list[dict[str, Any
                         "range": [None, 0.5],
                         "inclusiveLowerBound": True,
                         "inclusiveUpperBound": False,
+                        "functionalClassification": "abnormal",
                     },
                     {
                         "id": 2,
@@ -385,6 +412,7 @@ def _make_calibrations(*, primary=True, investigator=True) -> list[dict[str, Any
                         "range": [0.5, None],
                         "inclusiveLowerBound": True,
                         "inclusiveUpperBound": False,
+                        "functionalClassification": "normal",
                     },
                 ],
             }
@@ -403,6 +431,7 @@ def _make_calibrations(*, primary=True, investigator=True) -> list[dict[str, Any
                         "range": [None, 0.3],
                         "inclusiveLowerBound": True,
                         "inclusiveUpperBound": False,
+                        "functionalClassification": "abnormal",
                     },
                     {
                         "id": 11,
@@ -410,6 +439,7 @@ def _make_calibrations(*, primary=True, investigator=True) -> list[dict[str, Any
                         "range": [0.3, None],
                         "inclusiveLowerBound": True,
                         "inclusiveUpperBound": False,
+                        "functionalClassification": "normal",
                     },
                 ],
             }
@@ -448,18 +478,22 @@ def test_annotate_row_both_calibrations():
     assert result["mavedb.primary_calibration.urn"] == "urn:mavedb:cal-primary"
     assert result["mavedb.primary_calibration.name"] == "Primary Cal"
     assert result["mavedb.primary_calibration.url"] == _SCORE_SET_URL
-    assert result["mavedb.primary_calibration.functional_class"] == "Abnormal"
+    assert result["mavedb.primary_calibration.functional_class_label"] == "Abnormal"
+    assert result["mavedb.primary_calibration.functional_classification"] == "abnormal"
     assert result["mavedb.investigator_provided_calibration.urn"] == "urn:mavedb:cal-inv"
     assert result["mavedb.investigator_provided_calibration.name"] == "Investigator Cal"
     assert result["mavedb.investigator_provided_calibration.url"] == _SCORE_SET_URL
-    assert result["mavedb.investigator_provided_calibration.functional_class"] == "Loss of function"
+    assert result["mavedb.investigator_provided_calibration.functional_class_label"] == "Loss of function"
+    assert result["mavedb.investigator_provided_calibration.functional_classification"] == "abnormal"
 
 
 def test_annotate_row_high_score():
     row = {"variant_urn": "urn:mavedb:00000001-a-1#5", "score": "0.9"}
     result = _annotate_row_with_cache(row, _make_calibrations())
-    assert result["mavedb.primary_calibration.functional_class"] == "Functional"
-    assert result["mavedb.investigator_provided_calibration.functional_class"] == "Normal function"
+    assert result["mavedb.primary_calibration.functional_class_label"] == "Functional"
+    assert result["mavedb.primary_calibration.functional_classification"] == "normal"
+    assert result["mavedb.investigator_provided_calibration.functional_class_label"] == "Normal function"
+    assert result["mavedb.investigator_provided_calibration.functional_classification"] == "normal"
 
 
 def test_annotate_row_no_primary_calibration():
@@ -469,9 +503,11 @@ def test_annotate_row_no_primary_calibration():
     assert result["mavedb.primary_calibration.urn"] == "urn:mavedb:cal-inv"
     assert result["mavedb.primary_calibration.name"] == "Investigator Cal"
     assert result["mavedb.primary_calibration.url"] == _SCORE_SET_URL
-    assert result["mavedb.primary_calibration.functional_class"] == "Loss of function"
+    assert result["mavedb.primary_calibration.functional_class_label"] == "Loss of function"
+    assert result["mavedb.primary_calibration.functional_classification"] == "abnormal"
     assert result["mavedb.investigator_provided_calibration.url"] == _SCORE_SET_URL
-    assert result["mavedb.investigator_provided_calibration.functional_class"] == "Loss of function"
+    assert result["mavedb.investigator_provided_calibration.functional_class_label"] == "Loss of function"
+    assert result["mavedb.investigator_provided_calibration.functional_classification"] == "abnormal"
 
 
 def test_annotate_row_fallback_to_non_research_use_only():
@@ -490,6 +526,7 @@ def test_annotate_row_fallback_to_non_research_use_only():
                 "range": [None, 0.5],
                 "inclusiveLowerBound": True,
                 "inclusiveUpperBound": False,
+                "functionalClassification": "abnormal",
             },
         ],
     }
@@ -507,7 +544,8 @@ def test_annotate_row_fallback_to_non_research_use_only():
     assert result["mavedb.primary_calibration.urn"] == "urn:mavedb:cal-standard"
     assert result["mavedb.primary_calibration.name"] == "Standard Cal"
     assert result["mavedb.primary_calibration.url"] == _SCORE_SET_URL
-    assert result["mavedb.primary_calibration.functional_class"] == "Abnormal"
+    assert result["mavedb.primary_calibration.functional_class_label"] == "Abnormal"
+    assert result["mavedb.primary_calibration.functional_classification"] == "abnormal"
     # No investigator-provided calibration.
     assert result["mavedb.investigator_provided_calibration.urn"] == ""
     assert result["mavedb.investigator_provided_calibration.url"] == ""
@@ -517,11 +555,13 @@ def test_annotate_row_no_investigator_calibration():
     row = {"variant_urn": "urn:mavedb:00000001-a-1#5", "score": "0.8"}
     result = _annotate_row_with_cache(row, _make_calibrations(investigator=False))
     assert result["mavedb.primary_calibration.url"] == _SCORE_SET_URL
-    assert result["mavedb.primary_calibration.functional_class"] == "Functional"
+    assert result["mavedb.primary_calibration.functional_class_label"] == "Functional"
+    assert result["mavedb.primary_calibration.functional_classification"] == "normal"
     assert result["mavedb.investigator_provided_calibration.urn"] == ""
     assert result["mavedb.investigator_provided_calibration.name"] == ""
     assert result["mavedb.investigator_provided_calibration.url"] == ""
-    assert result["mavedb.investigator_provided_calibration.functional_class"] == ""
+    assert result["mavedb.investigator_provided_calibration.functional_class_label"] == ""
+    assert result["mavedb.investigator_provided_calibration.functional_classification"] == ""
 
 
 def test_annotate_row_empty_variant_urn():
@@ -547,7 +587,8 @@ def test_annotate_row_empty_score_for_range_cal():
     result = _annotate_row_with_cache(row, _make_calibrations(investigator=False))
     assert result["mavedb.primary_calibration.urn"] == "urn:mavedb:cal-primary"
     assert result["mavedb.primary_calibration.url"] == _SCORE_SET_URL
-    assert result["mavedb.primary_calibration.functional_class"] == ""
+    assert result["mavedb.primary_calibration.functional_class_label"] == ""
+    assert result["mavedb.primary_calibration.functional_classification"] == ""
 
 
 def test_annotate_row_calibration_cache_hit():
@@ -611,7 +652,8 @@ def test_annotate_row_custom_col_names():
         variant_urn_col="my_urn",
         score_col="my_score",
     )
-    assert result["mavedb.primary_calibration.functional_class"] == "Abnormal"
+    assert result["mavedb.primary_calibration.functional_class_label"] == "Abnormal"
+    assert result["mavedb.primary_calibration.functional_classification"] == "abnormal"
 
 
 # ---------------------------------------------------------------------------
@@ -642,9 +684,11 @@ def test_main_writes_output(tmp_path, monkeypatch):
 
     rows = list(csv.DictReader(output_tsv.open(encoding="utf-8"), delimiter="\t"))
     assert len(rows) == 2
-    assert rows[0]["mavedb.primary_calibration.functional_class"] == "Abnormal"
-    assert rows[1]["mavedb.primary_calibration.functional_class"] == "Functional"
-    assert rows[0]["mavedb.investigator_provided_calibration.functional_class"] == ""
+    assert rows[0]["mavedb.primary_calibration.functional_class_label"] == "Abnormal"
+    assert rows[0]["mavedb.primary_calibration.functional_classification"] == "abnormal"
+    assert rows[1]["mavedb.primary_calibration.functional_class_label"] == "Functional"
+    assert rows[1]["mavedb.primary_calibration.functional_classification"] == "normal"
+    assert rows[0]["mavedb.investigator_provided_calibration.functional_class_label"] == ""
 
 
 def test_main_skip_and_limit(tmp_path, monkeypatch):

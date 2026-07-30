@@ -568,7 +568,7 @@ See [docs/annotate_mavedb.md](docs/annotate_mavedb.md) for full reference docume
 
 **Input columns:** `variant_urn` (MaveDB variant URN), `score` (numeric variant score)
 
-**Output columns:** `mavedb.primary_calibration.urn`, `.name`, `.url`, `.functional_class`, `mavedb.investigator_provided_calibration.urn`, `.name`, `.url`, `.functional_class`
+**Output columns:** `mavedb.primary_calibration.urn`, `.name`, `.url`, `.functional_class_label`, `.functional_classification`, `mavedb.investigator_provided_calibration.urn`, `.name`, `.url`, `.functional_class_label`, `.functional_classification`
 
 **Command:**
 ```bash
