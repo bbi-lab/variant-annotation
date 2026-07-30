@@ -23,6 +23,11 @@ CLINGEN_CACHE_TTL_SECONDS_DEFAULT = 86400 # 1 day
 CLINGEN_CACHE_MISS_TTL_SECONDS_DEFAULT = 86400 # 1 day
 
 _CACHE_MISS_SENTINEL = "__MISS__"
+# Sentinel stored in the HGVS map key when ClinGen returned HTTP 200 but the
+# response carries a blank-node @id (e.g. "_:CA" or "_:PA") rather than a real
+# allele identifier.  The full response body is stored under the corresponding
+# _blank_node_cache_key so it can be retrieved on subsequent lookups.
+_BLANK_NODE_SENTINEL = "__BLANK__"
 _REDIS_CLIENT: Any = None
 _REDIS_INIT_ATTEMPTED = False
 _REDIS_UNAVAILABLE_LOGGED = False
@@ -112,6 +117,11 @@ def _get_with_503_retry(
 
 def _allele_cache_key(allele_id: str) -> str:
     return f"{_cache_prefix()}:allele:{allele_id}"
+
+
+def _blank_node_cache_key(hgvs: str) -> str:
+    """Return the Redis key used to cache the full body for a blank-node response."""
+    return f"{_cache_prefix()}:blank:{hgvs}"
 
 
 def _hgvs_map_key(hgvs: str) -> str:
@@ -388,31 +398,35 @@ def query_clingen_by_hgvs(
         Retried up to *max_retries* times with *retry_delay* seconds between
         attempts.  Returns ``None`` when all attempts fail.
 
-    Placeholder IDs
-        ClinGen occasionally returns HTTP 200 with an ``@id`` that contains a
-        blank-node-style placeholder such as ``_:CA123456`` or ``_:PA789``
-        rather than a real registry identifier.  ``_extract_clingen_allele_id``
-        rejects these values.  When this occurs the response is still returned
-        (callers may inspect it), but the HGVS key is stored as a miss in Redis
-        so the lookup is not repeated unnecessarily.
+    Blank-node alleles
+        ClinGen occasionally returns HTTP 200 with a blank-node ``@id`` such as
+        ``_:CA`` or ``_:PA`` rather than a real registry identifier.  This
+        happens when the registry recognises a variant (for example, a protein
+        change that can be encoded by multiple codon substitutions) but has not
+        yet assigned it a permanent allele ID.  The response body still contains
+        valid ``genomicAlleles``, ``transcriptAlleles``, or ``aminoAcidAlleles``
+        data that callers use.  ``_extract_clingen_allele_id`` rejects blank-node
+        values, so no real allele ID is extracted.  The full response body is
+        still returned to the caller, **and** it is cached under a dedicated
+        ``<prefix>:blank:<HGVS>`` key so subsequent lookups avoid a network
+        round-trip.  The HGVS map key is set to ``__BLANK__`` (rather than a
+        miss sentinel) to indicate this third cache tier.
 
     Redis caching
     -------------
-    When the Redis service is reachable, two keys are written per successful
-    lookup:
+    Three key patterns are used:
 
-    - ``<prefix>:hgvs:<HGVS>``        → allele ID string
-    - ``<prefix>:allele:<allele_ID>``  → full JSON response body
+    - ``<prefix>:hgvs:<HGVS>``         → allele ID, ``__BLANK__``, or ``__MISS__``
+    - ``<prefix>:allele:<allele_ID>``   → full JSON body (real CA/PA alleles)
+    - ``<prefix>:blank:<HGVS>``         → full JSON body (blank-node alleles)
 
-    Both hit and miss results are cached.  Misses are stored as the sentinel
-    value ``__MISS__``.  The default key prefix is ``clingen:v1`` (override
-    with ``CLINGEN_CACHE_PREFIX`` env var).  Default TTL is 86 400 s for hits
-    and misses (configurable via ``CLINGEN_CACHE_TTL_SECONDS`` /
-    ``CLINGEN_CACHE_MISS_TTL_SECONDS``).
+    The default key prefix is ``clingen:v1`` (override with the
+    ``CLINGEN_CACHE_PREFIX`` env var).  Default TTL is 86 400 s for all entries
+    (configurable via ``CLINGEN_CACHE_TTL_SECONDS`` / ``CLINGEN_CACHE_MISS_TTL_SECONDS``).
 
-    If the HGVS→ID mapping key exists in Redis but the allele response was
-    evicted or is corrupt, the allele is re-fetched by ID without re-querying
-    by HGVS.
+    If the HGVS→ID mapping key exists in Redis but the allele body was evicted
+    or is corrupt, the allele is re-fetched by ID without re-querying by HGVS.
+    If a blank-node body is evicted, the full HGVS query is re-issued.
 
     Known-misses list
     -----------------
@@ -431,26 +445,39 @@ def query_clingen_by_hgvs(
     if found_map and cached_allele_id is not None:
         if cached_allele_id == _CACHE_MISS_SENTINEL:
             return None
-        allele_key = _allele_cache_key(cached_allele_id)
-        found_allele, cached_response = _cache_get(allele_key)
-        if found_allele and cached_response is not None:
-            if cached_response == _CACHE_MISS_SENTINEL:
-                return None
-            try:
-                payload = json.loads(cached_response)
-                if isinstance(payload, dict):
-                    return payload
-            except Exception:
-                pass
+        if cached_allele_id == _BLANK_NODE_SENTINEL:
+            # Blank-node response: full body stored under a dedicated key.
+            found_blank, cached_blank = _cache_get(_blank_node_cache_key(hgvs))
+            if found_blank and cached_blank is not None:
+                try:
+                    payload = json.loads(cached_blank)
+                    if isinstance(payload, dict):
+                        return payload
+                except Exception:
+                    pass
+            # Body evicted or corrupt; fall through to re-fetch via HTTP.
+        else:
+            allele_key = _allele_cache_key(cached_allele_id)
+            found_allele, cached_response = _cache_get(allele_key)
+            if found_allele and cached_response is not None:
+                if cached_response == _CACHE_MISS_SENTINEL:
+                    return None
+                try:
+                    payload = json.loads(cached_response)
+                    if isinstance(payload, dict):
+                        return payload
+                except Exception:
+                    pass
 
-        # Mapping exists but allele response was evicted/corrupt; refetch by allele id.
-        return _fetch_allele_response_by_id(
-            cached_allele_id,
-            max_retries=max_retries,
-            retry_delay=retry_delay,
-        )
+            # Mapping exists but allele response was evicted/corrupt; refetch by allele id.
+            return _fetch_allele_response_by_id(
+                cached_allele_id,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+            )
 
-    # Redis missed. Check known_misses before making an HTTP request.
+    # Redis missed (or blank-node body evicted). Check known_misses before
+    # making an HTTP request.
     if known_misses and hgvs in known_misses:
         return None
 
@@ -469,14 +496,15 @@ def query_clingen_by_hgvs(
                 if allele_id:
                     _cache_set(_allele_cache_key(allele_id), json.dumps(data))
                     _cache_set(map_key, allele_id)
-                # else: blank-node allele (@id is "_:CA" or "_:PA") — the
-                # registry recognises the variant but hasn't assigned a
-                # permanent ID yet (e.g. a protein change that maps to multiple
-                # possible codon substitutions).  Do NOT write a miss sentinel:
-                # the response body contains valid genomic/transcript data that
-                # callers need.  Omitting the cache entry means subsequent calls
-                # will re-query ClinGen rather than returning None from a stale
-                # miss sentinel.
+                else:
+                    # Blank-node allele (@id is "_:CA" or "_:PA"): the registry
+                    # recognises the variant but has not yet assigned a permanent
+                    # allele ID.  The response body still contains useful
+                    # genomic/transcript data, so cache it under a dedicated key
+                    # and record a sentinel in the HGVS map key so subsequent
+                    # lookups know where to find the body.
+                    _cache_set(_blank_node_cache_key(hgvs), json.dumps(data))
+                    _cache_set(map_key, _BLANK_NODE_SENTINEL)
                 return data
             if resp.status_code == 404:
                 if log_404:
