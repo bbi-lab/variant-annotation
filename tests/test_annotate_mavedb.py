@@ -14,11 +14,13 @@ import requests
 
 from src.annotate_mavedb import (
     OUTPUT_COLS,
+    REQUESTED_CALIBRATION_COLS,
     annotate_row,
     classify_score_range,
     classify_variant,
     fetch_calibration_variant_class_ids,
     fetch_calibrations,
+    load_requested_calibration_map,
     score_set_urn_from_variant_urn,
 )
 
@@ -151,6 +153,59 @@ def test_fetch_calibrations_error_raises():
     session.get.return_value = resp
     with pytest.raises(requests.HTTPError):
         fetch_calibrations("https://api.mavedb.org", "urn:mavedb:bad", session)
+
+
+# ---------------------------------------------------------------------------
+# load_requested_calibration_map
+# ---------------------------------------------------------------------------
+
+
+def test_load_requested_calibration_map_basic(tmp_path):
+    path = tmp_path / "score_sets.tsv"
+    path.write_text(
+        "dataset_name\tscore_set_urn\trequested_calibration_urn\n"
+        "DatasetA\turn:mavedb:00000001-a-1\turn:mavedb:cal-req-1\n"
+        "DatasetB\turn:mavedb:00000002-a-1\t\n",
+        encoding="utf-8",
+    )
+    result = load_requested_calibration_map(path)
+    assert result == {"urn:mavedb:00000001-a-1": "urn:mavedb:cal-req-1"}
+
+
+def test_load_requested_calibration_map_csv(tmp_path):
+    path = tmp_path / "score_sets.csv"
+    path.write_text(
+        "score_set_urn,requested_calibration_urn\n"
+        "urn:mavedb:00000001-a-1,urn:mavedb:cal-req-1\n",
+        encoding="utf-8",
+    )
+    result = load_requested_calibration_map(path)
+    assert result == {"urn:mavedb:00000001-a-1": "urn:mavedb:cal-req-1"}
+
+
+def test_load_requested_calibration_map_missing_column_raises(tmp_path):
+    path = tmp_path / "score_sets.tsv"
+    path.write_text("score_set_urn\turn:mavedb:00000001-a-1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="missing column"):
+        load_requested_calibration_map(path)
+
+
+def test_load_requested_calibration_map_empty_file_raises(tmp_path):
+    path = tmp_path / "score_sets.tsv"
+    path.write_text("", encoding="utf-8")
+    with pytest.raises(ValueError, match="empty"):
+        load_requested_calibration_map(path)
+
+
+def test_load_requested_calibration_map_blank_score_set_urn_skipped(tmp_path):
+    path = tmp_path / "score_sets.tsv"
+    path.write_text(
+        "score_set_urn\trequested_calibration_urn\n"
+        "\turn:mavedb:cal-req-1\n",
+        encoding="utf-8",
+    )
+    result = load_requested_calibration_map(path)
+    assert result == {}
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +712,115 @@ def test_annotate_row_custom_col_names():
 
 
 # ---------------------------------------------------------------------------
+# annotate_row: requested calibration
+# ---------------------------------------------------------------------------
+
+
+def _make_requested_calibration(
+    cal_urn="urn:mavedb:cal-req",
+    title="Requested Cal",
+) -> dict[str, Any]:
+    return {
+        "urn": cal_urn,
+        "title": title,
+        "primary": False,
+        "investigatorProvided": False,
+        "functionalClassifications": [
+            {
+                "id": 20,
+                "label": "Requested Abnormal",
+                "range": [None, 0.4],
+                "inclusiveLowerBound": True,
+                "inclusiveUpperBound": False,
+                "functionalClassification": "abnormal",
+            },
+            {
+                "id": 21,
+                "label": "Requested Normal",
+                "range": [0.4, None],
+                "inclusiveLowerBound": True,
+                "inclusiveUpperBound": False,
+                "functionalClassification": "normal",
+            },
+        ],
+    }
+
+
+def test_annotate_row_requested_calibration_not_enabled_by_default():
+    """Requested-calibration columns are absent unless the mapping is passed."""
+    row = {"variant_urn": "urn:mavedb:00000001-a-1#5", "score": "0.2"}
+    result = _annotate_row_with_cache(row, _make_calibrations())
+    assert not any(col in result for col in REQUESTED_CALIBRATION_COLS)
+
+
+def test_annotate_row_requested_calibration_found_and_classified():
+    """The requested calibration is looked up by URN in the score set's own
+    calibration list — the same list already fetched for primary/investigator."""
+    req_cal = _make_requested_calibration()
+    ss_urn = "urn:mavedb:00000001-a-1"
+    row = {"variant_urn": f"{ss_urn}#5", "score": "0.2"}
+    result = annotate_row(
+        row,
+        api_url="https://api.mavedb.org",
+        variant_urn_col="variant_urn",
+        score_col="score",
+        session=MagicMock(),
+        calibration_cache={ss_urn: _make_calibrations() + [req_cal]},
+        class_id_cache={},
+        requested_calibration_urn_by_score_set={ss_urn: "urn:mavedb:cal-req"},
+    )
+    assert result["mavedb.requested_calibration.urn"] == "urn:mavedb:cal-req"
+    assert result["mavedb.requested_calibration.name"] == "Requested Cal"
+    assert result["mavedb.requested_calibration.url"] == _SCORE_SET_URL
+    assert result["mavedb.requested_calibration.functional_class_label"] == "Requested Abnormal"
+    assert result["mavedb.requested_calibration.functional_classification"] == "abnormal"
+
+
+def test_annotate_row_requested_calibration_not_in_score_set_returns_blank():
+    """A requested_calibration_urn that isn't among this score set's calibrations
+    (e.g. a stale entry, or one that actually belongs to a different score set)
+    must not be applied — no extra API call is made to fetch it by URN."""
+    ss_urn = "urn:mavedb:00000001-a-1"
+    row = {"variant_urn": f"{ss_urn}#5", "score": "0.2"}
+    session = MagicMock()
+    result = annotate_row(
+        row,
+        api_url="https://api.mavedb.org",
+        variant_urn_col="variant_urn",
+        score_col="score",
+        session=session,
+        calibration_cache={ss_urn: _make_calibrations()},  # no cal-req in this list
+        class_id_cache={},
+        requested_calibration_urn_by_score_set={ss_urn: "urn:mavedb:cal-req"},
+    )
+    assert result["mavedb.requested_calibration.urn"] == ""
+    assert result["mavedb.requested_calibration.name"] == ""
+    assert result["mavedb.requested_calibration.functional_class_label"] == ""
+    assert result["mavedb.requested_calibration.functional_classification"] == ""
+    session.get.assert_not_called()
+
+
+def test_annotate_row_requested_calibration_absent_for_score_set():
+    """Score sets missing from the mapping get blank requested_calibration fields."""
+    ss_urn = "urn:mavedb:00000001-a-1"
+    row = {"variant_urn": f"{ss_urn}#5", "score": "0.2"}
+    session = MagicMock()
+    result = annotate_row(
+        row,
+        api_url="https://api.mavedb.org",
+        variant_urn_col="variant_urn",
+        score_col="score",
+        session=session,
+        calibration_cache={ss_urn: _make_calibrations()},
+        class_id_cache={},
+        requested_calibration_urn_by_score_set={},  # no entry for this score set
+    )
+    assert result["mavedb.requested_calibration.urn"] == ""
+    assert result["mavedb.requested_calibration.functional_class_label"] == ""
+    session.get.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # Integration: main() writes correct TSV
 # ---------------------------------------------------------------------------
 
@@ -712,3 +876,77 @@ def test_main_skip_and_limit(tmp_path, monkeypatch):
 
     rows = list(csv.DictReader(output_tsv.open(encoding="utf-8"), delimiter="\t"))
     assert len(rows) == 3
+
+
+def test_main_without_requested_calibrations_file_omits_columns(tmp_path, monkeypatch):
+    calibrations = _make_calibrations(investigator=False)
+
+    input_tsv = tmp_path / "input.tsv"
+    input_tsv.write_text(
+        "variant_urn\tscore\nurn:mavedb:00000001-a-1#1\t0.2\n", encoding="utf-8"
+    )
+    output_tsv = tmp_path / "output.tsv"
+
+    monkeypatch.setattr(
+        "src.annotate_mavedb.fetch_calibrations",
+        lambda api_url, ss_urn, session: calibrations,
+    )
+
+    from src.annotate_mavedb import main
+
+    main([str(input_tsv), str(output_tsv)])
+
+    rows = list(csv.DictReader(output_tsv.open(encoding="utf-8"), delimiter="\t"))
+    assert not any(col in rows[0] for col in REQUESTED_CALIBRATION_COLS)
+
+
+def test_main_with_requested_calibrations_file(tmp_path, monkeypatch):
+    calibrations = _make_calibrations(investigator=False)
+    req_cal = _make_requested_calibration()
+
+    input_tsv = tmp_path / "input.tsv"
+    input_tsv.write_text(
+        "variant_urn\tscore\n"
+        "urn:mavedb:00000001-a-1#1\t0.2\n"
+        "urn:mavedb:00000002-a-1#1\t0.2\n",  # score set with no requested calibration
+        encoding="utf-8",
+    )
+    output_tsv = tmp_path / "output.tsv"
+
+    req_file = tmp_path / "score_sets.tsv"
+    req_file.write_text(
+        "score_set_urn\trequested_calibration_urn\n"
+        "urn:mavedb:00000001-a-1\turn:mavedb:cal-req\n"
+        "urn:mavedb:00000002-a-1\t\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "src.annotate_mavedb.fetch_calibrations",
+        lambda api_url, ss_urn, session: calibrations + [req_cal],
+    )
+
+    from src.annotate_mavedb import main
+
+    main([str(input_tsv), str(output_tsv), "--requested-calibrations-file", str(req_file)])
+
+    rows = list(csv.DictReader(output_tsv.open(encoding="utf-8"), delimiter="\t"))
+    assert rows[0]["mavedb.requested_calibration.urn"] == "urn:mavedb:cal-req"
+    assert rows[0]["mavedb.requested_calibration.functional_class_label"] == "Requested Abnormal"
+    assert rows[0]["mavedb.requested_calibration.functional_classification"] == "abnormal"
+    assert rows[1]["mavedb.requested_calibration.urn"] == ""
+    assert rows[1]["mavedb.requested_calibration.functional_class_label"] == ""
+
+
+def test_main_requested_calibrations_file_not_found(tmp_path):
+    input_tsv = tmp_path / "input.tsv"
+    input_tsv.write_text("variant_urn\tscore\n", encoding="utf-8")
+    output_tsv = tmp_path / "output.tsv"
+
+    from src.annotate_mavedb import main
+
+    with pytest.raises(SystemExit):
+        main([
+            str(input_tsv), str(output_tsv),
+            "--requested-calibrations-file", str(tmp_path / "missing.tsv"),
+        ])
