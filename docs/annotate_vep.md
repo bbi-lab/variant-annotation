@@ -81,16 +81,16 @@ For rows with pipe-delimited HGVS candidates (from step 2 reverse translation), 
 - `vep.consequence_source`: `transcript`, `most_severe`, or `no_change` per candidate; empty string when the candidate had an error and no fallback applies.
 - `vep.error`: `api_error` / `api_error:<sanitized message>` for HTTP-level failures; `vep_error:<sanitized message>` for VEP-internal errors; empty string otherwise. Cleared when `no_change` fallback applies.
 
-### VEP-internal error fill-in for multi-candidate rows
+### Consequence fill-in for multi-candidate rows
 
-When a row has multiple HGVS candidates (e.g. reverse translations of a protein variant) and one or more of those candidates returns a VEP-internal error, the script attempts to fill in the missing consequence from the remaining valid candidates:
+When a row has multiple HGVS candidates (e.g. reverse translations of a protein variant) and one or more of those candidates has no consequence — whether due to a VEP-internal error, an API error, or a silent VEP miss (VEP returned no result for that input) — the script attempts to fill in the missing consequence from the remaining valid candidates:
 
-1. Positions with a non-empty `vep.error` and no consequence are identified as *errored positions*.
-2. The most common `(vep.mutational_consequences, vep.most_severe_mutational_consequence)` tuple across all valid (non-errored) positions in the same row is selected. Ties are broken deterministically by alphabetical order of the tuple.
-3. The errored positions receive the chosen consequence values along with the `vep.access_date` and `vep.consequence_source` of one valid position that has those consequences.
-4. The original error message is preserved in `vep.error` even after fill-in.
+1. Positions with no consequence (empty `vep.most_severe_mutational_consequence`) are identified as *unfilled positions*.
+2. The most common `(vep.mutational_consequences, vep.most_severe_mutational_consequence)` tuple across all valid (non-empty) positions in the same row is selected. Ties are broken deterministically by alphabetical order of the tuple.
+3. The unfilled positions receive the chosen consequence values along with the `vep.access_date` and `vep.consequence_source` of one valid position that has those consequences.
+4. Any original error message is preserved in `vep.error` even after fill-in.
 
-If all candidates in a row have errors, no fill-in is possible and all consequence fields remain blank.
+If all candidates in a row have no consequence, no fill-in is possible and all consequence fields remain blank.
 
 ---
 

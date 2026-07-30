@@ -83,7 +83,19 @@ def test_annotate_row_emits_pipe_aligned_values_for_matching_candidates():
     assert out["vep.error"] == "|"
 
 
-def test_annotate_row_vep_miss_yields_blank_consequence_for_that_position():
+def test_annotate_row_vep_miss_yields_blank_for_single_candidate():
+    """A VEP miss with no siblings stays blank — nothing to fill from."""
+    row = {"mapped_hgvs_g": "NC_000001.11:g.2C>G"}
+    cache = {"NC_000001.11:g.2C>G": _miss()}
+    out = mod.annotate_row(
+        row, cache, col_prefix="vep", hgvs_cols=["mapped_hgvs_g"], access_date="2026-04-30",
+    )
+    assert out["vep.most_severe_mutational_consequence"] == ""
+    assert out["vep.error"] == ""
+
+
+def test_annotate_row_vep_miss_filled_from_sibling():
+    """A VEP miss in a multi-candidate row is filled from the valid sibling."""
     row = {"mapped_hgvs_g": "NC_000001.11:g.1A>T|NC_000001.11:g.2C>G"}
     cache = {
         "NC_000001.11:g.1A>T": _hit("synonymous_variant"),
@@ -92,7 +104,21 @@ def test_annotate_row_vep_miss_yields_blank_consequence_for_that_position():
     out = mod.annotate_row(
         row, cache, col_prefix="vep", hgvs_cols=["mapped_hgvs_g"], access_date="2026-04-30",
     )
-    assert out["vep.most_severe_mutational_consequence"] == "synonymous_variant|"
+    assert out["vep.most_severe_mutational_consequence"] == "synonymous_variant|synonymous_variant"
+    assert out["vep.error"] == "|"  # miss has no error, so error column stays blank
+
+
+def test_annotate_row_vep_all_miss_stays_blank():
+    """When all candidates are misses, no fill-in is possible."""
+    row = {"mapped_hgvs_g": "NC_000001.11:g.1A>T|NC_000001.11:g.2C>G"}
+    cache = {
+        "NC_000001.11:g.1A>T": _miss(),
+        "NC_000001.11:g.2C>G": _miss(),
+    }
+    out = mod.annotate_row(
+        row, cache, col_prefix="vep", hgvs_cols=["mapped_hgvs_g"], access_date="2026-04-30",
+    )
+    assert out["vep.most_severe_mutational_consequence"] == "|"
     assert out["vep.error"] == "|"
 
 
@@ -106,7 +132,9 @@ def test_annotate_row_pipe_aligned_multiple_different_consequences():
     out = mod.annotate_row(
         row, cache, col_prefix="vep", hgvs_cols=["mapped_hgvs_g"], access_date="2026-04-30",
     )
-    assert out["vep.most_severe_mutational_consequence"] == "missense_variant|synonymous_variant|"
+    # Miss at position 2 is filled from the most-frequent sibling tuple.
+    # missense and synonymous both appear once (tie); alphabetical tie-break → missense.
+    assert out["vep.most_severe_mutational_consequence"] == "missense_variant|synonymous_variant|missense_variant"
     assert out["vep.error"] == "||"
 
 

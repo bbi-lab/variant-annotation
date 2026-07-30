@@ -793,6 +793,7 @@ def annotate_row(
     access_values: list[str] = []
     source_values: list[str] = []
     error_values: list[str] = []
+    had_hgvs: list[bool] = []  # True for positions with a non-empty HGVS candidate
 
     for hgvs in candidates:
         if not hgvs:
@@ -801,7 +802,9 @@ def annotate_row(
             access_values.append("")
             source_values.append("")
             error_values.append("")
+            had_hgvs.append(False)
             continue
+        had_hgvs.append(True)
         cached = consequence_cache.get(hgvs)
         if cached is None:
             access_values.append(access_date)
@@ -853,11 +856,14 @@ def annotate_row(
         source_values.append(source if most_severe_str or cs_str else "")
         error_values.append("")
 
-    # For positions that have a VEP/API error and no consequence, fill from the
-    # most-common (consequences, most_severe) tuple among valid sibling candidates.
+    # For positions that had a non-empty HGVS candidate but have no consequence
+    # (from a VEP/API error OR a silent VEP miss where no result was returned),
+    # fill from the most-common (consequences, most_severe) tuple among valid
+    # sibling candidates.  Empty candidate slots (blank positions in the
+    # pipe-delimited input) are excluded from both filling and as sources.
     errored_positions = [
         i for i in range(len(most_severe_values))
-        if not most_severe_values[i] and error_values[i]
+        if had_hgvs[i] and not most_severe_values[i]
     ]
     valid_positions = [
         i for i in range(len(most_severe_values))
