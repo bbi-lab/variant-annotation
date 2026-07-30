@@ -15,14 +15,23 @@ Supported scores (hg38 / GRCh38 only):
     Range:  0–1 (higher = more likely pathogenic)
     Scope:  missense SNVs only
 
-  MutPred2 (via dbNSFP)
+  MutPred2 (via MP2 properties file — preferred)
+  --mutpred2-properties-file data_frame_missense_variants_MP2_properties.csv.gz
+    A MaveDB-derived per-DNA-variant properties table (columns include
+    mavedb_variant_urn, Chrom, hg38_start, hg38_end, ref_allele, alt_allele,
+    "MutPred2 score"). Looked up by variant_urn + genomic coordinates, so
+    scores are pipe-aligned per reverse-translation candidate (see below).
+
+  MutPred2 (via dbNSFP — legacy fallback)
   --dbnsfp-file dbNSFP5.3.1a_grch38.gz
     Source: https://sites.google.com/site/jpopgen/dbNSFP
     The file and its .tbi index are available pre-built (see run script for URLs).
     Range:  0–1 (higher = more likely pathogenic)
-    Scope:  missense SNVs only; returns max score across transcripts
+    Scope:  missense SNVs only; returns max score across transcripts.
+    Ignored if --mutpred2-properties-file is also given.
 
-At least one of --revel-file, --alphamissense-file, or --dbnsfp-file is required.
+At least one of --revel-file, --alphamissense-file, --mutpred2-properties-file,
+or --dbnsfp-file is required.
 
 
 Data file preparation
@@ -56,18 +65,25 @@ Output columns
   revel.score                — REVEL score string (empty for non-SNV / non-missense)
   alphamissense.pathogenicity — AlphaMissense pathogenicity score (0–1)
   alphamissense.class        — likely_benign / ambiguous / likely_pathogenic
-  mutpred2.score             — MutPred2 score from dbNSFP (single value per row; protein-level model)
+  mutpred2.score             — MutPred2 score
 
 For rows with pipe-delimited genomic HGVS values the REVEL and AlphaMissense
-columns are pipe-aligned to match the input candidate positions.  MutPred2 is a
-protein-level model, so all reverse-translation candidates encode the same amino
-acid substitution; a single score (the maximum across candidates) is emitted.
+columns are pipe-aligned to match the input candidate positions.
+
+mutpred2.score's shape depends on the source:
+  --mutpred2-properties-file: looked up per reverse-translation candidate
+    (variant_urn + genomic coordinates), so it is pipe-aligned like REVEL.
+  --dbnsfp-file (legacy): MutPred2 is treated as a protein-level model there,
+    so all reverse-translation candidates encode the same amino acid
+    substitution and a single score (the maximum across candidates) is
+    emitted, with no pipes.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 from itertools import islice
 import logging
 import os
@@ -299,6 +315,40 @@ def _lookup_mutpred2(
     cache[key] = result
     return result
 
+
+def _lookup_mutpred2_from_properties_file(
+    file_cache: dict[tuple[str, str, int, int, str, str], str],
+    variant_urn: str,
+    chrom: str,
+    start: str,
+    stop: str,
+    ref: str,
+    alt: str,
+) -> Optional[str]:
+    """Return the MutPred2 score for one DNA reverse-translation candidate.
+
+    Keyed on ``(variant_urn, chrom, start, stop, ref, alt)`` against a cache
+    built by :func:`_load_mutpred2_properties_file_cache`. *chrom* is tried
+    both with and without a ``chr`` prefix since the input file and the CVFG
+    genomic columns may not agree on convention.
+    """
+    if not (variant_urn and chrom and start and stop and ref and alt):
+        return None
+    try:
+        start_i = int(start)
+        stop_i = int(stop)
+    except ValueError:
+        return None
+
+    ref_u = ref.strip().upper()
+    alt_u = alt.strip().upper()
+    for chrom_try in _chrom_candidates(chrom.strip()):
+        score = file_cache.get((variant_urn, chrom_try, start_i, stop_i, ref_u, alt_u))
+        if score is not None:
+            return score
+    return None
+
+
 def _lookup_revel(
     path: Path,
     chrom: str,
@@ -434,6 +484,94 @@ def _load_alphamissense_file_cache(path: str) -> dict[str, tuple[str, str]]:
     return cache
 
 
+MUTPRED2_PROPERTIES_REQUIRED_COLS = [
+    "mavedb_variant_urn",
+    "Chrom",
+    "hg38_start",
+    "hg38_end",
+    "ref_allele",
+    "alt_allele",
+    "MutPred2 score",
+]
+
+
+def _load_mutpred2_properties_file_cache(
+    path: str,
+) -> dict[tuple[str, str, int, int, str, str], str]:
+    """Load MutPred2 scores from a MaveDB MP2-properties CSV into a lookup dict.
+
+    Expects (at least) the columns ``mavedb_variant_urn``, ``Chrom``,
+    ``hg38_start``, ``hg38_end``, ``ref_allele``, ``alt_allele``, and
+    ``MutPred2 score``. The file describes one row per DNA variant, so the
+    same ``mavedb_variant_urn`` (a MaveDB protein- or DNA-level variant) can
+    repeat across multiple reverse-translation candidates; each is keyed
+    separately on ``(variant_urn, chrom, start, stop, ref, alt)``.
+
+    Transparently handles gzip-compressed input (``.gz`` suffix).
+    """
+    opener = gzip.open if str(path).endswith(".gz") else open
+    cache: dict[tuple[str, str, int, int, str, str], str] = {}
+
+    with opener(path, "rt", newline="", encoding="utf-8") as fh:  # type: ignore[operator]
+        reader = csv.reader(fh)
+        try:
+            header = next(reader)
+        except StopIteration:
+            raise ValueError(f"MutPred2 properties file is empty: {path}")
+
+        col_idx = {name.strip(): i for i, name in enumerate(header)}
+        missing = [c for c in MUTPRED2_PROPERTIES_REQUIRED_COLS if c not in col_idx]
+        if missing:
+            raise ValueError(
+                f"MutPred2 properties file {path} is missing column(s): {', '.join(missing)}"
+            )
+
+        urn_i = col_idx["mavedb_variant_urn"]
+        chrom_i = col_idx["Chrom"]
+        start_i = col_idx["hg38_start"]
+        stop_i = col_idx["hg38_end"]
+        ref_i = col_idx["ref_allele"]
+        alt_i = col_idx["alt_allele"]
+        score_i = col_idx["MutPred2 score"]
+        n_cols_needed = max(urn_i, chrom_i, start_i, stop_i, ref_i, alt_i, score_i) + 1
+
+        n_rows = 0
+        n_skipped = 0
+        for fields in reader:
+            n_rows += 1
+            if len(fields) < n_cols_needed:
+                n_skipped += 1
+                continue
+            urn = fields[urn_i].strip()
+            score = fields[score_i].strip()
+            if not urn or not score:
+                n_skipped += 1
+                continue
+            try:
+                start = int(fields[start_i])
+                stop = int(fields[stop_i])
+            except ValueError:
+                n_skipped += 1
+                continue
+            key = (
+                urn,
+                fields[chrom_i].strip(),
+                start,
+                stop,
+                fields[ref_i].strip().upper(),
+                fields[alt_i].strip().upper(),
+            )
+            cache[key] = score
+            if n_rows % 200_000 == 0:
+                logger.info("MutPred2 properties file: %d rows scanned...", n_rows)
+
+    logger.info(
+        "Loaded %d MutPred2 file-cache entries from %s (%d rows scanned, %d skipped)",
+        len(cache), path, n_rows, n_skipped,
+    )
+    return cache
+
+
 # ---------------------------------------------------------------------------
 # Row-level annotation
 # ---------------------------------------------------------------------------
@@ -452,6 +590,13 @@ def annotate_row(
     mutpred2_cache: Optional[dict[tuple[str, int, str, str], Optional[str]]] = None,
     revel_file_cache: Optional[dict[str, str]] = None,
     am_file_cache: Optional[dict[str, tuple[str, str]]] = None,
+    mutpred2_properties_cache: Optional[dict[tuple[str, str, int, int, str, str], str]] = None,
+    variant_urn_col: Optional[str] = None,
+    mapped_hgvs_g_chromosome_col: Optional[str] = None,
+    mapped_hgvs_g_start_col: Optional[str] = None,
+    mapped_hgvs_g_stop_col: Optional[str] = None,
+    mapped_hgvs_g_ref_col: Optional[str] = None,
+    mapped_hgvs_g_alt_col: Optional[str] = None,
 ) -> dict[str, str]:
     """Return annotation columns for a single row.
 
@@ -460,6 +605,13 @@ def annotate_row(
     (keyed on the c-string from *mapped_hgvs_c_col*) first, then falling back
     to a tabix lookup via the g-string from *mapped_hgvs_g_col*.  Non-SNV
     candidates that are absent from the file cache produce empty strings.
+
+    MutPred2 has two, mutually-exclusive sources: if *mutpred2_properties_cache*
+    is given, each reverse-translation candidate is looked up individually
+    (variant_urn + genomic coordinates) and the result is pipe-aligned like
+    REVEL/AlphaMissense. Otherwise, if *dbnsfp_path* is given, MutPred2 is
+    treated as a protein-level model and a single score (the maximum across
+    candidates) is emitted with no pipes.
     """
     g_candidates = _split_pipe((row.get(mapped_hgvs_g_col) or "").strip())
     c_candidates = (
@@ -468,9 +620,42 @@ def annotate_row(
         else []
     )
 
-    n = max(len(g_candidates), len(c_candidates))
+    mutpred2_alt_enabled = mutpred2_properties_cache is not None
+    variant_urn = ""
+    chrom_candidates: list[str] = []
+    start_candidates: list[str] = []
+    stop_candidates: list[str] = []
+    ref_candidates: list[str] = []
+    alt_candidates: list[str] = []
+    if mutpred2_alt_enabled:
+        variant_urn = (row.get(variant_urn_col) or "").strip() if variant_urn_col else ""
+        if mapped_hgvs_g_chromosome_col:
+            chrom_candidates = _split_pipe((row.get(mapped_hgvs_g_chromosome_col) or "").strip())
+        if mapped_hgvs_g_start_col:
+            start_candidates = _split_pipe((row.get(mapped_hgvs_g_start_col) or "").strip())
+        if mapped_hgvs_g_stop_col:
+            stop_candidates = _split_pipe((row.get(mapped_hgvs_g_stop_col) or "").strip())
+        if mapped_hgvs_g_ref_col:
+            ref_candidates = _split_pipe((row.get(mapped_hgvs_g_ref_col) or "").strip())
+        if mapped_hgvs_g_alt_col:
+            alt_candidates = _split_pipe((row.get(mapped_hgvs_g_alt_col) or "").strip())
+
+    n = max(
+        len(g_candidates),
+        len(c_candidates),
+        len(chrom_candidates),
+        len(start_candidates),
+        len(stop_candidates),
+        len(ref_candidates),
+        len(alt_candidates),
+    )
     g_candidates += [""] * (n - len(g_candidates))
     c_candidates += [""] * (n - len(c_candidates))
+    chrom_candidates += [""] * (n - len(chrom_candidates))
+    start_candidates += [""] * (n - len(start_candidates))
+    stop_candidates += [""] * (n - len(stop_candidates))
+    ref_candidates += [""] * (n - len(ref_candidates))
+    alt_candidates += [""] * (n - len(alt_candidates))
 
     revel_enabled = revel_path is not None or revel_file_cache is not None
     am_enabled = alphamissense_path is not None or am_file_cache is not None
@@ -479,12 +664,15 @@ def annotate_row(
     am_path_vals: list[str] = []
     am_class_vals: list[str] = []
     mutpred2_vals: list[str] = []
+    mutpred2_alt_vals: list[str] = []
 
     _mp2_cache: dict[tuple[str, int, str, str], Optional[str]] = (
         mutpred2_cache if mutpred2_cache is not None else {}
     )
 
-    for hgvs_g, hgvs_c in zip(g_candidates, c_candidates):
+    for i in range(n):
+        hgvs_g = g_candidates[i]
+        hgvs_c = c_candidates[i]
         snv = _snv_from_hgvs_g(hgvs_g, nc_to_chrom) if hgvs_g else None
 
         if revel_enabled:
@@ -510,7 +698,18 @@ def annotate_row(
                 am_path_vals.append("")
                 am_class_vals.append("")
 
-        if snv is not None and dbnsfp_path is not None:
+        if mutpred2_alt_enabled:
+            m_alt = _lookup_mutpred2_from_properties_file(
+                mutpred2_properties_cache,  # type: ignore[arg-type]
+                variant_urn,
+                chrom_candidates[i],
+                start_candidates[i],
+                stop_candidates[i],
+                ref_candidates[i],
+                alt_candidates[i],
+            )
+            mutpred2_alt_vals.append(m_alt or "")
+        elif snv is not None and dbnsfp_path is not None:
             chrom, pos, ref, alt = snv
             m = _lookup_mutpred2(dbnsfp_path, chrom, pos, ref, alt, _mp2_cache)
             if m is not None:
@@ -523,7 +722,9 @@ def annotate_row(
     if am_enabled:
         out["alphamissense.pathogenicity"] = sep.join(am_path_vals)
         out["alphamissense.class"] = sep.join(am_class_vals)
-    if dbnsfp_path is not None:
+    if mutpred2_alt_enabled:
+        out["mutpred2.score"] = sep.join(mutpred2_alt_vals)
+    elif dbnsfp_path is not None:
         if mutpred2_vals:
             best_mp2 = max(mutpred2_vals, key=float)
         else:
@@ -572,7 +773,74 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "bgzipped, tabix-indexed dbNSFP GRCh38 variant file "
             "(e.g. dbNSFP5.3.1a_grch38.gz). "
             "Used to annotate MutPred2_score. "
+            "Ignored if --mutpred2-properties-file is also given. "
             "Defaults to DBNSFP_FILE env var."
+        ),
+    )
+    p.add_argument(
+        "--mutpred2-properties-file",
+        default=os.environ.get("MUTPRED2_PROPERTIES_FILE"),
+        metavar="PATH",
+        help=(
+            "MaveDB MP2-properties CSV (optionally gzipped), e.g. "
+            "data_frame_missense_variants_MP2_properties.csv.gz. Columns required: "
+            "mavedb_variant_urn, Chrom, hg38_start, hg38_end, ref_allele, alt_allele, "
+            "'MutPred2 score'. Preferred source for mutpred2.score; looked up per "
+            "reverse-translation candidate via --variant-urn-col and the "
+            "--mapped-hgvs-g-*-col columns, so the output is pipe-aligned. "
+            "Takes precedence over --dbnsfp-file when both are given. "
+            "Defaults to MUTPRED2_PROPERTIES_FILE env var."
+        ),
+    )
+    p.add_argument(
+        "--variant-urn-col",
+        default="variant_urn",
+        help=(
+            "Input column with the MaveDB variant URN, used as part of the lookup key "
+            "for --mutpred2-properties-file (default: variant_urn)"
+        ),
+    )
+    p.add_argument(
+        "--mapped-hgvs-g-chromosome-col",
+        default="mapped_hgvs_g_chromosome",
+        help=(
+            "Input column with pipe-delimited genomic chromosome(s), used as part of "
+            "the lookup key for --mutpred2-properties-file "
+            "(default: mapped_hgvs_g_chromosome)"
+        ),
+    )
+    p.add_argument(
+        "--mapped-hgvs-g-start-col",
+        default="mapped_hgvs_g_start",
+        help=(
+            "Input column with pipe-delimited genomic start position(s), used as part "
+            "of the lookup key for --mutpred2-properties-file "
+            "(default: mapped_hgvs_g_start)"
+        ),
+    )
+    p.add_argument(
+        "--mapped-hgvs-g-stop-col",
+        default="mapped_hgvs_g_stop",
+        help=(
+            "Input column with pipe-delimited genomic stop position(s), used as part "
+            "of the lookup key for --mutpred2-properties-file "
+            "(default: mapped_hgvs_g_stop)"
+        ),
+    )
+    p.add_argument(
+        "--mapped-hgvs-g-ref-col",
+        default="mapped_hgvs_g_ref",
+        help=(
+            "Input column with pipe-delimited genomic ref allele(s), used as part of "
+            "the lookup key for --mutpred2-properties-file (default: mapped_hgvs_g_ref)"
+        ),
+    )
+    p.add_argument(
+        "--mapped-hgvs-g-alt-col",
+        default="mapped_hgvs_g_alt",
+        help=(
+            "Input column with pipe-delimited genomic alt allele(s), used as part of "
+            "the lookup key for --mutpred2-properties-file (default: mapped_hgvs_g_alt)"
         ),
     )
     p.add_argument(
@@ -646,6 +914,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     revel_path = Path(args.revel_file) if args.revel_file else None
     am_path = Path(args.alphamissense_file) if args.alphamissense_file else None
     dbnsfp_path = Path(args.dbnsfp_file) if args.dbnsfp_file else None
+    mutpred2_properties_file = args.mutpred2_properties_file
 
     revel_file_cache: Optional[dict[str, str]] = None
     if args.revel_cache_file:
@@ -658,10 +927,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     revel_enabled = revel_path is not None or revel_file_cache is not None
     am_enabled = am_path is not None or am_file_cache is not None
 
-    if not revel_enabled and not am_enabled and dbnsfp_path is None:
+    if not revel_enabled and not am_enabled and dbnsfp_path is None and not mutpred2_properties_file:
         logger.error(
             "At least one of --revel-file, --revel-cache-file, --alphamissense-file, "
-            "--alphamissense-cache-file, or --dbnsfp-file must be provided."
+            "--alphamissense-cache-file, --mutpred2-properties-file, or --dbnsfp-file "
+            "must be provided."
         )
         raise SystemExit(1)
 
@@ -671,6 +941,18 @@ def main(argv: Optional[list[str]] = None) -> None:
     if am_path is not None and not am_path.exists():
         logger.error("AlphaMissense file not found: %s", am_path)
         raise SystemExit(1)
+    if mutpred2_properties_file and not Path(mutpred2_properties_file).exists():
+        logger.error("MutPred2 properties file not found: %s", mutpred2_properties_file)
+        raise SystemExit(1)
+
+    mutpred2_properties_cache: Optional[dict[tuple[str, str, int, int, str, str], str]] = None
+    if mutpred2_properties_file:
+        mutpred2_properties_cache = _load_mutpred2_properties_file_cache(mutpred2_properties_file)
+        if dbnsfp_path is not None:
+            logger.warning(
+                "Both --dbnsfp-file and --mutpred2-properties-file given; using "
+                "--mutpred2-properties-file for mutpred2.score and ignoring --dbnsfp-file."
+            )
     if dbnsfp_path is not None and not dbnsfp_path.exists():
         logger.error("dbNSFP file not found: %s", dbnsfp_path)
         raise SystemExit(1)
@@ -685,12 +967,14 @@ def main(argv: Optional[list[str]] = None) -> None:
     output_path = Path(args.output_file)
     delim = "\t" if input_path.suffix.lower() in (".tsv", ".txt") else ","
 
+    mutpred2_enabled = mutpred2_properties_cache is not None or dbnsfp_path is not None
+
     ann_cols: list[str] = []
     if revel_enabled:
         ann_cols.extend(REVEL_COLS)
     if am_enabled:
         ann_cols.extend(ALPHAMISSENSE_COLS)
-    if dbnsfp_path is not None:
+    if mutpred2_enabled:
         ann_cols.extend(DBNSFP_COLS)
 
     revel_cache: dict[tuple[str, int, str, str], Optional[str]] = {}
@@ -742,6 +1026,13 @@ def main(argv: Optional[list[str]] = None) -> None:
                 mutpred2_cache=mutpred2_cache,
                 revel_file_cache=revel_file_cache,
                 am_file_cache=am_file_cache,
+                mutpred2_properties_cache=mutpred2_properties_cache,
+                variant_urn_col=args.variant_urn_col,
+                mapped_hgvs_g_chromosome_col=args.mapped_hgvs_g_chromosome_col,
+                mapped_hgvs_g_start_col=args.mapped_hgvs_g_start_col,
+                mapped_hgvs_g_stop_col=args.mapped_hgvs_g_stop_col,
+                mapped_hgvs_g_ref_col=args.mapped_hgvs_g_ref_col,
+                mapped_hgvs_g_alt_col=args.mapped_hgvs_g_alt_col,
             )
             row.update(ann)
             writer.writerow(row)
@@ -751,7 +1042,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 scored_revel += 1
             if am_enabled and row.get("alphamissense.pathogenicity"):
                 scored_am += 1
-            if dbnsfp_path is not None and row.get("mutpred2.score"):
+            if mutpred2_enabled and row.get("mutpred2.score"):
                 scored_mutpred2 += 1
 
             if processed % 1000 == 0:
@@ -773,7 +1064,12 @@ def main(argv: Optional[list[str]] = None) -> None:
             "AlphaMissense: %d/%d rows scored (cache: %d unique SNVs queried)",
             scored_am, processed, len(am_cache),
         )
-    if dbnsfp_path is not None:
+    if mutpred2_properties_cache is not None:
+        logger.info(
+            "MutPred2 (properties file): %d/%d rows scored (%d candidates in file cache)",
+            scored_mutpred2, processed, len(mutpred2_properties_cache),
+        )
+    elif dbnsfp_path is not None:
         logger.info(
             "MutPred2 (dbNSFP): %d/%d rows scored (cache: %d unique SNVs queried)",
             scored_mutpred2, processed, len(mutpred2_cache),

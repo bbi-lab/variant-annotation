@@ -4,7 +4,7 @@
 
 Annotates each variant with pre-computed in-silico pathogenicity scores from computational predictors. All currently supported predictors score **missense SNVs only** (GRCh38); other variant types (indels, synonymous substitutions, splice-site variants, etc.) receive empty annotation columns.
 
-At least one of `--revel-file`, `--revel-cache-file`, `--alphamissense-file`, `--alphamissense-cache-file`, or `--dbnsfp-file` must be supplied.
+At least one of `--revel-file`, `--revel-cache-file`, `--alphamissense-file`, `--alphamissense-cache-file`, `--mutpred2-properties-file`, or `--dbnsfp-file` must be supplied.
 
 ---
 
@@ -15,9 +15,12 @@ At least one of `--revel-file`, `--revel-cache-file`, `--alphamissense-file`, `-
 | REVEL | `revel.score` | 0–1 (higher = more pathogenic) | `--revel-file` | `REVEL_FILE` |
 | AlphaMissense | `alphamissense.pathogenicity` | 0–1 | `--alphamissense-file` | `ALPHAMISSENSE_FILE` |
 | AlphaMissense | `alphamissense.class` | `likely_benign` / `ambiguous` / `likely_pathogenic` | (same file) | |
-| MutPred2 (via dbNSFP) | `mutpred2.score` | 0–1 | `--dbnsfp-file` | `DBNSFP_FILE` |
+| MutPred2 (via properties file — preferred) | `mutpred2.score` | 0–1 | `--mutpred2-properties-file` | `MUTPRED2_PROPERTIES_FILE` |
+| MutPred2 (via dbNSFP — legacy fallback) | `mutpred2.score` | 0–1 | `--dbnsfp-file` | `DBNSFP_FILE` |
 
 Only the columns for tools whose data files are provided will appear in the output. All score values are formatted to 4 decimal places.
+
+MutPred2 has two, mutually exclusive sources. If `--mutpred2-properties-file` is given it takes precedence and `--dbnsfp-file` is ignored (a warning is logged when both are supplied).
 
 ---
 
@@ -26,7 +29,8 @@ Only the columns for tools whose data files are provided will appear in the outp
 When a row has multiple DNA candidates (pipe-delimited `mapped_hgvs_g`):
 
 - **REVEL** and **AlphaMissense** columns are pipe-aligned to the input candidates — each candidate gets its own score value (or empty if not an SNV or not found).
-- **MutPred2** is a protein-level model. All reverse-translation candidates encode the same amino acid substitution, so a single maximum score across all SNV candidates is emitted (not pipe-delimited).
+- **MutPred2 (properties file)** is looked up per reverse-translation candidate, keyed on `variant_urn` plus the genomic coordinates for that candidate (chromosome, start, stop, ref, alt), so it is pipe-aligned like REVEL/AlphaMissense. A candidate absent from the properties file produces an empty slot rather than being dropped.
+- **MutPred2 (dbNSFP, legacy)** is treated as a protein-level model there: all reverse-translation candidates encode the same amino acid substitution, so a single maximum score across all SNV candidates is emitted (not pipe-delimited).
 
 ---
 
@@ -92,12 +96,29 @@ A typical use case is to extract previously computed scores from an existing out
    ```
    The resulting file has five tab-separated columns: `#chr pos ref alt revel_score`.
 
-### MutPred2 (via dbNSFP)
+### MutPred2 (via properties file)
+
+A MaveDB-derived per-DNA-variant properties table (CSV, optionally gzipped) with (at least) these columns:
+
+| Column | Description |
+|---|---|
+| `mavedb_variant_urn` | MaveDB variant URN (protein- or DNA-level) |
+| `Chrom` | Chromosome (with or without `chr` prefix — both are tried) |
+| `hg38_start` | Genomic start position (hg38) |
+| `hg38_end` | Genomic end position (hg38) |
+| `ref_allele` | Reference allele |
+| `alt_allele` | Alternate allele |
+| `MutPred2 score` | Pre-computed MutPred2 score |
+
+The same `mavedb_variant_urn` can repeat across multiple rows (one per DNA reverse-translation candidate); each is keyed separately on `(variant_urn, chrom, start, stop, ref, alt)`. No further preparation required beyond having the file on disk.
+
+### MutPred2 (via dbNSFP, legacy)
 
 1. Download the pre-built GRCh38 variant file and its `.tbi` index from:
    `https://sites.google.com/site/jpopgen/dbNSFP`
    (e.g. `dbNSFP5.3.1a_grch38.gz` and `dbNSFP5.3.1a_grch38.gz.tbi`)
 2. Both files must be in the same directory. No further preparation required.
+3. Ignored if `--mutpred2-properties-file` is also given.
 
 ---
 
@@ -108,11 +129,17 @@ A typical use case is to extract previously computed scores from an existing out
 src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
   --alphamissense-file AlphaMissense_hg38.tsv.gz
 
-# All three tools
+# All three tools, MutPred2 via legacy dbNSFP source
 src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
   --revel-file revel_hg38.tsv.gz \
   --alphamissense-file AlphaMissense_hg38.tsv.gz \
   --dbnsfp-file dbNSFP5.3.1a_grch38.gz
+
+# All three tools, MutPred2 via preferred properties-file source (pipe-aligned)
+src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
+  --revel-file revel_hg38.tsv.gz \
+  --alphamissense-file AlphaMissense_hg38.tsv.gz \
+  --mutpred2-properties-file data_frame_missense_variants_MP2_properties.csv.gz
 ```
 
 ---
@@ -125,7 +152,14 @@ src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
 | `--revel-cache-file PATH` | `REVEL_CACHE_FILE` | — | Two-column TSV `(hgvs, revel.score)` pre-loaded as a file-based REVEL cache; checked before tabix |
 | `--alphamissense-file PATH` | `ALPHAMISSENSE_FILE` | — | bgzipped, tabix-indexed AlphaMissense TSV |
 | `--alphamissense-cache-file PATH` | `ALPHAMISSENSE_CACHE_FILE` | — | Three-column TSV `(hgvs, alphamissense.pathogenicity, alphamissense.class)` pre-loaded as a file-based AlphaMissense cache; checked before tabix |
-| `--dbnsfp-file PATH` | `DBNSFP_FILE` | — | bgzipped, tabix-indexed dbNSFP GRCh38 variant file |
+| `--dbnsfp-file PATH` | `DBNSFP_FILE` | — | bgzipped, tabix-indexed dbNSFP GRCh38 variant file. Ignored if `--mutpred2-properties-file` is also given |
+| `--mutpred2-properties-file PATH` | `MUTPRED2_PROPERTIES_FILE` | — | MaveDB MP2-properties CSV (optionally gzipped); preferred source for `mutpred2.score`, takes precedence over `--dbnsfp-file` |
+| `--variant-urn-col COL` | — | `variant_urn` | Input column with the MaveDB variant URN, used as part of the lookup key for `--mutpred2-properties-file` |
+| `--mapped-hgvs-g-chromosome-col COL` | — | `mapped_hgvs_g_chromosome` | Input column with pipe-delimited genomic chromosome(s), used as part of the lookup key for `--mutpred2-properties-file` |
+| `--mapped-hgvs-g-start-col COL` | — | `mapped_hgvs_g_start` | Input column with pipe-delimited genomic start position(s), used as part of the lookup key for `--mutpred2-properties-file` |
+| `--mapped-hgvs-g-stop-col COL` | — | `mapped_hgvs_g_stop` | Input column with pipe-delimited genomic stop position(s), used as part of the lookup key for `--mutpred2-properties-file` |
+| `--mapped-hgvs-g-ref-col COL` | — | `mapped_hgvs_g_ref` | Input column with pipe-delimited genomic ref allele(s), used as part of the lookup key for `--mutpred2-properties-file` |
+| `--mapped-hgvs-g-alt-col COL` | — | `mapped_hgvs_g_alt` | Input column with pipe-delimited genomic alt allele(s), used as part of the lookup key for `--mutpred2-properties-file` |
 | `--mapped-hgvs-g-col COL` | — | `mapped_hgvs_g` | Input column containing pipe-delimited genomic HGVS values |
 | `--mapped-hgvs-c-col COL` | — | `mapped_hgvs_c` | Input column containing pipe-delimited transcript HGVS values used as file-cache keys |
 | `--skip N` | — | `0` | Skip first N data rows |
@@ -165,4 +199,8 @@ The script returns the highest pathogenicity score when multiple transcript entr
 
 **MutPred2: semicolon-separated values**
 
-dbNSFP stores multiple MutPred2 scores per row (one per transcript), semicolon-separated. The script returns the maximum non-null value across all entries for each allele.
+dbNSFP stores multiple MutPred2 scores per row (one per transcript), semicolon-separated. The script returns the maximum non-null value across all entries for each allele. This only applies to the legacy `--dbnsfp-file` source.
+
+**MutPred2 (properties file): candidate not found**
+
+Confirm `--variant-urn-col` and the `--mapped-hgvs-g-*-col` columns are populated and match the `mavedb_variant_urn` / `Chrom` / `hg38_start` / `hg38_end` / `ref_allele` / `alt_allele` values in the properties file exactly (chromosome is tried with and without a `chr` prefix, but positions and alleles must match verbatim).

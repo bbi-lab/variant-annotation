@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 import pytest
 
+import gzip
+
 import src.annotate_predictors as mod
 from src.annotate_predictors import (
     _snv_from_hgvs_g,
@@ -15,6 +17,8 @@ from src.annotate_predictors import (
     _lookup_alphamissense,
     _get_dbnsfp_col_indices,
     _lookup_mutpred2,
+    _lookup_mutpred2_from_properties_file,
+    _load_mutpred2_properties_file_cache,
     annotate_row,
     NC_TO_CHROM_GRCH38,
 )
@@ -275,6 +279,115 @@ def test_lookup_mutpred2_uses_cache(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# _load_mutpred2_properties_file_cache / _lookup_mutpred2_from_properties_file
+# ---------------------------------------------------------------------------
+
+_MP2_PROPERTIES_HEADER = (
+    "Dataset,Gene,mavedb_variant_urn,Chrom,Strand,hg38_start,hg38_end,"
+    "ref_allele,alt_allele,AA,protein_id,transcript_id,gene_id,gene_symbol,"
+    "Substitution,MutPred2 score,Mechanisms"
+)
+
+
+def _mp2_line(urn, chrom, start, stop, ref, alt, score):
+    return (
+        f"ds,GENE,{urn},{chrom},-1.0,{start},{stop},{ref},{alt},T2A,"
+        f"ENSP1,ENST1,ENSG1,GENE,T2A,{score},[]"
+    )
+
+
+def _write_mp2_properties_file(path: Path, lines: list[str], gzipped: bool) -> Path:
+    text = _MP2_PROPERTIES_HEADER + "\n" + "\n".join(lines) + "\n"
+    if gzipped:
+        file_path = path / "mp2.csv.gz"
+        with gzip.open(file_path, "wt", encoding="utf-8") as fh:
+            fh.write(text)
+    else:
+        file_path = path / "mp2.csv"
+        file_path.write_text(text, encoding="utf-8")
+    return file_path
+
+
+def test_load_mutpred2_properties_file_cache_plain_csv(tmp_path):
+    lines = [_mp2_line("urn:mavedb:1#1", "17", 100, 100, "A", "G", "0.5000")]
+    file_path = _write_mp2_properties_file(tmp_path, lines, gzipped=False)
+
+    cache = _load_mutpred2_properties_file_cache(str(file_path))
+
+    assert cache[("urn:mavedb:1#1", "17", 100, 100, "A", "G")] == "0.5000"
+
+
+def test_load_mutpred2_properties_file_cache_gzipped(tmp_path):
+    lines = [_mp2_line("urn:mavedb:1#1", "17", 100, 100, "A", "G", "0.5000")]
+    file_path = _write_mp2_properties_file(tmp_path, lines, gzipped=True)
+
+    cache = _load_mutpred2_properties_file_cache(str(file_path))
+
+    assert cache[("urn:mavedb:1#1", "17", 100, 100, "A", "G")] == "0.5000"
+
+
+def test_load_mutpred2_properties_file_cache_multiple_candidates_same_urn(tmp_path):
+    """One variant_urn can repeat across multiple DNA reverse-translation rows."""
+    lines = [
+        _mp2_line("urn:mavedb:1#1", "17", 100, 102, "ACT", "GCA", "0.3000"),
+        _mp2_line("urn:mavedb:1#1", "17", 100, 102, "ACT", "GCC", "0.3000"),
+    ]
+    file_path = _write_mp2_properties_file(tmp_path, lines, gzipped=False)
+
+    cache = _load_mutpred2_properties_file_cache(str(file_path))
+
+    assert cache[("urn:mavedb:1#1", "17", 100, 102, "ACT", "GCA")] == "0.3000"
+    assert cache[("urn:mavedb:1#1", "17", 100, 102, "ACT", "GCC")] == "0.3000"
+
+
+def test_load_mutpred2_properties_file_cache_missing_column_raises(tmp_path):
+    file_path = tmp_path / "bad.csv"
+    file_path.write_text("Dataset,Gene,mavedb_variant_urn\nds,GENE,urn:1\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="missing column"):
+        _load_mutpred2_properties_file_cache(str(file_path))
+
+
+def test_load_mutpred2_properties_file_cache_skips_bad_rows(tmp_path):
+    lines = [
+        _mp2_line("urn:mavedb:1#1", "17", 100, 100, "A", "G", "0.5000"),
+        _mp2_line("", "17", 100, 100, "A", "G", "0.5000"),  # blank urn
+        _mp2_line("urn:mavedb:1#2", "17", "notanumber", 100, "A", "G", "0.5000"),  # bad start
+        _mp2_line("urn:mavedb:1#3", "17", 100, 100, "A", "G", ""),  # blank score
+    ]
+    file_path = _write_mp2_properties_file(tmp_path, lines, gzipped=False)
+
+    cache = _load_mutpred2_properties_file_cache(str(file_path))
+
+    assert len(cache) == 1
+    assert cache[("urn:mavedb:1#1", "17", 100, 100, "A", "G")] == "0.5000"
+
+
+def test_lookup_mutpred2_from_properties_file_found():
+    cache = {("urn:mavedb:1#1", "17", 100, 100, "A", "G"): "0.5000"}
+    result = _lookup_mutpred2_from_properties_file(cache, "urn:mavedb:1#1", "17", "100", "100", "A", "G")
+    assert result == "0.5000"
+
+
+def test_lookup_mutpred2_from_properties_file_not_found():
+    cache = {("urn:mavedb:1#1", "17", 100, 100, "A", "G"): "0.5000"}
+    result = _lookup_mutpred2_from_properties_file(cache, "urn:mavedb:1#1", "17", "100", "100", "A", "C")
+    assert result is None
+
+
+def test_lookup_mutpred2_from_properties_file_tries_chr_prefix():
+    cache = {("urn:mavedb:1#1", "chr17", 100, 100, "A", "G"): "0.5000"}
+    result = _lookup_mutpred2_from_properties_file(cache, "urn:mavedb:1#1", "17", "100", "100", "A", "G")
+    assert result == "0.5000"
+
+
+def test_lookup_mutpred2_from_properties_file_missing_field_returns_none():
+    cache = {("urn:mavedb:1#1", "17", 100, 100, "A", "G"): "0.5000"}
+    result = _lookup_mutpred2_from_properties_file(cache, "", "17", "100", "100", "A", "G")
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
 # _lookup_alphamissense
 # ---------------------------------------------------------------------------
 
@@ -437,6 +550,120 @@ def test_annotate_row_mutpred2_single_score_across_candidates(tmp_path):
     assert ann["mutpred2.score"] == "0.8100"
 
 
+def test_annotate_row_mutpred2_properties_file_pipe_aligned_per_candidate(tmp_path):
+    """Alt source: MutPred2 is looked up per DNA RT candidate, pipe-aligned."""
+    mutpred2_properties_cache = {
+        ("urn:mavedb:1#1", "17", 100, 100, "A", "G"): "0.4000",
+        ("urn:mavedb:1#1", "17", 100, 100, "A", "T"): "0.9000",
+    }
+    row = {
+        "variant_urn": "urn:mavedb:1#1",
+        "mapped_hgvs_g": "NC_000017.11:g.100A>G|NC_000017.11:g.100A>T",
+        "mapped_hgvs_g_chromosome": "17|17",
+        "mapped_hgvs_g_start": "100|100",
+        "mapped_hgvs_g_stop": "100|100",
+        "mapped_hgvs_g_ref": "A|A",
+        "mapped_hgvs_g_alt": "G|T",
+    }
+
+    ann = annotate_row(
+        row,
+        nc_to_chrom=NC_TO_CHROM_GRCH38,
+        mapped_hgvs_g_col="mapped_hgvs_g",
+        revel_path=None,
+        alphamissense_path=None,
+        dbnsfp_path=None,
+        revel_cache={},
+        am_cache={},
+        mutpred2_properties_cache=mutpred2_properties_cache,
+        variant_urn_col="variant_urn",
+        mapped_hgvs_g_chromosome_col="mapped_hgvs_g_chromosome",
+        mapped_hgvs_g_start_col="mapped_hgvs_g_start",
+        mapped_hgvs_g_stop_col="mapped_hgvs_g_stop",
+        mapped_hgvs_g_ref_col="mapped_hgvs_g_ref",
+        mapped_hgvs_g_alt_col="mapped_hgvs_g_alt",
+    )
+
+    assert ann["mutpred2.score"] == "0.4000|0.9000"
+
+
+def test_annotate_row_mutpred2_properties_file_missing_candidate_is_empty(tmp_path):
+    """A candidate absent from the properties file produces an empty slot, not a dropped one."""
+    mutpred2_properties_cache = {
+        ("urn:mavedb:1#1", "17", 100, 100, "A", "G"): "0.4000",
+    }
+    row = {
+        "variant_urn": "urn:mavedb:1#1",
+        "mapped_hgvs_g": "NC_000017.11:g.100A>G|NC_000017.11:g.100A>T",
+        "mapped_hgvs_g_chromosome": "17|17",
+        "mapped_hgvs_g_start": "100|100",
+        "mapped_hgvs_g_stop": "100|100",
+        "mapped_hgvs_g_ref": "A|A",
+        "mapped_hgvs_g_alt": "G|T",
+    }
+
+    ann = annotate_row(
+        row,
+        nc_to_chrom=NC_TO_CHROM_GRCH38,
+        mapped_hgvs_g_col="mapped_hgvs_g",
+        revel_path=None,
+        alphamissense_path=None,
+        dbnsfp_path=None,
+        revel_cache={},
+        am_cache={},
+        mutpred2_properties_cache=mutpred2_properties_cache,
+        variant_urn_col="variant_urn",
+        mapped_hgvs_g_chromosome_col="mapped_hgvs_g_chromosome",
+        mapped_hgvs_g_start_col="mapped_hgvs_g_start",
+        mapped_hgvs_g_stop_col="mapped_hgvs_g_stop",
+        mapped_hgvs_g_ref_col="mapped_hgvs_g_ref",
+        mapped_hgvs_g_alt_col="mapped_hgvs_g_alt",
+    )
+
+    assert ann["mutpred2.score"] == "0.4000|"
+
+
+def test_annotate_row_mutpred2_properties_file_takes_precedence_over_dbnsfp(tmp_path):
+    """When both sources are configured, the properties file wins and dbNSFP is skipped."""
+    dbnsfp_path = tmp_path / "db.tsv.gz"
+    dbnsfp_path.touch()
+    mod._dbnsfp_col_index_cache[str(dbnsfp_path)] = _DBNSFP_IDX
+
+    mutpred2_properties_cache = {
+        ("urn:mavedb:1#1", "17", 100, 100, "A", "G"): "0.4000",
+    }
+    row = {
+        "variant_urn": "urn:mavedb:1#1",
+        "mapped_hgvs_g": "NC_000017.11:g.100A>G",
+        "mapped_hgvs_g_chromosome": "17",
+        "mapped_hgvs_g_start": "100",
+        "mapped_hgvs_g_stop": "100",
+        "mapped_hgvs_g_ref": "A",
+        "mapped_hgvs_g_alt": "G",
+    }
+
+    with patch.object(mod, "_run_tabix", side_effect=AssertionError("dbNSFP should not be queried")):
+        ann = annotate_row(
+            row,
+            nc_to_chrom=NC_TO_CHROM_GRCH38,
+            mapped_hgvs_g_col="mapped_hgvs_g",
+            revel_path=None,
+            alphamissense_path=None,
+            dbnsfp_path=dbnsfp_path,
+            revel_cache={},
+            am_cache={},
+            mutpred2_properties_cache=mutpred2_properties_cache,
+            variant_urn_col="variant_urn",
+            mapped_hgvs_g_chromosome_col="mapped_hgvs_g_chromosome",
+            mapped_hgvs_g_start_col="mapped_hgvs_g_start",
+            mapped_hgvs_g_stop_col="mapped_hgvs_g_stop",
+            mapped_hgvs_g_ref_col="mapped_hgvs_g_ref",
+            mapped_hgvs_g_alt_col="mapped_hgvs_g_alt",
+        )
+
+    assert ann["mutpred2.score"] == "0.4000"
+
+
 def test_annotate_row_non_snv_empty(tmp_path):
     """Indel HGVS → all scores empty."""
     revel_path = tmp_path / "revel.tsv.gz"
@@ -579,3 +806,92 @@ def test_main_writes_score_columns(tmp_path, monkeypatch):
     # Non-SNV row → empty
     assert rows[1]["revel.score"] == ""
     assert rows[1]["alphamissense.pathogenicity"] == ""
+
+
+def test_main_mutpred2_properties_file_pipe_aligned_output(tmp_path):
+    """End-to-end: protein-level row with multiple RT candidates → pipe-aligned mutpred2.score."""
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+    mp2_path = tmp_path / "mp2.csv"
+    mp2_path.write_text(
+        _MP2_PROPERTIES_HEADER + "\n"
+        + _mp2_line("urn:mavedb:1#1", "17", 100, 100, "A", "G", "0.4000") + "\n"
+        + _mp2_line("urn:mavedb:1#1", "17", 100, 100, "A", "T", "0.9000") + "\n",
+        encoding="utf-8",
+    )
+
+    _write_tsv(
+        in_path,
+        [
+            {
+                "variant_urn": "urn:mavedb:1#1",
+                "mapped_hgvs_g": "NC_000017.11:g.100A>G|NC_000017.11:g.100A>T",
+                "mapped_hgvs_g_chromosome": "17|17",
+                "mapped_hgvs_g_start": "100|100",
+                "mapped_hgvs_g_stop": "100|100",
+                "mapped_hgvs_g_ref": "A|A",
+                "mapped_hgvs_g_alt": "G|T",
+            },
+        ],
+        [
+            "variant_urn", "mapped_hgvs_g", "mapped_hgvs_g_chromosome",
+            "mapped_hgvs_g_start", "mapped_hgvs_g_stop", "mapped_hgvs_g_ref", "mapped_hgvs_g_alt",
+        ],
+    )
+
+    mod.main([
+        str(in_path), str(out_path),
+        "--mutpred2-properties-file", str(mp2_path),
+    ])
+
+    rows = _read_tsv(out_path)
+    assert len(rows) == 1
+    assert rows[0]["mutpred2.score"] == "0.4000|0.9000"
+
+
+def test_main_mutpred2_properties_file_takes_precedence_over_dbnsfp(tmp_path, monkeypatch):
+    """--dbnsfp-file is ignored for mutpred2.score when --mutpred2-properties-file is also given."""
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+    mp2_path = tmp_path / "mp2.csv"
+    dbnsfp_path = tmp_path / "db.tsv.gz"
+    dbnsfp_path.touch()
+    mp2_path.write_text(
+        _MP2_PROPERTIES_HEADER + "\n"
+        + _mp2_line("urn:mavedb:1#1", "17", 100, 100, "A", "G", "0.4000") + "\n",
+        encoding="utf-8",
+    )
+
+    _write_tsv(
+        in_path,
+        [
+            {
+                "variant_urn": "urn:mavedb:1#1",
+                "mapped_hgvs_g": "NC_000017.11:g.100A>G",
+                "mapped_hgvs_g_chromosome": "17",
+                "mapped_hgvs_g_start": "100",
+                "mapped_hgvs_g_stop": "100",
+                "mapped_hgvs_g_ref": "A",
+                "mapped_hgvs_g_alt": "G",
+            },
+        ],
+        [
+            "variant_urn", "mapped_hgvs_g", "mapped_hgvs_g_chromosome",
+            "mapped_hgvs_g_start", "mapped_hgvs_g_stop", "mapped_hgvs_g_ref", "mapped_hgvs_g_alt",
+        ],
+    )
+
+    monkeypatch.setattr(mod, "_run_tabix", lambda *a, **kw: (_ for _ in ()).throw(
+        AssertionError("dbNSFP should not be queried")
+    ))
+    import subprocess
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: type("R", (), {"returncode": 0})())
+
+    mod.main([
+        str(in_path), str(out_path),
+        "--mutpred2-properties-file", str(mp2_path),
+        "--dbnsfp-file", str(dbnsfp_path),
+    ])
+
+    rows = _read_tsv(out_path)
+    assert rows[0]["mutpred2.score"] == "0.4000"
