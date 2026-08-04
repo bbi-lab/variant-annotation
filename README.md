@@ -494,7 +494,7 @@ See [docs/annotate_erepo.md](docs/annotate_erepo.md) for full reference document
 
 **Input columns:** `mapped_hgvs_c` (from step 1 or step 2), optionally `dna_clingen_allele_id` and a ClinVar variation ID column
 
-**Output columns:** `clingen_evidence_repository.Assertion`, `.Expert Panel`, `.Disease Mondo Id`, `.Mode of Inheritance`, `.Applied Evidence Codes (Met)`, `.Applied Evidence Codes (Not Met)`, `.Summary of interpretation`, `.ClinVar Variation Id`, `.Allele Registry Id`, `.PubMed Articles`, `.Guideline`, `.Approval Date`, `.Published Date`, `.Retracted`, `.Evidence Repo Link`, `.Uuid`, `.warnings`
+**Output columns:** `clingen_evidence_repository.Assertion`, `.Expert Panel`, `.Disease`, `.Mondo Id`, `.Mode of Inheritance`, `.Applied Evidence Codes (Met)`, `.Applied Evidence Codes (Not Met)`, `.Summary of interpretation`, `.ClinVar Variation Id`, `.Allele Registry Id`, `.PubMed Articles`, `.Guideline`, `.Approval Date`, `.Published Date`, `.Retracted`, `.Evidence Repo Link`, `.Uuid`, `.warnings`
 
 **Command:**
 ```bash

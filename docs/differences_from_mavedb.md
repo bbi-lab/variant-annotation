@@ -162,7 +162,7 @@ Hail mode supports `--genes BRCA1,BRCA2` to restrict the local cache to specific
 
 **MaveDB:** ClinGen Evidence Repository annotation has not been implemented in MaveDB.
 
-**This pipeline:** `annotate_erepo` downloads the full ClinGen erepo expert-panel classification TSV and joins it against each variant candidate using up to three keys: HGVS expression, ClinVar Variation ID, and CAID. Sixteen classification columns are added per candidate (prefixed `clingen_evidence_repository.`), including `Assertion`, `Expert Panel`, `Disease Mondo Id`, `Mode of Inheritance`, applied ACMG evidence codes, and supporting metadata. A `warnings` column records cross-key discrepancies.
+**This pipeline:** `annotate_erepo` downloads the full ClinGen erepo expert-panel classification TSV and joins it against each variant candidate using up to three keys: HGVS expression, ClinVar Variation ID, and CAID. Seventeen classification columns are added per candidate (prefixed `clingen_evidence_repository.`), including `Assertion`, `Expert Panel`, `Disease`, `Mondo Id`, `Mode of Inheritance`, applied ACMG evidence codes, and supporting metadata. A `warnings` column records cross-key discrepancies.
 
 ---
 

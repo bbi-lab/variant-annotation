@@ -26,7 +26,8 @@ values across each ``mapped_hgvs_c`` candidate:
 
     clingen_evidence_repository.ClinVar Variation Id
     clingen_evidence_repository.Allele Registry Id
-    clingen_evidence_repository.Disease Mondo Id
+    clingen_evidence_repository.Disease
+    clingen_evidence_repository.Mondo Id
     clingen_evidence_repository.Mode of Inheritance
     clingen_evidence_repository.Assertion
     clingen_evidence_repository.Applied Evidence Codes (Met)
@@ -83,7 +84,8 @@ EREPO_COL_ALLELE_REGISTRY_ID = "Allele Registry Id"
 EREPO_OUTPUT_COLS = [
     "ClinVar Variation Id",
     "Allele Registry Id",
-    "Disease Mondo Id",
+    "Disease",
+    "Mondo Id",
     "Mode of Inheritance",
     "Assertion",
     "Applied Evidence Codes (Met)",
