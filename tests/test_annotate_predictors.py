@@ -19,6 +19,11 @@ from src.annotate_predictors import (
     _lookup_mutpred2,
     _lookup_mutpred2_from_properties_file,
     _load_mutpred2_properties_file_cache,
+    _lookup_revel_train,
+    _lookup_mutpred2_train,
+    _load_revel_training_variants,
+    _load_mutpred2_training_variants,
+    _unqualify_hgvs_p,
     annotate_row,
     NC_TO_CHROM_GRCH38,
 )
@@ -895,3 +900,320 @@ def test_main_mutpred2_properties_file_takes_precedence_over_dbnsfp(tmp_path, mo
 
     rows = _read_tsv(out_path)
     assert rows[0]["mutpred2.score"] == "0.4000"
+
+
+# ---------------------------------------------------------------------------
+# _unqualify_hgvs_p
+# ---------------------------------------------------------------------------
+
+def test_unqualify_hgvs_p_strips_accession():
+    assert _unqualify_hgvs_p("NP_000546.1:p.Asn1643His") == "p.Asn1643His"
+
+
+def test_unqualify_hgvs_p_passthrough_when_no_colon():
+    assert _unqualify_hgvs_p("p.Asn1643His") == "p.Asn1643His"
+
+
+def test_unqualify_hgvs_p_strips_whitespace():
+    assert _unqualify_hgvs_p("  NP_000546.1:p.Asn1643His  ") == "p.Asn1643His"
+
+
+# ---------------------------------------------------------------------------
+# _load_revel_training_variants
+# ---------------------------------------------------------------------------
+
+def _write_revel_training_file(path: Path, rows: list[dict]) -> Path:
+    file_path = path / "revel_training.tsv"
+    fieldnames = ["gene_symbol", "unqualified_hgvs_p", "chromosome", "hg38_start", "hg38_end", "ref_allele", "alt_allele"]
+    _write_tsv(file_path, rows, fieldnames)
+    return file_path
+
+
+def test_load_revel_training_variants_basic(tmp_path):
+    file_path = _write_revel_training_file(tmp_path, [
+        {
+            "gene_symbol": "ASPA", "unqualified_hgvs_p": "p.Cys4Arg",
+            "chromosome": "17", "hg38_start": "3476169.0", "hg38_end": "3476169.0",
+            "ref_allele": "T", "alt_allele": "C",
+        },
+    ])
+
+    training_set = _load_revel_training_variants(str(file_path))
+
+    assert training_set == {("17", 3476169, 3476169, "T", "C")}
+
+
+def test_load_revel_training_variants_missing_column_raises(tmp_path):
+    file_path = tmp_path / "bad.tsv"
+    file_path.write_text("gene_symbol\tunqualified_hgvs_p\nASPA\tp.Cys4Arg\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="missing column"):
+        _load_revel_training_variants(str(file_path))
+
+
+def test_load_revel_training_variants_skips_bad_positions(tmp_path):
+    file_path = _write_revel_training_file(tmp_path, [
+        {
+            "gene_symbol": "ASPA", "unqualified_hgvs_p": "p.Cys4Arg",
+            "chromosome": "17", "hg38_start": "notanumber", "hg38_end": "3476169.0",
+            "ref_allele": "T", "alt_allele": "C",
+        },
+    ])
+
+    training_set = _load_revel_training_variants(str(file_path))
+
+    assert training_set == set()
+
+
+# ---------------------------------------------------------------------------
+# _load_mutpred2_training_variants
+# ---------------------------------------------------------------------------
+
+def test_load_mutpred2_training_variants_unqualified_schema(tmp_path):
+    file_path = tmp_path / "mp2_training.tsv"
+    _write_tsv(
+        file_path,
+        [{"gene_symbol": "TSC2", "unqualified_hgvs_p": "p.Asn1643His"}],
+        ["gene_symbol", "unqualified_hgvs_p"],
+    )
+
+    schema, training_set = _load_mutpred2_training_variants(str(file_path))
+
+    assert schema == "unqualified"
+    assert training_set == {("TSC2", "p.Asn1643His")}
+
+
+def test_load_mutpred2_training_variants_qualified_schema(tmp_path):
+    file_path = tmp_path / "mp2_training.tsv"
+    _write_tsv(
+        file_path,
+        [{"hgvs_p": "NP_000546.1:p.Asn1643His"}],
+        ["hgvs_p"],
+    )
+
+    schema, training_set = _load_mutpred2_training_variants(str(file_path))
+
+    assert schema == "qualified"
+    assert training_set == {"NP_000546.1:p.Asn1643His"}
+
+
+def test_load_mutpred2_training_variants_missing_columns_raises(tmp_path):
+    file_path = tmp_path / "bad.tsv"
+    file_path.write_text("gene_symbol\nTSC2\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="must have either"):
+        _load_mutpred2_training_variants(str(file_path))
+
+
+# ---------------------------------------------------------------------------
+# _lookup_revel_train
+# ---------------------------------------------------------------------------
+
+def test_lookup_revel_train_found():
+    training_set = {("17", 3476169, 3476169, "T", "C")}
+    assert _lookup_revel_train(training_set, "17", "3476169", "3476169", "T", "C") is True
+
+
+def test_lookup_revel_train_not_found():
+    training_set = {("17", 3476169, 3476169, "T", "C")}
+    assert _lookup_revel_train(training_set, "17", "100", "100", "A", "G") is False
+
+
+def test_lookup_revel_train_tries_chr_prefix():
+    training_set = {("17", 3476169, 3476169, "T", "C")}
+    assert _lookup_revel_train(training_set, "chr17", "3476169", "3476169", "T", "C") is True
+
+
+def test_lookup_revel_train_missing_field_is_false():
+    training_set = {("17", 3476169, 3476169, "T", "C")}
+    assert _lookup_revel_train(training_set, "17", "", "3476169", "T", "C") is False
+
+
+# ---------------------------------------------------------------------------
+# _lookup_mutpred2_train
+# ---------------------------------------------------------------------------
+
+def test_lookup_mutpred2_train_unqualified_match():
+    training_set = {("TSC2", "p.Asn1643His")}
+    assert _lookup_mutpred2_train("unqualified", training_set, "TSC2", "NP_001071.3:p.Asn1643His") is True
+
+
+def test_lookup_mutpred2_train_unqualified_no_gene_match():
+    training_set = {("TSC2", "p.Asn1643His")}
+    assert _lookup_mutpred2_train("unqualified", training_set, "OTHERGENE", "p.Asn1643His") is False
+
+
+def test_lookup_mutpred2_train_qualified_match_ignores_gene():
+    training_set = {"NP_001071.3:p.Asn1643His"}
+    assert _lookup_mutpred2_train("qualified", training_set, "", "NP_001071.3:p.Asn1643His") is True
+
+
+def test_lookup_mutpred2_train_pipe_delimited_any_segment_matches():
+    training_set = {("TSC2", "p.Asn1643His")}
+    mapped_hgvs_p = "NP_999999.1:p.Gln2Ter|NP_001071.3:p.Asn1643His"
+    assert _lookup_mutpred2_train("unqualified", training_set, "TSC2", mapped_hgvs_p) is True
+
+
+def test_lookup_mutpred2_train_empty_value_is_false():
+    training_set = {("TSC2", "p.Asn1643His")}
+    assert _lookup_mutpred2_train("unqualified", training_set, "TSC2", "") is False
+
+
+# ---------------------------------------------------------------------------
+# annotate_row: revel.train / mutpred2.train
+# ---------------------------------------------------------------------------
+
+def test_annotate_row_revel_train_pipe_aligned_per_candidate(tmp_path):
+    revel_training_set = {("17", 100, 100, "A", "G")}
+    row = {
+        "mapped_hgvs_g": "NC_000017.11:g.100A>G|NC_000017.11:g.100A>T",
+        "mapped_hgvs_g_chromosome": "17|17",
+        "mapped_hgvs_g_start": "100|100",
+        "mapped_hgvs_g_stop": "100|100",
+        "mapped_hgvs_g_ref": "A|A",
+        "mapped_hgvs_g_alt": "G|T",
+    }
+
+    ann = annotate_row(
+        row,
+        nc_to_chrom=NC_TO_CHROM_GRCH38,
+        mapped_hgvs_g_col="mapped_hgvs_g",
+        revel_path=None,
+        alphamissense_path=None,
+        revel_cache={},
+        am_cache={},
+        mapped_hgvs_g_chromosome_col="mapped_hgvs_g_chromosome",
+        mapped_hgvs_g_start_col="mapped_hgvs_g_start",
+        mapped_hgvs_g_stop_col="mapped_hgvs_g_stop",
+        mapped_hgvs_g_ref_col="mapped_hgvs_g_ref",
+        mapped_hgvs_g_alt_col="mapped_hgvs_g_alt",
+        revel_training_set=revel_training_set,
+    )
+
+    assert ann["revel.train"] == "true|false"
+
+
+def test_annotate_row_mutpred2_train_duplicated_across_candidates(tmp_path):
+    """MutPred2 training is protein-level: same true/false repeats for every DNA candidate."""
+    mutpred2_training_set = {("TSC2", "p.Asn1643His")}
+    row = {
+        "mapped_hgvs_g": "NC_000016.10:g.100A>G|NC_000016.10:g.200A>T",
+        "gene_symbol": "TSC2",
+        "mapped_hgvs_p": "NP_001071.3:p.Asn1643His",
+    }
+
+    ann = annotate_row(
+        row,
+        nc_to_chrom=NC_TO_CHROM_GRCH38,
+        mapped_hgvs_g_col="mapped_hgvs_g",
+        revel_path=None,
+        alphamissense_path=None,
+        revel_cache={},
+        am_cache={},
+        mutpred2_training_schema="unqualified",
+        mutpred2_training_set=mutpred2_training_set,
+        gene_symbol_col="gene_symbol",
+        mapped_hgvs_p_col="mapped_hgvs_p",
+    )
+
+    assert ann["mutpred2.train"] == "true|true"
+
+
+def test_annotate_row_mutpred2_train_single_candidate_no_pipe(tmp_path):
+    mutpred2_training_set = {("TSC2", "p.Asn1643His")}
+    row = {
+        "mapped_hgvs_g": "NC_000016.10:g.100A>G",
+        "gene_symbol": "OTHERGENE",
+        "mapped_hgvs_p": "NP_001071.3:p.Asn1643His",
+    }
+
+    ann = annotate_row(
+        row,
+        nc_to_chrom=NC_TO_CHROM_GRCH38,
+        mapped_hgvs_g_col="mapped_hgvs_g",
+        revel_path=None,
+        alphamissense_path=None,
+        revel_cache={},
+        am_cache={},
+        mutpred2_training_schema="unqualified",
+        mutpred2_training_set=mutpred2_training_set,
+        gene_symbol_col="gene_symbol",
+        mapped_hgvs_p_col="mapped_hgvs_p",
+    )
+
+    assert ann["mutpred2.train"] == "false"
+
+
+# ---------------------------------------------------------------------------
+# main(): revel.train / mutpred2.train end-to-end
+# ---------------------------------------------------------------------------
+
+def test_main_training_files_only_writes_train_columns(tmp_path):
+    """--revel-training-file and --mutpred2-training-file work without any score source."""
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+
+    revel_training_path = _write_revel_training_file(tmp_path, [
+        {
+            "gene_symbol": "ASPA", "unqualified_hgvs_p": "p.Cys4Arg",
+            "chromosome": "17", "hg38_start": "100", "hg38_end": "100",
+            "ref_allele": "A", "alt_allele": "G",
+        },
+    ])
+    mutpred2_training_path = tmp_path / "mp2_training.tsv"
+    _write_tsv(
+        mutpred2_training_path,
+        [{"gene_symbol": "TSC2", "unqualified_hgvs_p": "p.Asn1643His"}],
+        ["gene_symbol", "unqualified_hgvs_p"],
+    )
+
+    _write_tsv(
+        in_path,
+        [
+            {
+                "gene_symbol": "ASPA",
+                "mapped_hgvs_g": "NC_000017.11:g.100A>G",
+                "mapped_hgvs_g_chromosome": "17",
+                "mapped_hgvs_g_start": "100",
+                "mapped_hgvs_g_stop": "100",
+                "mapped_hgvs_g_ref": "A",
+                "mapped_hgvs_g_alt": "G",
+                "mapped_hgvs_p": "NP_999999.1:p.Cys4Arg",
+            },
+            {
+                "gene_symbol": "TSC2",
+                "mapped_hgvs_g": "NC_000016.10:g.999A>T",
+                "mapped_hgvs_g_chromosome": "16",
+                "mapped_hgvs_g_start": "999",
+                "mapped_hgvs_g_stop": "999",
+                "mapped_hgvs_g_ref": "A",
+                "mapped_hgvs_g_alt": "T",
+                "mapped_hgvs_p": "NP_001071.3:p.Asn1643His",
+            },
+        ],
+        [
+            "gene_symbol", "mapped_hgvs_g", "mapped_hgvs_g_chromosome", "mapped_hgvs_g_start",
+            "mapped_hgvs_g_stop", "mapped_hgvs_g_ref", "mapped_hgvs_g_alt", "mapped_hgvs_p",
+        ],
+    )
+
+    mod.main([
+        str(in_path), str(out_path),
+        "--revel-training-file", str(revel_training_path),
+        "--mutpred2-training-file", str(mutpred2_training_path),
+    ])
+
+    rows = _read_tsv(out_path)
+    assert rows[0]["revel.train"] == "true"
+    assert rows[0]["mutpred2.train"] == "false"
+    assert rows[1]["revel.train"] == "false"
+    assert rows[1]["mutpred2.train"] == "true"
+
+
+def test_main_requires_at_least_one_source_including_training_files(tmp_path):
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+    _write_tsv(in_path, [{"mapped_hgvs_g": "NC_000001.11:g.69094T>A"}], ["mapped_hgvs_g"])
+
+    with pytest.raises(SystemExit):
+        mod.main([str(in_path), str(out_path)])

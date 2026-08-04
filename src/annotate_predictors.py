@@ -31,7 +31,27 @@ Supported scores (hg38 / GRCh38 only):
     Ignored if --mutpred2-properties-file is also given.
 
 At least one of --revel-file, --alphamissense-file, --mutpred2-properties-file,
-or --dbnsfp-file is required.
+--dbnsfp-file, --revel-training-file, or --mutpred2-training-file is required.
+
+
+Training-set overlap (optional)
+--------------------------------
+
+  --revel-training-file data/revel_training_variants.tsv
+    List of REVEL training variants. Joined on hg38 genomic coordinates
+    (chromosome, hg38_start, hg38_end, ref_allele, alt_allele) against the
+    --mapped-hgvs-g-*-col columns. Produces revel.train, pipe-aligned per
+    DNA reverse-translation candidate like revel.score.
+
+  --mutpred2-training-file data/mutpred2_training_variants.tsv
+    List of MutPred2 training variants. MutPred2 is a protein-level model,
+    so the join key is gene symbol + unqualified protein HGVS rather than
+    genomic coordinates: either an 'hgvs_p' column (transcript/protein-
+    accession-qualified, e.g. 'NP_000546.1:p.Asn1643His' — gene symbols are
+    then ignored), or 'gene_symbol' + 'unqualified_hgvs_p' columns, matched
+    against --gene-symbol-col and the part of --mapped-hgvs-p-col following
+    the colon. Produces mutpred2.train, duplicated across all DNA candidates
+    in the row since the match doesn't vary per candidate.
 
 
 Data file preparation
@@ -66,6 +86,8 @@ Output columns
   alphamissense.pathogenicity — AlphaMissense pathogenicity score (0–1)
   alphamissense.class        — likely_benign / ambiguous / likely_pathogenic
   mutpred2.score             — MutPred2 score
+  revel.train                — "true"/"false": in the REVEL training set (--revel-training-file)
+  mutpred2.train             — "true"/"false": in the MutPred2 training set (--mutpred2-training-file)
 
 For rows with pipe-delimited genomic HGVS values the REVEL and AlphaMissense
 columns are pipe-aligned to match the input candidate positions.
@@ -127,6 +149,8 @@ NC_TO_CHROM_GRCH38: dict[str, str] = {
 REVEL_COLS = ["revel.score"]
 ALPHAMISSENSE_COLS = ["alphamissense.pathogenicity", "alphamissense.class"]
 DBNSFP_COLS = ["mutpred2.score"]
+REVEL_TRAIN_COLS = ["revel.train"]
+MUTPRED2_TRAIN_COLS = ["mutpred2.train"]
 
 # Module-level cache so the dbNSFP header is read at most once per file path.
 _dbnsfp_col_index_cache: dict[str, dict[str, int]] = {}
@@ -224,6 +248,18 @@ def _split_pipe(value: str) -> list[str]:
     if "|" not in raw:
         return [raw.strip()]
     return [part.strip() for part in raw.split("|")]
+
+
+def _unqualify_hgvs_p(value: str) -> str:
+    """Strip a leading transcript/protein accession from a p. HGVS string.
+
+    ``NP_000546.1:p.Asn1643His`` -> ``p.Asn1643His``. Values with no colon
+    (already unqualified) are returned stripped and unchanged.
+    """
+    value = value.strip()
+    if ":" in value:
+        return value.rsplit(":", 1)[1].strip()
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +384,65 @@ def _lookup_mutpred2_from_properties_file(
         if score is not None:
             return score
     return None
+
+
+def _lookup_revel_train(
+    training_set: set[tuple[str, int, int, str, str]],
+    chrom: str,
+    start: str,
+    stop: str,
+    ref: str,
+    alt: str,
+) -> bool:
+    """Return whether one DNA reverse-translation candidate is a REVEL training variant.
+
+    Keyed on genomic coordinates ``(chrom, start, stop, ref, alt)`` against a
+    set built by :func:`_load_revel_training_variants`. *chrom* is tried both
+    with and without a ``chr`` prefix, as elsewhere in this module.
+    """
+    if not (chrom and start and stop and ref and alt):
+        return False
+    try:
+        start_i = int(float(start))
+        stop_i = int(float(stop))
+    except ValueError:
+        return False
+
+    ref_u = ref.strip().upper()
+    alt_u = alt.strip().upper()
+    return any(
+        (chrom_try, start_i, stop_i, ref_u, alt_u) in training_set
+        for chrom_try in _chrom_candidates(chrom.strip())
+    )
+
+
+def _lookup_mutpred2_train(
+    schema: str,
+    training_set: set,
+    gene_symbol: str,
+    mapped_hgvs_p: str,
+) -> bool:
+    """Return whether a protein variant is a MutPred2 training variant.
+
+    MutPred2 is protein-level, so this is evaluated once per row (not per DNA
+    candidate). *mapped_hgvs_p* may itself be pipe-delimited (e.g. multiple
+    transcript mappings for the same protein change); a match on any segment
+    counts as a match for the whole row. When *schema* is ``"qualified"``,
+    segments are matched verbatim against ``training_set`` (a set of
+    transcript/protein-accession-qualified hgvs_p strings) and *gene_symbol*
+    is ignored. When *schema* is ``"unqualified"``, segments are stripped of
+    any accession prefix and matched together with *gene_symbol* against
+    ``training_set`` (a set of ``(gene_symbol, unqualified_hgvs_p)`` tuples).
+    """
+    candidates = [c for c in _split_pipe(mapped_hgvs_p) if c]
+    if not candidates:
+        return False
+    if schema == "qualified":
+        return any(c in training_set for c in candidates)
+    gene = gene_symbol.strip()
+    if not gene:
+        return False
+    return any((gene, _unqualify_hgvs_p(c)) in training_set for c in candidates)
 
 
 def _lookup_revel(
@@ -561,6 +656,104 @@ def _load_mutpred2_properties_file_cache(
     return cache
 
 
+REVEL_TRAINING_REQUIRED_COLS = [
+    "chromosome",
+    "hg38_start",
+    "hg38_end",
+    "ref_allele",
+    "alt_allele",
+]
+
+
+def _load_revel_training_variants(path: str) -> set[tuple[str, int, int, str, str]]:
+    """Load a REVEL training-variant TSV into a set of genomic-coordinate keys.
+
+    Expects (at least) the columns ``chromosome``, ``hg38_start``,
+    ``hg38_end``, ``ref_allele``, and ``alt_allele``. Any other columns (e.g.
+    ``gene_symbol``, ``unqualified_hgvs_p``) are informational only and are
+    not used for matching. Positions may be written as floats (e.g.
+    ``3476169.0``), which is tolerated.
+    """
+    training_set: set[tuple[str, int, int, str, str]] = set()
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        if reader.fieldnames is None:
+            raise ValueError(f"REVEL training-variants file is empty: {path}")
+        missing = [c for c in REVEL_TRAINING_REQUIRED_COLS if c not in reader.fieldnames]
+        if missing:
+            raise ValueError(
+                f"REVEL training-variants file {path} is missing column(s): {', '.join(missing)}"
+            )
+
+        for row in reader:
+            chrom = (row.get("chromosome") or "").strip()
+            ref = (row.get("ref_allele") or "").strip().upper()
+            alt = (row.get("alt_allele") or "").strip().upper()
+            try:
+                start = int(float(row.get("hg38_start") or ""))
+                stop = int(float(row.get("hg38_end") or ""))
+            except ValueError:
+                continue
+            if not (chrom and ref and alt):
+                continue
+            training_set.add((chrom, start, stop, ref, alt))
+
+    logger.info("Loaded %d REVEL training-variant keys from %s", len(training_set), path)
+    return training_set
+
+
+MUTPRED2_TRAINING_QUALIFIED_COL = "hgvs_p"
+MUTPRED2_TRAINING_UNQUALIFIED_COLS = ["gene_symbol", "unqualified_hgvs_p"]
+
+
+def _load_mutpred2_training_variants(path: str) -> tuple[str, set]:
+    """Load a MutPred2 training-variant TSV, auto-detecting its join schema.
+
+    If the file has an ``hgvs_p`` column (a transcript/protein-accession-
+    qualified HGVS string, e.g. ``NP_000546.1:p.Asn1643His``), matching is
+    done on that full qualified string and gene symbols are ignored.
+    Otherwise the file must have ``gene_symbol`` and ``unqualified_hgvs_p``
+    columns, and matching is done on that pair.
+
+    Returns ``(schema, training_set)`` where *schema* is ``"qualified"`` or
+    ``"unqualified"``, and *training_set* holds either qualified hgvs_p
+    strings or ``(gene_symbol, unqualified_hgvs_p)`` tuples, respectively.
+    """
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        if reader.fieldnames is None:
+            raise ValueError(f"MutPred2 training-variants file is empty: {path}")
+        fieldnames = set(reader.fieldnames)
+
+        if MUTPRED2_TRAINING_QUALIFIED_COL in fieldnames:
+            schema = "qualified"
+            training_set: set = set()
+            for row in reader:
+                hgvs_p = (row.get(MUTPRED2_TRAINING_QUALIFIED_COL) or "").strip()
+                if hgvs_p:
+                    training_set.add(hgvs_p)
+        elif fieldnames.issuperset(MUTPRED2_TRAINING_UNQUALIFIED_COLS):
+            schema = "unqualified"
+            training_set = set()
+            for row in reader:
+                gene = (row.get("gene_symbol") or "").strip()
+                hgvs_p = (row.get("unqualified_hgvs_p") or "").strip()
+                if gene and hgvs_p:
+                    training_set.add((gene, hgvs_p))
+        else:
+            raise ValueError(
+                f"MutPred2 training-variants file {path} must have either an "
+                f"'{MUTPRED2_TRAINING_QUALIFIED_COL}' column or all of "
+                f"{MUTPRED2_TRAINING_UNQUALIFIED_COLS}"
+            )
+
+    logger.info(
+        "Loaded %d MutPred2 training-variant keys from %s (schema: %s)",
+        len(training_set), path, schema,
+    )
+    return schema, training_set
+
+
 # ---------------------------------------------------------------------------
 # Row-level annotation
 # ---------------------------------------------------------------------------
@@ -586,6 +779,11 @@ def annotate_row(
     mapped_hgvs_g_stop_col: Optional[str] = None,
     mapped_hgvs_g_ref_col: Optional[str] = None,
     mapped_hgvs_g_alt_col: Optional[str] = None,
+    revel_training_set: Optional[set[tuple[str, int, int, str, str]]] = None,
+    mutpred2_training_schema: Optional[str] = None,
+    mutpred2_training_set: Optional[set] = None,
+    gene_symbol_col: Optional[str] = None,
+    mapped_hgvs_p_col: Optional[str] = None,
 ) -> dict[str, str]:
     """Return annotation columns for a single row.
 
@@ -601,6 +799,14 @@ def annotate_row(
     REVEL/AlphaMissense. Otherwise, if *dbnsfp_path* is given, MutPred2 is
     treated as a protein-level model and a single score (the maximum across
     candidates) is emitted with no pipes.
+
+    Training-set overlap is optional and independent of the score sources
+    above. If *revel_training_set* is given, ``revel.train`` is looked up per
+    DNA candidate (genomic coordinates) and pipe-aligned like ``revel.score``.
+    If *mutpred2_training_set* is given, ``mutpred2.train`` is evaluated once
+    for the row (gene symbol + protein HGVS) and the same "true"/"false"
+    value is duplicated across all DNA candidates, since the match doesn't
+    vary per candidate.
     """
     g_candidates = _split_pipe((row.get(mapped_hgvs_g_col) or "").strip())
     c_candidates = (
@@ -610,14 +816,20 @@ def annotate_row(
     )
 
     mutpred2_alt_enabled = mutpred2_properties_cache is not None
+    revel_train_enabled = revel_training_set is not None
+    mutpred2_train_enabled = mutpred2_training_set is not None
+    need_geno_candidates = mutpred2_alt_enabled or revel_train_enabled
+
     variant_urn = ""
+    if mutpred2_alt_enabled:
+        variant_urn = (row.get(variant_urn_col) or "").strip() if variant_urn_col else ""
+
     chrom_candidates: list[str] = []
     start_candidates: list[str] = []
     stop_candidates: list[str] = []
     ref_candidates: list[str] = []
     alt_candidates: list[str] = []
-    if mutpred2_alt_enabled:
-        variant_urn = (row.get(variant_urn_col) or "").strip() if variant_urn_col else ""
+    if need_geno_candidates:
         if mapped_hgvs_g_chromosome_col:
             chrom_candidates = _split_pipe((row.get(mapped_hgvs_g_chromosome_col) or "").strip())
         if mapped_hgvs_g_start_col:
@@ -654,6 +866,7 @@ def annotate_row(
     am_class_vals: list[str] = []
     mutpred2_vals: list[str] = []
     mutpred2_alt_vals: list[str] = []
+    revel_train_vals: list[str] = []
 
     _mp2_cache: dict[tuple[str, int, str, str], Optional[str]] = (
         mutpred2_cache if mutpred2_cache is not None else {}
@@ -704,6 +917,17 @@ def annotate_row(
             if m is not None:
                 mutpred2_vals.append(m)
 
+        if revel_train_enabled:
+            is_train = _lookup_revel_train(
+                revel_training_set,  # type: ignore[arg-type]
+                chrom_candidates[i],
+                start_candidates[i],
+                stop_candidates[i],
+                ref_candidates[i],
+                alt_candidates[i],
+            )
+            revel_train_vals.append("true" if is_train else "false")
+
     sep = "|" if n > 1 else ""
     out: dict[str, str] = {}
     if revel_enabled:
@@ -719,6 +943,18 @@ def annotate_row(
         else:
             best_mp2 = ""
         out["mutpred2.score"] = best_mp2
+    if revel_train_enabled:
+        out["revel.train"] = sep.join(revel_train_vals)
+    if mutpred2_train_enabled:
+        gene_symbol = (row.get(gene_symbol_col) or "") if gene_symbol_col else ""
+        mapped_hgvs_p = (row.get(mapped_hgvs_p_col) or "") if mapped_hgvs_p_col else ""
+        is_train = _lookup_mutpred2_train(
+            mutpred2_training_schema,  # type: ignore[arg-type]
+            mutpred2_training_set,  # type: ignore[arg-type]
+            gene_symbol,
+            mapped_hgvs_p,
+        )
+        out["mutpred2.train"] = sep.join(["true" if is_train else "false"] * n)
     return out
 
 
@@ -794,7 +1030,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="mapped_hgvs_g_chromosome",
         help=(
             "Input column with pipe-delimited genomic chromosome(s), used as part of "
-            "the lookup key for --mutpred2-properties-file "
+            "the lookup key for --mutpred2-properties-file and --revel-training-file "
             "(default: mapped_hgvs_g_chromosome)"
         ),
     )
@@ -803,7 +1039,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="mapped_hgvs_g_start",
         help=(
             "Input column with pipe-delimited genomic start position(s), used as part "
-            "of the lookup key for --mutpred2-properties-file "
+            "of the lookup key for --mutpred2-properties-file and --revel-training-file "
             "(default: mapped_hgvs_g_start)"
         ),
     )
@@ -812,7 +1048,7 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="mapped_hgvs_g_stop",
         help=(
             "Input column with pipe-delimited genomic stop position(s), used as part "
-            "of the lookup key for --mutpred2-properties-file "
+            "of the lookup key for --mutpred2-properties-file and --revel-training-file "
             "(default: mapped_hgvs_g_stop)"
         ),
     )
@@ -821,7 +1057,8 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="mapped_hgvs_g_ref",
         help=(
             "Input column with pipe-delimited genomic ref allele(s), used as part of "
-            "the lookup key for --mutpred2-properties-file (default: mapped_hgvs_g_ref)"
+            "the lookup key for --mutpred2-properties-file and --revel-training-file "
+            "(default: mapped_hgvs_g_ref)"
         ),
     )
     p.add_argument(
@@ -829,7 +1066,50 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="mapped_hgvs_g_alt",
         help=(
             "Input column with pipe-delimited genomic alt allele(s), used as part of "
-            "the lookup key for --mutpred2-properties-file (default: mapped_hgvs_g_alt)"
+            "the lookup key for --mutpred2-properties-file and --revel-training-file "
+            "(default: mapped_hgvs_g_alt)"
+        ),
+    )
+    p.add_argument(
+        "--revel-training-file",
+        default=os.environ.get("REVEL_TRAINING_FILE"),
+        metavar="PATH",
+        help=(
+            "TSV of REVEL training variants with columns chromosome, hg38_start, "
+            "hg38_end, ref_allele, alt_allele (e.g. data/revel_training_variants.tsv). "
+            "Produces revel.train, looked up per reverse-translation candidate via the "
+            "--mapped-hgvs-g-*-col columns, pipe-aligned like revel.score. "
+            "Defaults to REVEL_TRAINING_FILE env var."
+        ),
+    )
+    p.add_argument(
+        "--mutpred2-training-file",
+        default=os.environ.get("MUTPRED2_TRAINING_FILE"),
+        metavar="PATH",
+        help=(
+            "TSV of MutPred2 training variants (e.g. data/mutpred2_training_variants.tsv), "
+            "either with an 'hgvs_p' column (transcript/protein-accession-qualified, "
+            "gene symbols ignored) or with 'gene_symbol' and 'unqualified_hgvs_p' columns. "
+            "Produces mutpred2.train, evaluated once per row via --gene-symbol-col and "
+            "--mapped-hgvs-p-col and duplicated across all DNA candidates. "
+            "Defaults to MUTPRED2_TRAINING_FILE env var."
+        ),
+    )
+    p.add_argument(
+        "--gene-symbol-col",
+        default="gene_symbol",
+        help=(
+            "Input column with the gene symbol, used as part of the lookup key for "
+            "--mutpred2-training-file when that file has no 'hgvs_p' column "
+            "(default: gene_symbol)"
+        ),
+    )
+    p.add_argument(
+        "--mapped-hgvs-p-col",
+        default="mapped_hgvs_p",
+        help=(
+            "Input column with protein HGVS value(s), used as part of the lookup key "
+            "for --mutpred2-training-file (default: mapped_hgvs_p)"
         ),
     )
     p.add_argument(
@@ -916,11 +1196,18 @@ def main(argv: Optional[list[str]] = None) -> None:
     revel_enabled = revel_path is not None or revel_file_cache is not None
     am_enabled = am_path is not None or am_file_cache is not None
 
-    if not revel_enabled and not am_enabled and dbnsfp_path is None and not mutpred2_properties_file:
+    if (
+        not revel_enabled
+        and not am_enabled
+        and dbnsfp_path is None
+        and not mutpred2_properties_file
+        and not args.revel_training_file
+        and not args.mutpred2_training_file
+    ):
         logger.error(
             "At least one of --revel-file, --revel-cache-file, --alphamissense-file, "
-            "--alphamissense-cache-file, --mutpred2-properties-file, or --dbnsfp-file "
-            "must be provided."
+            "--alphamissense-cache-file, --mutpred2-properties-file, --dbnsfp-file, "
+            "--revel-training-file, or --mutpred2-training-file must be provided."
         )
         raise SystemExit(1)
 
@@ -932,6 +1219,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         raise SystemExit(1)
     if mutpred2_properties_file and not Path(mutpred2_properties_file).exists():
         logger.error("MutPred2 properties file not found: %s", mutpred2_properties_file)
+        raise SystemExit(1)
+    if args.revel_training_file and not Path(args.revel_training_file).exists():
+        logger.error("REVEL training-variants file not found: %s", args.revel_training_file)
+        raise SystemExit(1)
+    if args.mutpred2_training_file and not Path(args.mutpred2_training_file).exists():
+        logger.error("MutPred2 training-variants file not found: %s", args.mutpred2_training_file)
         raise SystemExit(1)
 
     mutpred2_properties_cache: Optional[dict[tuple[str, str, int, int, str, str], str]] = None
@@ -945,6 +1238,17 @@ def main(argv: Optional[list[str]] = None) -> None:
     if dbnsfp_path is not None and not dbnsfp_path.exists():
         logger.error("dbNSFP file not found: %s", dbnsfp_path)
         raise SystemExit(1)
+
+    revel_training_set: Optional[set[tuple[str, int, int, str, str]]] = None
+    if args.revel_training_file:
+        revel_training_set = _load_revel_training_variants(args.revel_training_file)
+
+    mutpred2_training_schema: Optional[str] = None
+    mutpred2_training_set: Optional[set] = None
+    if args.mutpred2_training_file:
+        mutpred2_training_schema, mutpred2_training_set = _load_mutpred2_training_variants(
+            args.mutpred2_training_file
+        )
 
     # Only require tabix when at least one tabix-indexed file is configured.
     if revel_path is not None or am_path is not None or dbnsfp_path is not None:
@@ -965,6 +1269,10 @@ def main(argv: Optional[list[str]] = None) -> None:
         ann_cols.extend(ALPHAMISSENSE_COLS)
     if mutpred2_enabled:
         ann_cols.extend(DBNSFP_COLS)
+    if revel_training_set is not None:
+        ann_cols.extend(REVEL_TRAIN_COLS)
+    if mutpred2_training_set is not None:
+        ann_cols.extend(MUTPRED2_TRAIN_COLS)
 
     revel_cache: dict[tuple[str, int, str, str], Optional[str]] = {}
     am_cache: dict[tuple[str, int, str, str], Optional[tuple[str, str]]] = {}
@@ -974,6 +1282,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     scored_revel = 0
     scored_am = 0
     scored_mutpred2 = 0
+    revel_train_rows_matched = 0
+    revel_train_variants_matched = 0
+    revel_train_variants_total = 0
+    mutpred2_train_rows_matched = 0
+    mutpred2_train_variants_matched = 0
+    mutpred2_train_variants_total = 0
     started = time.monotonic()
 
     with input_path.open("r", encoding="utf-8", newline="") as in_fh, \
@@ -1022,6 +1336,11 @@ def main(argv: Optional[list[str]] = None) -> None:
                 mapped_hgvs_g_stop_col=args.mapped_hgvs_g_stop_col,
                 mapped_hgvs_g_ref_col=args.mapped_hgvs_g_ref_col,
                 mapped_hgvs_g_alt_col=args.mapped_hgvs_g_alt_col,
+                revel_training_set=revel_training_set,
+                mutpred2_training_schema=mutpred2_training_schema,
+                mutpred2_training_set=mutpred2_training_set,
+                gene_symbol_col=args.gene_symbol_col,
+                mapped_hgvs_p_col=args.mapped_hgvs_p_col,
             )
             row.update(ann)
             writer.writerow(row)
@@ -1033,6 +1352,20 @@ def main(argv: Optional[list[str]] = None) -> None:
                 scored_am += 1
             if mutpred2_enabled and row.get("mutpred2.score"):
                 scored_mutpred2 += 1
+            if revel_training_set is not None:
+                vals = ann["revel.train"].split("|")
+                n_true = vals.count("true")
+                revel_train_variants_total += len(vals)
+                revel_train_variants_matched += n_true
+                if n_true:
+                    revel_train_rows_matched += 1
+            if mutpred2_training_set is not None:
+                vals = ann["mutpred2.train"].split("|")
+                n_true = vals.count("true")
+                mutpred2_train_variants_total += len(vals)
+                mutpred2_train_variants_matched += n_true
+                if n_true:
+                    mutpred2_train_rows_matched += 1
 
             if processed % 1000 == 0:
                 elapsed = max(time.monotonic() - started, 1e-9)
@@ -1062,6 +1395,31 @@ def main(argv: Optional[list[str]] = None) -> None:
         logger.info(
             "MutPred2 (dbNSFP): %d/%d rows scored (cache: %d unique SNVs queried)",
             scored_mutpred2, processed, len(mutpred2_cache),
+        )
+    if revel_training_set is not None:
+        logger.info(
+            "REVEL training-set overlap: %d/%d assayed variants matched "
+            "(%d/%d genomic variants); joined on %s/%s/%s/%s/%s vs. REVEL-training "
+            "chromosome/hg38_start/hg38_end/ref_allele/alt_allele",
+            revel_train_rows_matched, processed,
+            revel_train_variants_matched, revel_train_variants_total,
+            args.mapped_hgvs_g_chromosome_col, args.mapped_hgvs_g_start_col,
+            args.mapped_hgvs_g_stop_col, args.mapped_hgvs_g_ref_col, args.mapped_hgvs_g_alt_col,
+        )
+    if mutpred2_training_set is not None:
+        if mutpred2_training_schema == "qualified":
+            join_desc = f"{args.mapped_hgvs_p_col} vs. MutPred2-training hgvs_p (qualified; gene symbols ignored)"
+        else:
+            join_desc = (
+                f"{args.gene_symbol_col}/{args.mapped_hgvs_p_col} vs. "
+                "MutPred2-training gene_symbol/unqualified_hgvs_p"
+            )
+        logger.info(
+            "MutPred2 training-set overlap: %d/%d assayed variants matched "
+            "(%d/%d genomic variants); joined on %s",
+            mutpred2_train_rows_matched, processed,
+            mutpred2_train_variants_matched, mutpred2_train_variants_total,
+            join_desc,
         )
     logger.info(
         "Done. %d rows written to %s (%.1f rows/s)",
