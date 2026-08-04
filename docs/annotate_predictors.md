@@ -174,7 +174,7 @@ The input delimiter is auto-detected from the file extension (`.tsv`/`.txt` → 
 ## Dependencies
 
 - **`tabix`** (htslib) — required when any tabix-indexed data file is configured (`--revel-file`, `--alphamissense-file`, `--dbnsfp-file`). Not required when running with file-based caches alone. The script verifies `tabix` is available at startup only when needed.
-- No additional Python library dependencies.
+- **`pandas`** — used to load `--mutpred2-properties-file` (a multi-column, often multi-million-row CSV) with its C parser rather than a per-row Python loop. Not required for any other code path.
 
 ---
 

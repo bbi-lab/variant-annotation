@@ -83,7 +83,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import gzip
 from itertools import islice
 import logging
 import os
@@ -92,6 +91,8 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Optional
+
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -507,63 +508,51 @@ def _load_mutpred2_properties_file_cache(
     repeat across multiple reverse-translation candidates; each is keyed
     separately on ``(variant_urn, chrom, start, stop, ref, alt)``.
 
-    Transparently handles gzip-compressed input (``.gz`` suffix).
+    Transparently handles gzip-compressed input (``.gz`` suffix). Uses
+    pandas' C parser (reading only the required columns) rather than a
+    per-row Python loop, since this file commonly has well over a million
+    rows and the naive loop dominates startup time.
     """
-    opener = gzip.open if str(path).endswith(".gz") else open
-    cache: dict[tuple[str, str, int, int, str, str], str] = {}
+    try:
+        header_cols = pd.read_csv(path, nrows=0).columns
+    except pd.errors.EmptyDataError:
+        raise ValueError(f"MutPred2 properties file is empty: {path}")
 
-    with opener(path, "rt", newline="", encoding="utf-8") as fh:  # type: ignore[operator]
-        reader = csv.reader(fh)
-        try:
-            header = next(reader)
-        except StopIteration:
-            raise ValueError(f"MutPred2 properties file is empty: {path}")
+    missing = [c for c in MUTPRED2_PROPERTIES_REQUIRED_COLS if c not in header_cols]
+    if missing:
+        raise ValueError(
+            f"MutPred2 properties file {path} is missing column(s): {', '.join(missing)}"
+        )
 
-        col_idx = {name.strip(): i for i, name in enumerate(header)}
-        missing = [c for c in MUTPRED2_PROPERTIES_REQUIRED_COLS if c not in col_idx]
-        if missing:
-            raise ValueError(
-                f"MutPred2 properties file {path} is missing column(s): {', '.join(missing)}"
-            )
+    df = pd.read_csv(
+        path,
+        usecols=MUTPRED2_PROPERTIES_REQUIRED_COLS,
+        dtype=str,
+        na_filter=False,
+    )
+    n_rows = len(df)
 
-        urn_i = col_idx["mavedb_variant_urn"]
-        chrom_i = col_idx["Chrom"]
-        start_i = col_idx["hg38_start"]
-        stop_i = col_idx["hg38_end"]
-        ref_i = col_idx["ref_allele"]
-        alt_i = col_idx["alt_allele"]
-        score_i = col_idx["MutPred2 score"]
-        n_cols_needed = max(urn_i, chrom_i, start_i, stop_i, ref_i, alt_i, score_i) + 1
+    urn = df["mavedb_variant_urn"].str.strip()
+    score = df["MutPred2 score"].str.strip()
+    start = pd.to_numeric(df["hg38_start"], errors="coerce")
+    stop = pd.to_numeric(df["hg38_end"], errors="coerce")
 
-        n_rows = 0
-        n_skipped = 0
-        for fields in reader:
-            n_rows += 1
-            if len(fields) < n_cols_needed:
-                n_skipped += 1
-                continue
-            urn = fields[urn_i].strip()
-            score = fields[score_i].strip()
-            if not urn or not score:
-                n_skipped += 1
-                continue
-            try:
-                start = int(fields[start_i])
-                stop = int(fields[stop_i])
-            except ValueError:
-                n_skipped += 1
-                continue
-            key = (
-                urn,
-                fields[chrom_i].strip(),
-                start,
-                stop,
-                fields[ref_i].strip().upper(),
-                fields[alt_i].strip().upper(),
-            )
-            cache[key] = score
-            if n_rows % 200_000 == 0:
-                logger.info("MutPred2 properties file: %d rows scanned...", n_rows)
+    valid = (urn != "") & (score != "") & start.notna() & stop.notna()
+    n_skipped = n_rows - int(valid.sum())
+
+    chrom = df["Chrom"].str.strip()[valid]
+    ref = df["ref_allele"].str.strip().str.upper()[valid]
+    alt = df["alt_allele"].str.strip().str.upper()[valid]
+
+    keys = zip(
+        urn[valid].tolist(),
+        chrom.tolist(),
+        start[valid].astype(int).tolist(),
+        stop[valid].astype(int).tolist(),
+        ref.tolist(),
+        alt.tolist(),
+    )
+    cache: dict[tuple[str, str, int, int, str, str], str] = dict(zip(keys, score[valid].tolist()))
 
     logger.info(
         "Loaded %d MutPred2 file-cache entries from %s (%d rows scanned, %d skipped)",
