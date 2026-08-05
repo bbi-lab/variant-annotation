@@ -4,6 +4,8 @@
 
 Annotates each variant with pre-computed in-silico pathogenicity scores from computational predictors. All currently supported predictors score **missense SNVs only** (GRCh38); other variant types (indels, synonymous substitutions, splice-site variants, etc.) receive empty annotation columns.
 
+Tabix queries (REVEL, AlphaMissense, dbNSFP) use thread-local `pysam.TabixFile` handles when pysam is available, falling back to subprocess `tabix` otherwise. `--max-workers N` (N > 1) parallelizes those lookups across threads within a single process: a first pass collects all unique SNVs in the input, looks them up concurrently, then a second pass streams the annotated output.
+
 At least one of `--revel-file`, `--revel-cache-file`, `--alphamissense-file`, `--alphamissense-cache-file`, `--mutpred2-properties-file`, `--dbnsfp-file`, `--revel-training-file`, or `--mutpred2-training-file` must be supplied.
 
 ---
@@ -218,6 +220,7 @@ src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
 | `--limit N` | — | no limit | Stop after N rows |
 | `--log-level` | — | `INFO` | Logging verbosity |
 | `--csv-field-size-limit BYTES` | — | system default | Increase for large fields |
+| `--max-workers N` | — | `1` | Parallel tabix lookup threads for REVEL/AlphaMissense/dbNSFP. No effect on `--mutpred2-properties-file`, `--revel-training-file`, or `--mutpred2-training-file`, which don't use tabix |
 
 The input delimiter is auto-detected from the file extension (`.tsv`/`.txt` → tab; otherwise comma). Output delimiter matches.
 
@@ -226,6 +229,7 @@ The input delimiter is auto-detected from the file extension (`.tsv`/`.txt` → 
 ## Dependencies
 
 - **`tabix`** (htslib) — required when any tabix-indexed data file is configured (`--revel-file`, `--alphamissense-file`, `--dbnsfp-file`). Not required when running with file-based caches alone. The script verifies `tabix` is available at startup only when needed.
+- **`pysam`** (optional but recommended) — enables faster thread-local tabix handles, avoiding subprocess overhead per lookup, and is required for `--max-workers` to actually run lookups in parallel (without it, per-query subprocess spawns serialize under the GIL). If pysam is not installed, every tabix query spawns a subprocess.
 - **`pandas`** — used to load `--mutpred2-properties-file` (a multi-column, often multi-million-row CSV) with its C parser rather than a per-row Python loop. Not required for any other code path.
 
 ---
@@ -256,6 +260,10 @@ dbNSFP stores multiple MutPred2 scores per row (one per transcript), semicolon-s
 **MutPred2 (properties file): candidate not found**
 
 Confirm `--variant-urn-col` and the `--mapped-hgvs-g-*-col` columns are populated and match the `mavedb_variant_urn` / `Chrom` / `hg38_start` / `hg38_end` / `ref_allele` / `alt_allele` values in the properties file exactly (chromosome is tried with and without a `chr` prefix, but positions and alleles must match verbatim).
+
+**Slow tabix lookups (REVEL/AlphaMissense/dbNSFP)**
+
+Ensure `pysam` is installed so lookups use thread-local `TabixFile` handles instead of spawning a `tabix` subprocess per query — this alone is typically the largest speedup. Then increase `--max-workers` to parallelize those lookups across threads within the process, rather than splitting the input and running multiple separate processes.
 
 **`revel.train` / `mutpred2.train` are always `false`**
 

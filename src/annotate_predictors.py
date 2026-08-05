@@ -34,6 +34,19 @@ At least one of --revel-file, --alphamissense-file, --mutpred2-properties-file,
 --dbnsfp-file, --revel-training-file, or --mutpred2-training-file is required.
 
 
+Performance
+-----------
+
+Tabix lookups (REVEL, AlphaMissense, dbNSFP) use pysam's ``TabixFile`` when
+pysam is installed, avoiding a subprocess spawn per lookup; a subprocess
+fallback runs otherwise. --max-workers N (N > 1) runs those lookups
+concurrently across threads within this one process: a first pass over the
+input collects all unique SNVs, looks them up in a thread pool, then a
+second pass streams the input and annotates from the now-warm cache. This
+gets the throughput benefit of running multiple processes over split input
+without the split/merge step or the repeated cache-loading cost.
+
+
 Training-set overlap (optional)
 --------------------------------
 
@@ -110,13 +123,18 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+# Thread-local pysam.TabixFile handles; avoids spawning a subprocess per lookup.
+_tabix_local = threading.local()
 
 NC_TO_CHROM_GRCH38: dict[str, str] = {
     "NC_000001.11": "1",
@@ -170,8 +188,40 @@ def _chrom_candidates(chrom: str) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
+def _get_tabix_handle(path: Path) -> Optional[Any]:
+    """Return a thread-local ``pysam.TabixFile`` handle, opening it lazily.
+
+    Returns ``None`` when pysam is unavailable; the caller falls back to
+    spawning a subprocess in that case.
+    """
+    try:
+        import pysam  # type: ignore[import]
+    except ImportError:
+        return None
+    handles: Optional[dict[str, Any]] = getattr(_tabix_local, "handles", None)
+    if handles is None:
+        _tabix_local.handles = {}  # type: ignore[attr-defined]
+        handles = _tabix_local.handles
+    key = str(path.resolve())
+    if key not in handles:
+        handles[key] = pysam.TabixFile(str(path))
+    return handles[key]
+
+
 def _run_tabix(path: Path, chrom: str, pos: int) -> list[str]:
-    """Return non-comment lines from a tabix point query at *chrom*:*pos*."""
+    """Return non-comment lines from a tabix point query at *chrom*:*pos*.
+
+    Uses a thread-local ``pysam.TabixFile`` handle when pysam is available
+    (avoids spawning a ``tabix`` subprocess per lookup, and lets concurrent
+    lookups run in parallel across threads within one process); falls back
+    to shelling out to the ``tabix`` binary otherwise.
+    """
+    handle = _get_tabix_handle(path)
+    if handle is not None:
+        try:
+            return list(handle.fetch(chrom, pos - 1, pos))
+        except (ValueError, KeyError):
+            return []
     region = f"{chrom}:{pos}-{pos}"
     proc = subprocess.run(
         ["tabix", str(path), region],
@@ -959,6 +1009,74 @@ def annotate_row(
 
 
 # ---------------------------------------------------------------------------
+# Parallel tabix prefetch (--max-workers > 1)
+# ---------------------------------------------------------------------------
+
+def _collect_needed_snv_keys(
+    rows: Any,
+    *,
+    nc_to_chrom: dict[str, str],
+    mapped_hgvs_g_col: str,
+    mapped_hgvs_c_col: Optional[str],
+    revel_enabled: bool,
+    revel_file_cache: Optional[dict[str, str]],
+    am_enabled: bool,
+    am_file_cache: Optional[dict[str, tuple[str, str]]],
+    mutpred2_dbnsfp_enabled: bool,
+) -> tuple[set[tuple[str, int, str, str]], set[tuple[str, int, str, str]], set[tuple[str, int, str, str]]]:
+    """Scan *rows* and return the unique SNV keys that will need a tabix lookup.
+
+    Mirrors the candidate-splitting logic in :func:`annotate_row`, but only
+    for the g./c. HGVS columns that feed REVEL/AlphaMissense/dbNSFP — the
+    other lookups (MutPred2-properties-file, training-set overlap) are plain
+    dict/set lookups and don't benefit from tabix prefetching.
+    """
+    revel_needed: set[tuple[str, int, str, str]] = set()
+    am_needed: set[tuple[str, int, str, str]] = set()
+    mp2_needed: set[tuple[str, int, str, str]] = set()
+
+    for row in rows:
+        g_candidates = _split_pipe((row.get(mapped_hgvs_g_col) or "").strip())
+        c_candidates = (
+            _split_pipe((row.get(mapped_hgvs_c_col) or "").strip())
+            if mapped_hgvs_c_col
+            else []
+        )
+        for i, hgvs_g in enumerate(g_candidates):
+            if not hgvs_g:
+                continue
+            snv = _snv_from_hgvs_g(hgvs_g, nc_to_chrom)
+            if snv is None:
+                continue
+            hgvs_c = c_candidates[i] if i < len(c_candidates) else ""
+
+            if revel_enabled and not (hgvs_c and revel_file_cache is not None and hgvs_c in revel_file_cache):
+                revel_needed.add(snv)
+            if am_enabled and not (hgvs_c and am_file_cache is not None and hgvs_c in am_file_cache):
+                am_needed.add(snv)
+            if mutpred2_dbnsfp_enabled:
+                mp2_needed.add(snv)
+
+    return revel_needed, am_needed, mp2_needed
+
+
+def _prefetch_into_cache(
+    keys: set[tuple[str, int, str, str]],
+    lookup_one: Any,
+    max_workers: int,
+) -> dict[tuple[str, int, str, str], Any]:
+    """Run *lookup_one* over *keys* concurrently and return a key -> result dict."""
+    if not keys:
+        return {}
+    keys_list = list(keys)
+    results: dict[tuple[str, int, str, str], Any] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for key, value in zip(keys_list, executor.map(lookup_one, keys_list)):
+            results[key] = value
+    return results
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1169,6 +1287,19 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         metavar="BYTES",
         help="Maximum per-field character length for CSV/TSV parsing (default: %(default)s)",
     )
+    p.add_argument(
+        "--max-workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Number of parallel tabix lookup threads for REVEL/AlphaMissense/dbNSFP "
+            "(default: 1). Values >1 make a first pass over the input to collect all "
+            "unique SNVs, look them up concurrently, then annotate in a second pass. "
+            "No effect on --mutpred2-properties-file, --revel-training-file, or "
+            "--mutpred2-training-file, which don't use tabix."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -1277,6 +1408,53 @@ def main(argv: Optional[list[str]] = None) -> None:
     revel_cache: dict[tuple[str, int, str, str], Optional[str]] = {}
     am_cache: dict[tuple[str, int, str, str], Optional[tuple[str, str]]] = {}
     mutpred2_cache: dict[tuple[str, int, str, str], Optional[str]] = {}
+
+    mutpred2_dbnsfp_enabled = dbnsfp_path is not None and mutpred2_properties_cache is None
+    if args.max_workers > 1 and (revel_path is not None or am_path is not None or mutpred2_dbnsfp_enabled):
+        logger.info("Prefetch pass: scanning input for unique SNVs (max_workers=%d)…", args.max_workers)
+        with input_path.open("r", encoding="utf-8", newline="") as scan_fh:
+            scan_reader = csv.DictReader(scan_fh, delimiter=delim)
+            scan_rows = islice(
+                scan_reader,
+                args.skip,
+                None if args.limit is None else args.skip + args.limit,
+            )
+            revel_needed, am_needed, mp2_needed = _collect_needed_snv_keys(
+                scan_rows,
+                nc_to_chrom=NC_TO_CHROM_GRCH38,
+                mapped_hgvs_g_col=args.mapped_hgvs_g_col,
+                mapped_hgvs_c_col=args.mapped_hgvs_c_col,
+                revel_enabled=revel_path is not None,
+                revel_file_cache=revel_file_cache,
+                am_enabled=am_path is not None,
+                am_file_cache=am_file_cache,
+                mutpred2_dbnsfp_enabled=mutpred2_dbnsfp_enabled,
+            )
+
+        logger.info(
+            "Prefetch pass: %d unique REVEL / %d AlphaMissense / %d MutPred2(dbNSFP) SNVs to look up",
+            len(revel_needed), len(am_needed), len(mp2_needed),
+        )
+        prefetch_started = time.monotonic()
+        if revel_needed:
+            revel_cache.update(_prefetch_into_cache(
+                revel_needed,
+                lambda key: _lookup_revel(revel_path, key[0], key[1], key[2], key[3], {}),  # type: ignore[arg-type]
+                args.max_workers,
+            ))
+        if am_needed:
+            am_cache.update(_prefetch_into_cache(
+                am_needed,
+                lambda key: _lookup_alphamissense(am_path, key[0], key[1], key[2], key[3], {}),  # type: ignore[arg-type]
+                args.max_workers,
+            ))
+        if mp2_needed:
+            mutpred2_cache.update(_prefetch_into_cache(
+                mp2_needed,
+                lambda key: _lookup_mutpred2(dbnsfp_path, key[0], key[1], key[2], key[3], {}),  # type: ignore[arg-type]
+                args.max_workers,
+            ))
+        logger.info("Prefetch pass complete in %.1fs.", time.monotonic() - prefetch_started)
 
     processed = 0
     scored_revel = 0
