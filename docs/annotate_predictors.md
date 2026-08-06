@@ -35,7 +35,8 @@ The two training-set columns are independent, optional additions — they can be
 When a row has multiple DNA candidates (pipe-delimited `mapped_hgvs_g`):
 
 - **REVEL** and **AlphaMissense** columns are pipe-aligned to the input candidates — each candidate gets its own score value (or empty if not an SNV or not found).
-- **MutPred2 (properties file)** is looked up per reverse-translation candidate, keyed on `variant_urn` plus the genomic coordinates for that candidate (chromosome, start, stop, ref, alt), so it is pipe-aligned like REVEL/AlphaMissense. A candidate absent from the properties file produces an empty slot rather than being dropped.
+- **MutPred2 (properties file, `--mutpred2-properties-join-key genomic`, the default)** is looked up per reverse-translation candidate, keyed on `variant_urn` plus the genomic coordinates for that candidate (chromosome, start, stop, ref, alt), so it is pipe-aligned like REVEL/AlphaMissense. A candidate absent from the properties file produces an empty slot rather than being dropped.
+- **MutPred2 (properties file, `--mutpred2-properties-join-key gene-aa`)** is looked up once per row on gene symbol + amino-acid substitution (e.g. `T2A`), since MutPred2 is protein-level and the key doesn't vary across DNA reverse-translation candidates. That single score is then duplicated across every pipe slot, so `mutpred2.score` is still pipe-aligned like the genomic join — except that `--mutpred2-gene-aa-long-indels ignore` blanks the slot for any candidate whose genomic ref or alt allele exceeds 3bp (see below).
 - **MutPred2 (dbNSFP, legacy)** is treated as a protein-level model there: all reverse-translation candidates encode the same amino acid substitution, so a single maximum score across all SNV candidates is emitted (not pipe-delimited).
 - **`revel.train`** is looked up per candidate by genomic coordinates, like REVEL/AlphaMissense scores, and is `true`/`false` per pipe slot.
 - **`mutpred2.train`** is protein-level like MutPred2 via dbNSFP, but for consistency with the other pipe-aligned columns it is still emitted once per DNA candidate — the same `true`/`false` value is duplicated across every pipe slot in the row.
@@ -114,6 +115,23 @@ If `--mapped-hgvs-p-col` itself holds a pipe-delimited value (e.g. multiple tran
 
 ---
 
+## Gene-symbol mapping file (gene-AA join only)
+
+With `--mutpred2-properties-join-key gene-aa`, the input's gene symbol (`--gene-symbol-col`) and the properties file's `gene_symbol` column are expected to name the same gene the same way. When they don't — e.g. a combined-target dataset assayed as `CALM1_2_3` in the input but scored under `CALM1` in the properties file's `gene_symbol` column — `--mutpred2-gene-symbol-map-file` remaps the input's gene symbol before the `(gene, AA)` lookup.
+
+A two-column tab-separated file (header required):
+
+| Column | Description |
+|---|---|
+| `gene_symbol` | Gene symbol as it appears via `--gene-symbol-col` in the input |
+| `mutpred2_gene_symbol` | The corresponding gene symbol used in `--mutpred2-properties-file` |
+
+Only genes that actually differ need an entry — any gene symbol absent from the map is looked up unchanged. A repeated `gene_symbol` keeps its last row's mapping.
+
+Passed via `--mutpred2-gene-symbol-map-file PATH` or the `MUTPRED2_GENE_SYMBOL_MAP_FILE` environment variable. No effect with `--mutpred2-properties-join-key genomic`.
+
+---
+
 ## Data file preparation
 
 ### AlphaMissense
@@ -143,7 +161,9 @@ If `--mapped-hgvs-p-col` itself holds a pipe-delimited value (e.g. multiple tran
 
 ### MutPred2 (via properties file)
 
-A MaveDB-derived per-DNA-variant properties table (CSV, optionally gzipped) with (at least) these columns:
+A MaveDB-derived per-DNA-variant properties table (CSV, optionally gzipped). `--mutpred2-properties-join-key` selects which columns are required and how rows are joined:
+
+**`genomic` (default)**
 
 | Column | Description |
 |---|---|
@@ -155,7 +175,21 @@ A MaveDB-derived per-DNA-variant properties table (CSV, optionally gzipped) with
 | `alt_allele` | Alternate allele |
 | `MutPred2 score` | Pre-computed MutPred2 score |
 
-The same `mavedb_variant_urn` can repeat across multiple rows (one per DNA reverse-translation candidate); each is keyed separately on `(variant_urn, chrom, start, stop, ref, alt)`. No further preparation required beyond having the file on disk.
+The same `mavedb_variant_urn` can repeat across multiple rows (one per DNA reverse-translation candidate); each is keyed separately on `(variant_urn, chrom, start, stop, ref, alt)`.
+
+**`gene-aa`**
+
+| Column | Description |
+|---|---|
+| `gene_symbol` | Gene symbol. (The file's `Gene` column, which occasionally lists multiple genes for a combined-target dataset, e.g. `CALM1, CALM2, CALM3`, is ignored — use `--mutpred2-gene-symbol-map-file` if the input's gene symbol doesn't match `gene_symbol` directly.) |
+| `AA` | Amino-acid substitution in short form, ref+pos+alt (e.g. `T2A`) |
+| `MutPred2 score` | Pre-computed MutPred2 score |
+
+Since MutPred2 is a protein-level model, this join only needs one score per `(gene, AA)` regardless of which `mavedb_variant_urn` or DNA reverse-translation candidate it came from. On the input side, the `(gene, AA)` key is built from `--gene-symbol-col` and the `--mapped-hgvs-p-ref-col`/`--mapped-hgvs-p-start-col`/`--mapped-hgvs-p-alt-col` columns (already-split single-letter ref/pos/alt, not the qualified 3-letter `mapped_hgvs_p` HGVS string).
+
+By default (`--mutpred2-gene-aa-long-indels annotate`) the row's score is applied to every DNA reverse-translation candidate, even a large indel/delins whose codon representation barely resembles the assayed substitution. Pass `--mutpred2-gene-aa-long-indels ignore` to blank the slot instead for any candidate whose genomic ref or alt allele (`--mapped-hgvs-g-ref-col`/`--mapped-hgvs-g-alt-col`) exceeds 3bp — i.e. `max(len(ref), len(alt)) > 3`.
+
+No further preparation required beyond having the file on disk, for either join key.
 
 ### MutPred2 (via dbNSFP, legacy)
 
@@ -186,6 +220,27 @@ src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
   --alphamissense-file AlphaMissense_hg38.tsv.gz \
   --mutpred2-properties-file data_frame_missense_variants_MP2_properties.csv.gz
 
+# MutPred2 via properties file, joined on gene + amino-acid substitution instead
+# of genomic coordinates (one score computed per row, then pipe-aligned like
+# the genomic join)
+src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
+  --mutpred2-properties-file data_frame_missense_variants_MP2_properties.csv.gz \
+  --mutpred2-properties-join-key gene-aa
+
+# Same, but blank out candidates whose genomic ref/alt allele exceeds 3bp
+# (large indels/delins) instead of giving them the row's score
+src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
+  --mutpred2-properties-file data_frame_missense_variants_MP2_properties.csv.gz \
+  --mutpred2-properties-join-key gene-aa \
+  --mutpred2-gene-aa-long-indels ignore
+
+# Gene-aa join with a gene-symbol map for combined-target datasets
+# (e.g. CALM1_2_3 in the input -> CALM1 in the properties file)
+src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
+  --mutpred2-properties-file data_frame_missense_variants_MP2_properties.csv.gz \
+  --mutpred2-properties-join-key gene-aa \
+  --mutpred2-gene-symbol-map-file data/mutpred2_gene_symbol_map.tsv
+
 # Training-set overlap flags only, no scores
 src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
   --revel-training-file data/revel_training_variants.tsv \
@@ -204,16 +259,22 @@ src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
 | `--alphamissense-cache-file PATH` | `ALPHAMISSENSE_CACHE_FILE` | — | Three-column TSV `(hgvs, alphamissense.pathogenicity, alphamissense.class)` pre-loaded as a file-based AlphaMissense cache; checked before tabix |
 | `--dbnsfp-file PATH` | `DBNSFP_FILE` | — | bgzipped, tabix-indexed dbNSFP GRCh38 variant file. Ignored if `--mutpred2-properties-file` is also given |
 | `--mutpred2-properties-file PATH` | `MUTPRED2_PROPERTIES_FILE` | — | MaveDB MP2-properties CSV (optionally gzipped); preferred source for `mutpred2.score`, takes precedence over `--dbnsfp-file` |
+| `--mutpred2-properties-join-key {genomic,gene-aa}` | — | `genomic` | How `--mutpred2-properties-file` is joined: `genomic` (variant_urn + genomic coordinates, pipe-aligned) or `gene-aa` (gene symbol + amino-acid substitution, one score per row) |
+| `--mutpred2-gene-aa-long-indels {annotate,ignore}` | — | `annotate` | With the `gene-aa` join key, whether candidates with a genomic ref/alt allele over 3bp still get the row's `mutpred2.score` (`annotate`) or an empty slot (`ignore`). No effect with the `genomic` join key or `--dbnsfp-file` |
+| `--mutpred2-gene-symbol-map-file PATH` | `MUTPRED2_GENE_SYMBOL_MAP_FILE` | — | With the `gene-aa` join key, TSV (`gene_symbol`, `mutpred2_gene_symbol`) remapping input gene symbols to the properties file's naming before the lookup. No effect with the `genomic` join key |
 | `--revel-training-file PATH` | `REVEL_TRAINING_FILE` | — | TSV of REVEL training variants (genomic coordinates); produces `revel.train` |
 | `--mutpred2-training-file PATH` | `MUTPRED2_TRAINING_FILE` | — | TSV of MutPred2 training variants (`hgvs_p`, or `gene_symbol` + `unqualified_hgvs_p`); produces `mutpred2.train` |
-| `--variant-urn-col COL` | — | `variant_urn` | Input column with the MaveDB variant URN, used as part of the lookup key for `--mutpred2-properties-file` |
-| `--mapped-hgvs-g-chromosome-col COL` | — | `mapped_hgvs_g_chromosome` | Input column with pipe-delimited genomic chromosome(s), used as part of the lookup key for `--mutpred2-properties-file` and `--revel-training-file` |
-| `--mapped-hgvs-g-start-col COL` | — | `mapped_hgvs_g_start` | Input column with pipe-delimited genomic start position(s), used as part of the lookup key for `--mutpred2-properties-file` and `--revel-training-file` |
-| `--mapped-hgvs-g-stop-col COL` | — | `mapped_hgvs_g_stop` | Input column with pipe-delimited genomic stop position(s), used as part of the lookup key for `--mutpred2-properties-file` and `--revel-training-file` |
-| `--mapped-hgvs-g-ref-col COL` | — | `mapped_hgvs_g_ref` | Input column with pipe-delimited genomic ref allele(s), used as part of the lookup key for `--mutpred2-properties-file` and `--revel-training-file` |
-| `--mapped-hgvs-g-alt-col COL` | — | `mapped_hgvs_g_alt` | Input column with pipe-delimited genomic alt allele(s), used as part of the lookup key for `--mutpred2-properties-file` and `--revel-training-file` |
-| `--gene-symbol-col COL` | — | `gene_symbol` | Input column with the gene symbol, used for `--mutpred2-training-file` when that file has no `hgvs_p` column |
+| `--variant-urn-col COL` | — | `variant_urn` | Input column with the MaveDB variant URN, used as part of the lookup key for `--mutpred2-properties-file` with `--mutpred2-properties-join-key genomic` |
+| `--mapped-hgvs-g-chromosome-col COL` | — | `mapped_hgvs_g_chromosome` | Input column with pipe-delimited genomic chromosome(s), used as part of the lookup key for `--mutpred2-properties-file` (genomic join) and `--revel-training-file` |
+| `--mapped-hgvs-g-start-col COL` | — | `mapped_hgvs_g_start` | Input column with pipe-delimited genomic start position(s), used as part of the lookup key for `--mutpred2-properties-file` (genomic join) and `--revel-training-file` |
+| `--mapped-hgvs-g-stop-col COL` | — | `mapped_hgvs_g_stop` | Input column with pipe-delimited genomic stop position(s), used as part of the lookup key for `--mutpred2-properties-file` (genomic join) and `--revel-training-file` |
+| `--mapped-hgvs-g-ref-col COL` | — | `mapped_hgvs_g_ref` | Input column with pipe-delimited genomic ref allele(s), used as part of the lookup key for `--mutpred2-properties-file` (genomic join) and `--revel-training-file` |
+| `--mapped-hgvs-g-alt-col COL` | — | `mapped_hgvs_g_alt` | Input column with pipe-delimited genomic alt allele(s), used as part of the lookup key for `--mutpred2-properties-file` (genomic join) and `--revel-training-file` |
+| `--gene-symbol-col COL` | — | `gene_symbol` | Input column with the gene symbol, used for `--mutpred2-training-file` when that file has no `hgvs_p` column, and for `--mutpred2-properties-file` with `--mutpred2-properties-join-key gene-aa` |
 | `--mapped-hgvs-p-col COL` | — | `mapped_hgvs_p` | Input column with protein HGVS value(s), used as part of the lookup key for `--mutpred2-training-file` |
+| `--mapped-hgvs-p-ref-col COL` | — | `mapped_hgvs_p_ref` | Input column with the single-letter reference amino acid, used with `--mapped-hgvs-p-start-col`/`--mapped-hgvs-p-alt-col` to build the AA substitution key (e.g. `T2A`) for `--mutpred2-properties-file` with `--mutpred2-properties-join-key gene-aa` |
+| `--mapped-hgvs-p-start-col COL` | — | `mapped_hgvs_p_start` | Input column with the amino acid position, used as part of the AA substitution key for `--mutpred2-properties-file` with `--mutpred2-properties-join-key gene-aa` |
+| `--mapped-hgvs-p-alt-col COL` | — | `mapped_hgvs_p_alt` | Input column with the single-letter alternate amino acid, used as part of the AA substitution key for `--mutpred2-properties-file` with `--mutpred2-properties-join-key gene-aa` |
 | `--mapped-hgvs-g-col COL` | — | `mapped_hgvs_g` | Input column containing pipe-delimited genomic HGVS values |
 | `--mapped-hgvs-c-col COL` | — | `mapped_hgvs_c` | Input column containing pipe-delimited transcript HGVS values used as file-cache keys |
 | `--skip N` | — | `0` | Skip first N data rows |
@@ -257,9 +318,19 @@ The script returns the highest pathogenicity score when multiple transcript entr
 
 dbNSFP stores multiple MutPred2 scores per row (one per transcript), semicolon-separated. The script returns the maximum non-null value across all entries for each allele. This only applies to the legacy `--dbnsfp-file` source.
 
-**MutPred2 (properties file): candidate not found**
+**MutPred2 (properties file, genomic join): candidate not found**
 
 Confirm `--variant-urn-col` and the `--mapped-hgvs-g-*-col` columns are populated and match the `mavedb_variant_urn` / `Chrom` / `hg38_start` / `hg38_end` / `ref_allele` / `alt_allele` values in the properties file exactly (chromosome is tried with and without a `chr` prefix, but positions and alleles must match verbatim).
+
+**MutPred2 (properties file, gene-AA join): row not found**
+
+Confirm `--gene-symbol-col` matches the properties file's `gene_symbol` column (the file's `Gene` column is ignored), and that `--mapped-hgvs-p-ref-col`/`--mapped-hgvs-p-start-col`/`--mapped-hgvs-p-alt-col` hold already-split single-letter amino acids (e.g. `T`/`2`/`A`), not the qualified 3-letter HGVS string — the built key (e.g. `T2A`) must match the properties file's `AA` column verbatim. The end-of-run log line reports which columns were used for the join.
+
+If the gene is named differently between the two files (e.g. `CALM1_2_3` in the input vs. `CALM1` in the properties file), add an entry to `--mutpred2-gene-symbol-map-file` rather than changing `--gene-symbol-col` — the end-of-run log line also reports the number of gene-symbol-map entries loaded (or `none` if not configured).
+
+**MutPred2 (gene-AA join): some pipe slots are unexpectedly empty**
+
+Check `--mutpred2-gene-aa-long-indels` — with `ignore` (not the default), any DNA reverse-translation candidate whose `--mapped-hgvs-g-ref-col`/`--mapped-hgvs-g-alt-col` allele exceeds 3bp gets an empty slot instead of the row's score. Switch to `--mutpred2-gene-aa-long-indels annotate` if those candidates should also carry the score.
 
 **Slow tabix lookups (REVEL/AlphaMissense/dbNSFP)**
 

@@ -19,6 +19,10 @@ from src.annotate_predictors import (
     _lookup_mutpred2,
     _lookup_mutpred2_from_properties_file,
     _load_mutpred2_properties_file_cache,
+    _load_mutpred2_properties_gene_aa_cache,
+    _lookup_mutpred2_from_gene_aa_cache,
+    _load_mutpred2_gene_symbol_map,
+    _build_aa_substitution,
     _lookup_revel_train,
     _lookup_mutpred2_train,
     _load_revel_training_variants,
@@ -393,6 +397,193 @@ def test_lookup_mutpred2_from_properties_file_missing_field_returns_none():
 
 
 # ---------------------------------------------------------------------------
+# _build_aa_substitution
+# ---------------------------------------------------------------------------
+
+def test_build_aa_substitution_builds_short_form():
+    assert _build_aa_substitution("T", "2", "A") == "T2A"
+
+
+def test_build_aa_substitution_uppercases_and_strips():
+    assert _build_aa_substitution(" t ", " 2 ", " a ") == "T2A"
+
+
+def test_build_aa_substitution_rejects_same_ref_and_alt():
+    assert _build_aa_substitution("T", "2", "T") is None
+
+
+def test_build_aa_substitution_rejects_multi_letter_codes():
+    # 3-letter codes (e.g. from an un-split HGVS) are not accepted here.
+    assert _build_aa_substitution("Thr", "2", "Ala") is None
+
+
+def test_build_aa_substitution_rejects_blank_position():
+    assert _build_aa_substitution("T", "", "A") is None
+
+
+# ---------------------------------------------------------------------------
+# _load_mutpred2_properties_gene_aa_cache / _lookup_mutpred2_from_gene_aa_cache
+# ---------------------------------------------------------------------------
+
+def _mp2_gene_aa_line(gene, gene_symbol, aa, score, urn="urn:mavedb:1#1"):
+    gene_field = f'"{gene}"' if "," in gene else gene
+    return (
+        f"ds,{gene_field},{urn},17,-1.0,100,100,A,G,{aa},"
+        f"ENSP1,ENST1,ENSG1,{gene_symbol},{aa},{score},[]"
+    )
+
+
+def test_load_mutpred2_properties_gene_aa_cache_basic(tmp_path):
+    lines = [_mp2_gene_aa_line("ASPA", "ASPA", "T2A", "0.0867")]
+    file_path = _write_mp2_properties_file(tmp_path, lines, gzipped=False)
+
+    cache = _load_mutpred2_properties_gene_aa_cache(str(file_path))
+
+    assert cache[("ASPA", "T2A")] == "0.0867"
+
+
+def test_load_mutpred2_properties_gene_aa_cache_gzipped(tmp_path):
+    lines = [_mp2_gene_aa_line("ASPA", "ASPA", "T2A", "0.0867")]
+    file_path = _write_mp2_properties_file(tmp_path, lines, gzipped=True)
+
+    cache = _load_mutpred2_properties_gene_aa_cache(str(file_path))
+
+    assert cache[("ASPA", "T2A")] == "0.0867"
+
+
+def test_load_mutpred2_properties_gene_aa_cache_ignores_gene_column(tmp_path):
+    """The 'Gene' column is ignored; only 'gene_symbol' is indexed."""
+    lines = [_mp2_gene_aa_line("CALM1, CALM2, CALM3", "CALM1", "T2A", "0.5000")]
+    file_path = _write_mp2_properties_file(tmp_path, lines, gzipped=False)
+
+    cache = _load_mutpred2_properties_gene_aa_cache(str(file_path))
+
+    assert cache == {("CALM1", "T2A"): "0.5000"}
+    assert ("CALM2", "T2A") not in cache
+    assert ("CALM3", "T2A") not in cache
+
+
+def test_load_mutpred2_properties_gene_aa_cache_missing_column_raises(tmp_path):
+    file_path = tmp_path / "bad.csv"
+    file_path.write_text("Dataset,Gene,mavedb_variant_urn\nds,GENE,urn:1\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="missing column"):
+        _load_mutpred2_properties_gene_aa_cache(str(file_path))
+
+
+def test_load_mutpred2_properties_gene_aa_cache_skips_bad_rows(tmp_path):
+    lines = [
+        _mp2_gene_aa_line("ASPA", "ASPA", "T2A", "0.5000"),
+        _mp2_gene_aa_line("ASPA", "ASPA", "", "0.5000"),  # blank AA
+        _mp2_gene_aa_line("ASPA", "ASPA", "T3A", ""),  # blank score
+    ]
+    file_path = _write_mp2_properties_file(tmp_path, lines, gzipped=False)
+
+    cache = _load_mutpred2_properties_gene_aa_cache(str(file_path))
+
+    assert cache == {("ASPA", "T2A"): "0.5000"}
+
+
+def test_lookup_mutpred2_from_gene_aa_cache_found():
+    cache = {("ASPA", "T2A"): "0.0867"}
+    assert _lookup_mutpred2_from_gene_aa_cache(cache, "ASPA", "T2A") == "0.0867"
+
+
+def test_lookup_mutpred2_from_gene_aa_cache_not_found():
+    cache = {("ASPA", "T2A"): "0.0867"}
+    assert _lookup_mutpred2_from_gene_aa_cache(cache, "ASPA", "T3A") is None
+
+
+def test_lookup_mutpred2_from_gene_aa_cache_none_aa_returns_none():
+    cache = {("ASPA", "T2A"): "0.0867"}
+    assert _lookup_mutpred2_from_gene_aa_cache(cache, "ASPA", None) is None
+
+
+def test_lookup_mutpred2_from_gene_aa_cache_blank_gene_returns_none():
+    cache = {("ASPA", "T2A"): "0.0867"}
+    assert _lookup_mutpred2_from_gene_aa_cache(cache, "", "T2A") is None
+
+
+# ---------------------------------------------------------------------------
+# _load_mutpred2_gene_symbol_map
+# ---------------------------------------------------------------------------
+
+def _write_gene_symbol_map_file(path: Path, rows: list[dict]) -> Path:
+    file_path = path / "gene_symbol_map.tsv"
+    _write_tsv(file_path, rows, ["gene_symbol", "mutpred2_gene_symbol"])
+    return file_path
+
+
+def test_load_mutpred2_gene_symbol_map_basic(tmp_path):
+    file_path = _write_gene_symbol_map_file(
+        tmp_path, [{"gene_symbol": "CALM1_2_3", "mutpred2_gene_symbol": "CALM1"}]
+    )
+
+    mapping = _load_mutpred2_gene_symbol_map(str(file_path))
+
+    assert mapping == {"CALM1_2_3": "CALM1"}
+
+
+def test_load_mutpred2_gene_symbol_map_multiple_rows(tmp_path):
+    file_path = _write_gene_symbol_map_file(
+        tmp_path,
+        [
+            {"gene_symbol": "CALM1_2_3", "mutpred2_gene_symbol": "CALM1"},
+            {"gene_symbol": "TP53_variant", "mutpred2_gene_symbol": "TP53"},
+        ],
+    )
+
+    mapping = _load_mutpred2_gene_symbol_map(str(file_path))
+
+    assert mapping == {"CALM1_2_3": "CALM1", "TP53_variant": "TP53"}
+
+
+def test_load_mutpred2_gene_symbol_map_missing_column_raises(tmp_path):
+    file_path = tmp_path / "bad.tsv"
+    file_path.write_text("gene_symbol\nCALM1_2_3\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="missing column"):
+        _load_mutpred2_gene_symbol_map(str(file_path))
+
+
+def test_load_mutpred2_gene_symbol_map_empty_file_raises(tmp_path):
+    file_path = tmp_path / "empty.tsv"
+    file_path.write_text("", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="empty"):
+        _load_mutpred2_gene_symbol_map(str(file_path))
+
+
+def test_load_mutpred2_gene_symbol_map_skips_blank_rows(tmp_path):
+    file_path = _write_gene_symbol_map_file(
+        tmp_path,
+        [
+            {"gene_symbol": "CALM1_2_3", "mutpred2_gene_symbol": "CALM1"},
+            {"gene_symbol": "", "mutpred2_gene_symbol": "SHOULD_SKIP"},
+            {"gene_symbol": "SHOULD_SKIP_TOO", "mutpred2_gene_symbol": ""},
+        ],
+    )
+
+    mapping = _load_mutpred2_gene_symbol_map(str(file_path))
+
+    assert mapping == {"CALM1_2_3": "CALM1"}
+
+
+def test_load_mutpred2_gene_symbol_map_repeated_key_keeps_last(tmp_path):
+    file_path = _write_gene_symbol_map_file(
+        tmp_path,
+        [
+            {"gene_symbol": "CALM1_2_3", "mutpred2_gene_symbol": "CALM1"},
+            {"gene_symbol": "CALM1_2_3", "mutpred2_gene_symbol": "CALM2"},
+        ],
+    )
+
+    mapping = _load_mutpred2_gene_symbol_map(str(file_path))
+
+    assert mapping == {"CALM1_2_3": "CALM2"}
+
+
+# ---------------------------------------------------------------------------
 # _lookup_alphamissense
 # ---------------------------------------------------------------------------
 
@@ -669,6 +860,291 @@ def test_annotate_row_mutpred2_properties_file_takes_precedence_over_dbnsfp(tmp_
     assert ann["mutpred2.score"] == "0.4000"
 
 
+def test_annotate_row_mutpred2_gene_aa_duplicated_across_candidates(tmp_path):
+    """Gene-AA join: one score computed for the row, duplicated across every pipe slot."""
+    mutpred2_gene_aa_cache = {("ASPA", "T2A"): "0.0867"}
+    row = {
+        "gene_symbol": "ASPA",
+        "mapped_hgvs_g": "NC_000017.11:g.100A>G|NC_000017.11:g.100_102delinsGCA",
+        "mapped_hgvs_p_ref": "T",
+        "mapped_hgvs_p_start": "2",
+        "mapped_hgvs_p_alt": "A",
+    }
+
+    ann = annotate_row(
+        row,
+        nc_to_chrom=NC_TO_CHROM_GRCH38,
+        mapped_hgvs_g_col="mapped_hgvs_g",
+        revel_path=None,
+        alphamissense_path=None,
+        dbnsfp_path=None,
+        revel_cache={},
+        am_cache={},
+        mutpred2_gene_aa_cache=mutpred2_gene_aa_cache,
+        gene_symbol_col="gene_symbol",
+        mapped_hgvs_p_ref_col="mapped_hgvs_p_ref",
+        mapped_hgvs_p_start_col="mapped_hgvs_p_start",
+        mapped_hgvs_p_alt_col="mapped_hgvs_p_alt",
+    )
+
+    assert ann["mutpred2.score"] == "0.0867|0.0867"
+
+
+def test_annotate_row_mutpred2_gene_aa_no_match_is_empty(tmp_path):
+    mutpred2_gene_aa_cache = {("ASPA", "T2A"): "0.0867"}
+    row = {
+        "gene_symbol": "ASPA",
+        "mapped_hgvs_g": "NC_000017.11:g.100A>G",
+        "mapped_hgvs_p_ref": "T",
+        "mapped_hgvs_p_start": "3",
+        "mapped_hgvs_p_alt": "A",
+    }
+
+    ann = annotate_row(
+        row,
+        nc_to_chrom=NC_TO_CHROM_GRCH38,
+        mapped_hgvs_g_col="mapped_hgvs_g",
+        revel_path=None,
+        alphamissense_path=None,
+        dbnsfp_path=None,
+        revel_cache={},
+        am_cache={},
+        mutpred2_gene_aa_cache=mutpred2_gene_aa_cache,
+        gene_symbol_col="gene_symbol",
+        mapped_hgvs_p_ref_col="mapped_hgvs_p_ref",
+        mapped_hgvs_p_start_col="mapped_hgvs_p_start",
+        mapped_hgvs_p_alt_col="mapped_hgvs_p_alt",
+    )
+
+    assert ann["mutpred2.score"] == ""
+
+
+def test_annotate_row_mutpred2_gene_aa_no_match_duplicated_empty_across_candidates(tmp_path):
+    """No match still pipe-aligns: an empty slot per DNA candidate, not a single blank."""
+    mutpred2_gene_aa_cache = {("ASPA", "T2A"): "0.0867"}
+    row = {
+        "gene_symbol": "ASPA",
+        "mapped_hgvs_g": "NC_000017.11:g.100A>G|NC_000017.11:g.100_102delinsGCA",
+        "mapped_hgvs_p_ref": "T",
+        "mapped_hgvs_p_start": "3",
+        "mapped_hgvs_p_alt": "A",
+    }
+
+    ann = annotate_row(
+        row,
+        nc_to_chrom=NC_TO_CHROM_GRCH38,
+        mapped_hgvs_g_col="mapped_hgvs_g",
+        revel_path=None,
+        alphamissense_path=None,
+        dbnsfp_path=None,
+        revel_cache={},
+        am_cache={},
+        mutpred2_gene_aa_cache=mutpred2_gene_aa_cache,
+        gene_symbol_col="gene_symbol",
+        mapped_hgvs_p_ref_col="mapped_hgvs_p_ref",
+        mapped_hgvs_p_start_col="mapped_hgvs_p_start",
+        mapped_hgvs_p_alt_col="mapped_hgvs_p_alt",
+    )
+
+    assert ann["mutpred2.score"] == "|"
+
+
+def test_annotate_row_mutpred2_gene_aa_long_indels_default_still_scored(tmp_path):
+    """Default ('annotate'): a >3bp ref/alt candidate still gets the row's score."""
+    mutpred2_gene_aa_cache = {("ASPA", "T2A"): "0.0867"}
+    row = {
+        "gene_symbol": "ASPA",
+        "mapped_hgvs_g": "NC_000017.11:g.100A>G|NC_000017.11:g.100_104delinsGCATG",
+        "mapped_hgvs_g_ref": "A|ACTGA",
+        "mapped_hgvs_g_alt": "G|GCATG",
+        "mapped_hgvs_p_ref": "T",
+        "mapped_hgvs_p_start": "2",
+        "mapped_hgvs_p_alt": "A",
+    }
+
+    ann = annotate_row(
+        row,
+        nc_to_chrom=NC_TO_CHROM_GRCH38,
+        mapped_hgvs_g_col="mapped_hgvs_g",
+        revel_path=None,
+        alphamissense_path=None,
+        dbnsfp_path=None,
+        revel_cache={},
+        am_cache={},
+        mutpred2_gene_aa_cache=mutpred2_gene_aa_cache,
+        mapped_hgvs_g_ref_col="mapped_hgvs_g_ref",
+        mapped_hgvs_g_alt_col="mapped_hgvs_g_alt",
+        gene_symbol_col="gene_symbol",
+        mapped_hgvs_p_ref_col="mapped_hgvs_p_ref",
+        mapped_hgvs_p_start_col="mapped_hgvs_p_start",
+        mapped_hgvs_p_alt_col="mapped_hgvs_p_alt",
+    )
+
+    assert ann["mutpred2.score"] == "0.0867|0.0867"
+
+
+def test_annotate_row_mutpred2_gene_aa_long_indels_ignore_blanks_long_candidate(tmp_path):
+    """--mutpred2-gene-aa-long-indels ignore blanks only the candidate over 3bp."""
+    mutpred2_gene_aa_cache = {("ASPA", "T2A"): "0.0867"}
+    row = {
+        "gene_symbol": "ASPA",
+        "mapped_hgvs_g": "NC_000017.11:g.100A>G|NC_000017.11:g.100_104delinsGCATG",
+        "mapped_hgvs_g_ref": "A|ACTGA",
+        "mapped_hgvs_g_alt": "G|GCATG",
+        "mapped_hgvs_p_ref": "T",
+        "mapped_hgvs_p_start": "2",
+        "mapped_hgvs_p_alt": "A",
+    }
+
+    ann = annotate_row(
+        row,
+        nc_to_chrom=NC_TO_CHROM_GRCH38,
+        mapped_hgvs_g_col="mapped_hgvs_g",
+        revel_path=None,
+        alphamissense_path=None,
+        dbnsfp_path=None,
+        revel_cache={},
+        am_cache={},
+        mutpred2_gene_aa_cache=mutpred2_gene_aa_cache,
+        mutpred2_gene_aa_long_indels="ignore",
+        mapped_hgvs_g_ref_col="mapped_hgvs_g_ref",
+        mapped_hgvs_g_alt_col="mapped_hgvs_g_alt",
+        gene_symbol_col="gene_symbol",
+        mapped_hgvs_p_ref_col="mapped_hgvs_p_ref",
+        mapped_hgvs_p_start_col="mapped_hgvs_p_start",
+        mapped_hgvs_p_alt_col="mapped_hgvs_p_alt",
+    )
+
+    assert ann["mutpred2.score"] == "0.0867|"
+
+
+def test_annotate_row_mutpred2_gene_aa_long_indels_ignore_exactly_3bp_still_scored(tmp_path):
+    """max(len(ref), len(alt)) == 3 is not 'exceeds 3bp' — still gets the score."""
+    mutpred2_gene_aa_cache = {("ASPA", "T2A"): "0.0867"}
+    row = {
+        "gene_symbol": "ASPA",
+        "mapped_hgvs_g": "NC_000017.11:g.100_102delinsGCA",
+        "mapped_hgvs_g_ref": "ACT",
+        "mapped_hgvs_g_alt": "GCA",
+        "mapped_hgvs_p_ref": "T",
+        "mapped_hgvs_p_start": "2",
+        "mapped_hgvs_p_alt": "A",
+    }
+
+    ann = annotate_row(
+        row,
+        nc_to_chrom=NC_TO_CHROM_GRCH38,
+        mapped_hgvs_g_col="mapped_hgvs_g",
+        revel_path=None,
+        alphamissense_path=None,
+        dbnsfp_path=None,
+        revel_cache={},
+        am_cache={},
+        mutpred2_gene_aa_cache=mutpred2_gene_aa_cache,
+        mutpred2_gene_aa_long_indels="ignore",
+        mapped_hgvs_g_ref_col="mapped_hgvs_g_ref",
+        mapped_hgvs_g_alt_col="mapped_hgvs_g_alt",
+        gene_symbol_col="gene_symbol",
+        mapped_hgvs_p_ref_col="mapped_hgvs_p_ref",
+        mapped_hgvs_p_start_col="mapped_hgvs_p_start",
+        mapped_hgvs_p_alt_col="mapped_hgvs_p_alt",
+    )
+
+    assert ann["mutpred2.score"] == "0.0867"
+
+
+def test_annotate_row_mutpred2_gene_aa_symbol_map_resolves_mismatched_name(tmp_path):
+    """A combined-target gene name in the input resolves via the symbol map."""
+    mutpred2_gene_aa_cache = {("CALM1", "T2A"): "0.4200"}
+    row = {
+        "gene_symbol": "CALM1_2_3",
+        "mapped_hgvs_g": "NC_000017.11:g.100A>G",
+        "mapped_hgvs_p_ref": "T",
+        "mapped_hgvs_p_start": "2",
+        "mapped_hgvs_p_alt": "A",
+    }
+
+    ann = annotate_row(
+        row,
+        nc_to_chrom=NC_TO_CHROM_GRCH38,
+        mapped_hgvs_g_col="mapped_hgvs_g",
+        revel_path=None,
+        alphamissense_path=None,
+        dbnsfp_path=None,
+        revel_cache={},
+        am_cache={},
+        mutpred2_gene_aa_cache=mutpred2_gene_aa_cache,
+        mutpred2_gene_symbol_map={"CALM1_2_3": "CALM1"},
+        gene_symbol_col="gene_symbol",
+        mapped_hgvs_p_ref_col="mapped_hgvs_p_ref",
+        mapped_hgvs_p_start_col="mapped_hgvs_p_start",
+        mapped_hgvs_p_alt_col="mapped_hgvs_p_alt",
+    )
+
+    assert ann["mutpred2.score"] == "0.4200"
+
+
+def test_annotate_row_mutpred2_gene_aa_symbol_map_leaves_unmapped_genes_unchanged(tmp_path):
+    """A gene absent from the map is looked up under its original name."""
+    mutpred2_gene_aa_cache = {("ASPA", "T2A"): "0.0867"}
+    row = {
+        "gene_symbol": "ASPA",
+        "mapped_hgvs_g": "NC_000017.11:g.100A>G",
+        "mapped_hgvs_p_ref": "T",
+        "mapped_hgvs_p_start": "2",
+        "mapped_hgvs_p_alt": "A",
+    }
+
+    ann = annotate_row(
+        row,
+        nc_to_chrom=NC_TO_CHROM_GRCH38,
+        mapped_hgvs_g_col="mapped_hgvs_g",
+        revel_path=None,
+        alphamissense_path=None,
+        dbnsfp_path=None,
+        revel_cache={},
+        am_cache={},
+        mutpred2_gene_aa_cache=mutpred2_gene_aa_cache,
+        mutpred2_gene_symbol_map={"CALM1_2_3": "CALM1"},
+        gene_symbol_col="gene_symbol",
+        mapped_hgvs_p_ref_col="mapped_hgvs_p_ref",
+        mapped_hgvs_p_start_col="mapped_hgvs_p_start",
+        mapped_hgvs_p_alt_col="mapped_hgvs_p_alt",
+    )
+
+    assert ann["mutpred2.score"] == "0.0867"
+
+
+def test_annotate_row_mutpred2_gene_aa_symbol_map_no_match_after_mapping_is_empty(tmp_path):
+    mutpred2_gene_aa_cache = {("CALM1", "T2A"): "0.4200"}
+    row = {
+        "gene_symbol": "CALM1_2_3",
+        "mapped_hgvs_g": "NC_000017.11:g.100A>G",
+        "mapped_hgvs_p_ref": "T",
+        "mapped_hgvs_p_start": "3",
+        "mapped_hgvs_p_alt": "A",
+    }
+
+    ann = annotate_row(
+        row,
+        nc_to_chrom=NC_TO_CHROM_GRCH38,
+        mapped_hgvs_g_col="mapped_hgvs_g",
+        revel_path=None,
+        alphamissense_path=None,
+        dbnsfp_path=None,
+        revel_cache={},
+        am_cache={},
+        mutpred2_gene_aa_cache=mutpred2_gene_aa_cache,
+        mutpred2_gene_symbol_map={"CALM1_2_3": "CALM1"},
+        gene_symbol_col="gene_symbol",
+        mapped_hgvs_p_ref_col="mapped_hgvs_p_ref",
+        mapped_hgvs_p_start_col="mapped_hgvs_p_start",
+        mapped_hgvs_p_alt_col="mapped_hgvs_p_alt",
+    )
+
+    assert ann["mutpred2.score"] == ""
+
+
 def test_annotate_row_non_snv_empty(tmp_path):
     """Indel HGVS → all scores empty."""
     revel_path = tmp_path / "revel.tsv.gz"
@@ -900,6 +1376,145 @@ def test_main_mutpred2_properties_file_takes_precedence_over_dbnsfp(tmp_path, mo
 
     rows = _read_tsv(out_path)
     assert rows[0]["mutpred2.score"] == "0.4000"
+
+
+def test_main_mutpred2_properties_join_key_gene_aa(tmp_path):
+    """--mutpred2-properties-join-key gene-aa joins on gene symbol + AA substitution."""
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+    mp2_path = tmp_path / "mp2.csv"
+    mp2_path.write_text(
+        _MP2_PROPERTIES_HEADER + "\n"
+        + _mp2_gene_aa_line("ASPA", "ASPA", "T2A", "0.0867") + "\n",
+        encoding="utf-8",
+    )
+
+    _write_tsv(
+        in_path,
+        [
+            {
+                "gene_symbol": "ASPA",
+                "mapped_hgvs_g": "NC_000017.11:g.100A>G|NC_000017.11:g.100_102delinsGCA",
+                "mapped_hgvs_p_ref": "T",
+                "mapped_hgvs_p_start": "2",
+                "mapped_hgvs_p_alt": "A",
+            },
+        ],
+        ["gene_symbol", "mapped_hgvs_g", "mapped_hgvs_p_ref", "mapped_hgvs_p_start", "mapped_hgvs_p_alt"],
+    )
+
+    mod.main([
+        str(in_path), str(out_path),
+        "--mutpred2-properties-file", str(mp2_path),
+        "--mutpred2-properties-join-key", "gene-aa",
+    ])
+
+    rows = _read_tsv(out_path)
+    assert len(rows) == 1
+    # One score computed for the row, duplicated across both DNA candidates.
+    assert rows[0]["mutpred2.score"] == "0.0867|0.0867"
+
+
+def test_main_mutpred2_gene_aa_long_indels_ignore(tmp_path):
+    """--mutpred2-gene-aa-long-indels ignore blanks candidates with a >3bp ref/alt allele."""
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+    mp2_path = tmp_path / "mp2.csv"
+    mp2_path.write_text(
+        _MP2_PROPERTIES_HEADER + "\n"
+        + _mp2_gene_aa_line("ASPA", "ASPA", "T2A", "0.0867") + "\n",
+        encoding="utf-8",
+    )
+
+    _write_tsv(
+        in_path,
+        [
+            {
+                "gene_symbol": "ASPA",
+                "mapped_hgvs_g": "NC_000017.11:g.100A>G|NC_000017.11:g.100_104delinsGCATG",
+                "mapped_hgvs_g_ref": "A|ACTGA",
+                "mapped_hgvs_g_alt": "G|GCATG",
+                "mapped_hgvs_p_ref": "T",
+                "mapped_hgvs_p_start": "2",
+                "mapped_hgvs_p_alt": "A",
+            },
+        ],
+        [
+            "gene_symbol", "mapped_hgvs_g", "mapped_hgvs_g_ref", "mapped_hgvs_g_alt",
+            "mapped_hgvs_p_ref", "mapped_hgvs_p_start", "mapped_hgvs_p_alt",
+        ],
+    )
+
+    mod.main([
+        str(in_path), str(out_path),
+        "--mutpred2-properties-file", str(mp2_path),
+        "--mutpred2-properties-join-key", "gene-aa",
+        "--mutpred2-gene-aa-long-indels", "ignore",
+    ])
+
+    rows = _read_tsv(out_path)
+    assert len(rows) == 1
+    # First candidate (1bp ref/alt) keeps the score; second (5bp) is blanked.
+    assert rows[0]["mutpred2.score"] == "0.0867|"
+
+
+def test_main_mutpred2_gene_aa_symbol_map_file(tmp_path):
+    """--mutpred2-gene-symbol-map-file remaps a combined-target gene name before the lookup."""
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+    mp2_path = tmp_path / "mp2.csv"
+    map_path = _write_gene_symbol_map_file(
+        tmp_path, [{"gene_symbol": "CALM1_2_3", "mutpred2_gene_symbol": "CALM1"}]
+    )
+    mp2_path.write_text(
+        _MP2_PROPERTIES_HEADER + "\n"
+        + _mp2_gene_aa_line("CALM1", "CALM1", "T2A", "0.4200") + "\n",
+        encoding="utf-8",
+    )
+
+    _write_tsv(
+        in_path,
+        [
+            {
+                "gene_symbol": "CALM1_2_3",
+                "mapped_hgvs_g": "NC_000017.11:g.100A>G",
+                "mapped_hgvs_p_ref": "T",
+                "mapped_hgvs_p_start": "2",
+                "mapped_hgvs_p_alt": "A",
+            },
+        ],
+        ["gene_symbol", "mapped_hgvs_g", "mapped_hgvs_p_ref", "mapped_hgvs_p_start", "mapped_hgvs_p_alt"],
+    )
+
+    mod.main([
+        str(in_path), str(out_path),
+        "--mutpred2-properties-file", str(mp2_path),
+        "--mutpred2-properties-join-key", "gene-aa",
+        "--mutpred2-gene-symbol-map-file", str(map_path),
+    ])
+
+    rows = _read_tsv(out_path)
+    assert len(rows) == 1
+    assert rows[0]["mutpred2.score"] == "0.4200"
+
+
+def test_main_mutpred2_gene_symbol_map_file_not_found_exits(tmp_path):
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+    mp2_path = tmp_path / "mp2.csv"
+    mp2_path.write_text(
+        _MP2_PROPERTIES_HEADER + "\n" + _mp2_gene_aa_line("ASPA", "ASPA", "T2A", "0.0867") + "\n",
+        encoding="utf-8",
+    )
+    _write_tsv(in_path, [{"gene_symbol": "ASPA"}], ["gene_symbol"])
+
+    with pytest.raises(SystemExit):
+        mod.main([
+            str(in_path), str(out_path),
+            "--mutpred2-properties-file", str(mp2_path),
+            "--mutpred2-properties-join-key", "gene-aa",
+            "--mutpred2-gene-symbol-map-file", str(tmp_path / "does_not_exist.tsv"),
+        ])
 
 
 # ---------------------------------------------------------------------------

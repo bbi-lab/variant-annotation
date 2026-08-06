@@ -19,8 +19,20 @@ Supported scores (hg38 / GRCh38 only):
   --mutpred2-properties-file data_frame_missense_variants_MP2_properties.csv.gz
     A MaveDB-derived per-DNA-variant properties table (columns include
     mavedb_variant_urn, Chrom, hg38_start, hg38_end, ref_allele, alt_allele,
-    "MutPred2 score"). Looked up by variant_urn + genomic coordinates, so
-    scores are pipe-aligned per reverse-translation candidate (see below).
+    gene_symbol, AA, "MutPred2 score"). --mutpred2-properties-join-key
+    selects how it's joined:
+      genomic (default): variant_urn + genomic coordinates, per reverse-
+        translation candidate, so scores are pipe-aligned (see below).
+      gene-aa: gene symbol + amino-acid substitution (e.g. "T2A", built from
+        --gene-symbol-col and the --mapped-hgvs-p-ref/-start/-alt-col
+        columns), matching MutPred2's protein-level scope. Evaluated once per
+        row, then the same score is duplicated across every pipe slot, since
+        the join doesn't vary per DNA candidate. --mutpred2-gene-aa-long-indels
+        controls whether candidates with a genomic ref/alt allele over 3bp
+        (from --mapped-hgvs-g-ref-col/-alt-col) still get that score, or an
+        empty slot instead. --mutpred2-gene-symbol-map-file optionally remaps
+        input gene symbols that don't match the properties file's naming
+        (e.g. "CALM1_2_3" -> "CALM1") before the lookup.
 
   MutPred2 (via dbNSFP — legacy fallback)
   --dbnsfp-file dbNSFP5.3.1a_grch38.gz
@@ -106,8 +118,13 @@ For rows with pipe-delimited genomic HGVS values the REVEL and AlphaMissense
 columns are pipe-aligned to match the input candidate positions.
 
 mutpred2.score's shape depends on the source:
-  --mutpred2-properties-file: looked up per reverse-translation candidate
-    (variant_urn + genomic coordinates), so it is pipe-aligned like REVEL.
+  --mutpred2-properties-file (--mutpred2-properties-join-key genomic,
+    the default): looked up per reverse-translation candidate (variant_urn +
+    genomic coordinates), so it is pipe-aligned like REVEL.
+  --mutpred2-properties-file (--mutpred2-properties-join-key gene-aa): a
+    single score computed once for the row (gene + AA-substitution doesn't
+    vary across DNA reverse-translation candidates), then duplicated across
+    every pipe slot, so it is pipe-aligned like the genomic join.
   --dbnsfp-file (legacy): MutPred2 is treated as a protein-level model there,
     so all reverse-translation candidates encode the same amino acid
     substitution and a single score (the maximum across candidates) is
@@ -300,6 +317,26 @@ def _split_pipe(value: str) -> list[str]:
     return [part.strip() for part in raw.split("|")]
 
 
+AA_SUBSTITUTION_RE = re.compile(r"^[A-Za-z]$")
+
+
+def _build_aa_substitution(ref: str, pos: str, alt: str) -> Optional[str]:
+    """Build a short-form AA substitution string (e.g. ``T2A``) from split columns.
+
+    Returns ``None`` unless *ref* and *alt* are each a single amino-acid
+    letter, *pos* is non-empty, and *ref* != *alt* — matching the properties
+    file's missense-only ``AA`` column and naturally excluding stop/
+    frameshift/indel/synonymous rows. Mirrors the convention used in
+    ``src/find_mp2_unannotated.py``.
+    """
+    ref = ref.strip().upper()
+    alt = alt.strip().upper()
+    pos = pos.strip()
+    if not (AA_SUBSTITUTION_RE.match(ref) and AA_SUBSTITUTION_RE.match(alt) and pos) or ref == alt:
+        return None
+    return f"{ref}{pos}{alt}"
+
+
 def _unqualify_hgvs_p(value: str) -> str:
     """Strip a leading transcript/protein accession from a p. HGVS string.
 
@@ -434,6 +471,23 @@ def _lookup_mutpred2_from_properties_file(
         if score is not None:
             return score
     return None
+
+
+def _lookup_mutpred2_from_gene_aa_cache(
+    cache: dict[tuple[str, str], str],
+    gene: str,
+    aa: Optional[str],
+) -> Optional[str]:
+    """Return the MutPred2 score for one (gene, AA-substitution) key, or ``None``.
+
+    Alternative to :func:`_lookup_mutpred2_from_properties_file` for
+    ``--mutpred2-properties-join-key gene-aa``. Evaluated once per row rather
+    than per DNA reverse-translation candidate, since the join key doesn't
+    vary across candidates.
+    """
+    if not (gene and aa):
+        return None
+    return cache.get((gene.strip(), aa))
 
 
 def _lookup_revel_train(
@@ -706,6 +760,96 @@ def _load_mutpred2_properties_file_cache(
     return cache
 
 
+MUTPRED2_PROPERTIES_GENE_AA_REQUIRED_COLS = ["gene_symbol", "AA", "MutPred2 score"]
+
+
+def _load_mutpred2_properties_gene_aa_cache(path: str) -> dict[tuple[str, str], str]:
+    """Load MutPred2 scores from a MaveDB MP2-properties CSV into a (gene, AA) -> score dict.
+
+    Alternative to :func:`_load_mutpred2_properties_file_cache` for
+    ``--mutpred2-properties-join-key gene-aa``. MutPred2 is a protein-level
+    model, so a variant only needs one score per (gene, amino-acid
+    substitution) regardless of which mavedb_variant_urn or DNA reverse-
+    translation candidate it came from in the properties file. Keyed on the
+    ``gene_symbol`` column (the file's ``Gene`` column is ignored).
+
+    Transparently handles gzip-compressed input (``.gz`` suffix).
+    """
+    try:
+        header_cols = pd.read_csv(path, nrows=0).columns
+    except pd.errors.EmptyDataError:
+        raise ValueError(f"MutPred2 properties file is empty: {path}")
+
+    missing = [c for c in MUTPRED2_PROPERTIES_GENE_AA_REQUIRED_COLS if c not in header_cols]
+    if missing:
+        raise ValueError(
+            f"MutPred2 properties file {path} is missing column(s): {', '.join(missing)}"
+        )
+
+    df = pd.read_csv(
+        path,
+        usecols=MUTPRED2_PROPERTIES_GENE_AA_REQUIRED_COLS,
+        dtype=str,
+        na_filter=False,
+    )
+    n_rows = len(df)
+
+    gene_symbol = df["gene_symbol"].str.strip()
+    aa = df["AA"].str.strip()
+    score = df["MutPred2 score"].str.strip()
+
+    valid = (gene_symbol != "") & (aa != "") & (score != "")
+    n_skipped = n_rows - int(valid.sum())
+
+    keys = zip(gene_symbol[valid].tolist(), aa[valid].tolist())
+    cache: dict[tuple[str, str], str] = dict(zip(keys, score[valid].tolist()))
+
+    logger.info(
+        "Loaded %d MutPred2 (gene, AA) file-cache entries from %s (%d rows scanned, %d skipped)",
+        len(cache), path, n_rows, n_skipped,
+    )
+    return cache
+
+
+MUTPRED2_GENE_SYMBOL_MAP_REQUIRED_COLS = ["gene_symbol", "mutpred2_gene_symbol"]
+
+
+def _load_mutpred2_gene_symbol_map(path: str) -> dict[str, str]:
+    """Load a TSV mapping input gene symbols to MutPred2-properties-file gene symbols.
+
+    For ``--mutpred2-properties-join-key gene-aa``, when a gene is named
+    differently between the two files (e.g. a combined-target dataset's
+    ``CALM1_2_3`` in the input vs. ``CALM1`` in the properties file's
+    ``gene_symbol`` column), this remaps the input gene symbol before the
+    (gene, AA) cache lookup. Only genes that actually differ need an entry;
+    any gene symbol absent from the map is looked up unchanged.
+
+    Expects a header with ``gene_symbol`` (as it appears via
+    ``--gene-symbol-col`` in the input) and ``mutpred2_gene_symbol`` (as it
+    appears in the properties file). A repeated ``gene_symbol`` keeps its
+    last row's mapping.
+    """
+    mapping: dict[str, str] = {}
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        if reader.fieldnames is None:
+            raise ValueError(f"MutPred2 gene-symbol-map file is empty: {path}")
+        missing = [c for c in MUTPRED2_GENE_SYMBOL_MAP_REQUIRED_COLS if c not in reader.fieldnames]
+        if missing:
+            raise ValueError(
+                f"MutPred2 gene-symbol-map file {path} is missing column(s): {', '.join(missing)}"
+            )
+
+        for row in reader:
+            src = (row.get("gene_symbol") or "").strip()
+            dst = (row.get("mutpred2_gene_symbol") or "").strip()
+            if src and dst:
+                mapping[src] = dst
+
+    logger.info("Loaded %d MutPred2 gene-symbol mapping(s) from %s", len(mapping), path)
+    return mapping
+
+
 REVEL_TRAINING_REQUIRED_COLS = [
     "chromosome",
     "hg38_start",
@@ -823,6 +967,9 @@ def annotate_row(
     revel_file_cache: Optional[dict[str, str]] = None,
     am_file_cache: Optional[dict[str, tuple[str, str]]] = None,
     mutpred2_properties_cache: Optional[dict[tuple[str, str, int, int, str, str], str]] = None,
+    mutpred2_gene_aa_cache: Optional[dict[tuple[str, str], str]] = None,
+    mutpred2_gene_aa_long_indels: str = "annotate",
+    mutpred2_gene_symbol_map: Optional[dict[str, str]] = None,
     variant_urn_col: Optional[str] = None,
     mapped_hgvs_g_chromosome_col: Optional[str] = None,
     mapped_hgvs_g_start_col: Optional[str] = None,
@@ -834,6 +981,9 @@ def annotate_row(
     mutpred2_training_set: Optional[set] = None,
     gene_symbol_col: Optional[str] = None,
     mapped_hgvs_p_col: Optional[str] = None,
+    mapped_hgvs_p_ref_col: Optional[str] = None,
+    mapped_hgvs_p_start_col: Optional[str] = None,
+    mapped_hgvs_p_alt_col: Optional[str] = None,
 ) -> dict[str, str]:
     """Return annotation columns for a single row.
 
@@ -843,12 +993,25 @@ def annotate_row(
     to a tabix lookup via the g-string from *mapped_hgvs_g_col*.  Non-SNV
     candidates that are absent from the file cache produce empty strings.
 
-    MutPred2 has two, mutually-exclusive sources: if *mutpred2_properties_cache*
+    MutPred2 has three, mutually-exclusive sources. If *mutpred2_properties_cache*
     is given, each reverse-translation candidate is looked up individually
     (variant_urn + genomic coordinates) and the result is pipe-aligned like
-    REVEL/AlphaMissense. Otherwise, if *dbnsfp_path* is given, MutPred2 is
-    treated as a protein-level model and a single score (the maximum across
-    candidates) is emitted with no pipes.
+    REVEL/AlphaMissense. If *mutpred2_gene_aa_cache* is given instead, the
+    join is gene symbol + amino-acid substitution (built from
+    *mapped_hgvs_p_ref_col*/*_start_col*/*_alt_col*), evaluated once for the
+    row since MutPred2 is protein-level and the key doesn't vary per DNA
+    candidate, then the same score is duplicated across every pipe slot so it
+    is still pipe-aligned like REVEL/AlphaMissense. If *mutpred2_gene_symbol_map*
+    is given, the row's gene symbol is remapped through it (e.g. ``CALM1_2_3``
+    -> ``CALM1``) before the (gene, AA) cache lookup; genes absent from the
+    map are looked up unchanged. If *mutpred2_gene_aa_long_indels*
+    is ``"ignore"``, any candidate whose genomic ref or alt allele (from
+    *mapped_hgvs_g_ref_col*/*_alt_col*) exceeds 3bp gets an empty slot instead
+    of the row's score, since such a large indel/delins is a poor proxy for
+    the assayed protein substitution; the default, ``"annotate"``, applies the
+    row's score to every candidate regardless of allele length. Otherwise, if
+    *dbnsfp_path* is given, MutPred2 is treated as a protein-level model and a
+    single score (the maximum across candidates) is emitted with no pipes.
 
     Training-set overlap is optional and independent of the score sources
     above. If *revel_training_set* is given, ``revel.train`` is looked up per
@@ -866,9 +1029,13 @@ def annotate_row(
     )
 
     mutpred2_alt_enabled = mutpred2_properties_cache is not None
+    mutpred2_gene_aa_enabled = mutpred2_gene_aa_cache is not None
+    mutpred2_gene_aa_skip_long_indels = (
+        mutpred2_gene_aa_enabled and mutpred2_gene_aa_long_indels == "ignore"
+    )
     revel_train_enabled = revel_training_set is not None
     mutpred2_train_enabled = mutpred2_training_set is not None
-    need_geno_candidates = mutpred2_alt_enabled or revel_train_enabled
+    need_geno_candidates = mutpred2_alt_enabled or revel_train_enabled or mutpred2_gene_aa_skip_long_indels
 
     variant_urn = ""
     if mutpred2_alt_enabled:
@@ -987,6 +1154,29 @@ def annotate_row(
         out["alphamissense.class"] = sep.join(am_class_vals)
     if mutpred2_alt_enabled:
         out["mutpred2.score"] = sep.join(mutpred2_alt_vals)
+    elif mutpred2_gene_aa_enabled:
+        gene = (row.get(gene_symbol_col) or "").strip() if gene_symbol_col else ""
+        if mutpred2_gene_symbol_map:
+            gene = mutpred2_gene_symbol_map.get(gene, gene)
+        ref = (row.get(mapped_hgvs_p_ref_col) or "") if mapped_hgvs_p_ref_col else ""
+        pos = (row.get(mapped_hgvs_p_start_col) or "") if mapped_hgvs_p_start_col else ""
+        alt = (row.get(mapped_hgvs_p_alt_col) or "") if mapped_hgvs_p_alt_col else ""
+        aa = _build_aa_substitution(ref, pos, alt)
+        gene_aa_score = _lookup_mutpred2_from_gene_aa_cache(
+            mutpred2_gene_aa_cache,  # type: ignore[arg-type]
+            gene,
+            aa,
+        ) or ""
+        if mutpred2_gene_aa_skip_long_indels:
+            gene_aa_vals = [
+                ""
+                if max(len(ref_candidates[i]), len(alt_candidates[i])) > 3
+                else gene_aa_score
+                for i in range(n)
+            ]
+        else:
+            gene_aa_vals = [gene_aa_score] * n
+        out["mutpred2.score"] = sep.join(gene_aa_vals)
     elif dbnsfp_path is not None:
         if mutpred2_vals:
             best_mp2 = max(mutpred2_vals, key=float)
@@ -1126,13 +1316,59 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         metavar="PATH",
         help=(
             "MaveDB MP2-properties CSV (optionally gzipped), e.g. "
-            "data_frame_missense_variants_MP2_properties.csv.gz. Columns required: "
-            "mavedb_variant_urn, Chrom, hg38_start, hg38_end, ref_allele, alt_allele, "
-            "'MutPred2 score'. Preferred source for mutpred2.score; looked up per "
-            "reverse-translation candidate via --variant-urn-col and the "
-            "--mapped-hgvs-g-*-col columns, so the output is pipe-aligned. "
+            "data_frame_missense_variants_MP2_properties.csv.gz. Preferred source for "
+            "mutpred2.score. Join columns depend on --mutpred2-properties-join-key: "
+            "'genomic' (default) requires mavedb_variant_urn, Chrom, hg38_start, "
+            "hg38_end, ref_allele, alt_allele, 'MutPred2 score'; 'gene-aa' requires "
+            "gene_symbol, AA, 'MutPred2 score'. "
             "Takes precedence over --dbnsfp-file when both are given. "
             "Defaults to MUTPRED2_PROPERTIES_FILE env var."
+        ),
+    )
+    p.add_argument(
+        "--mutpred2-properties-join-key",
+        choices=["genomic", "gene-aa"],
+        default="genomic",
+        help=(
+            "How --mutpred2-properties-file is joined to the input. 'genomic' "
+            "(default): per reverse-translation candidate via --variant-urn-col and "
+            "the --mapped-hgvs-g-*-col columns, so mutpred2.score is pipe-aligned like "
+            "revel.score. 'gene-aa': gene symbol + amino-acid substitution (e.g. "
+            "'T2A') via --gene-symbol-col and the --mapped-hgvs-p-ref/-start/-alt-col "
+            "columns — MutPred2 is protein-level, so this matches regardless of which "
+            "DNA reverse-translation candidate is used; the score is computed once per "
+            "row and then duplicated across every pipe slot, so mutpred2.score is still "
+            "pipe-aligned like the genomic join."
+        ),
+    )
+    p.add_argument(
+        "--mutpred2-gene-aa-long-indels",
+        choices=["annotate", "ignore"],
+        default="annotate",
+        help=(
+            "With --mutpred2-properties-join-key gene-aa, whether DNA reverse-"
+            "translation candidates whose genomic ref or alt allele (from "
+            "--mapped-hgvs-g-ref-col/--mapped-hgvs-g-alt-col) exceeds 3bp still "
+            "receive the row's mutpred2.score. 'annotate' (default): every candidate "
+            "gets the score regardless of allele length. 'ignore': candidates with "
+            "max(len(ref), len(alt)) > 3bp get an empty slot instead. No effect with "
+            "--mutpred2-properties-join-key genomic or --dbnsfp-file."
+        ),
+    )
+    p.add_argument(
+        "--mutpred2-gene-symbol-map-file",
+        default=os.environ.get("MUTPRED2_GENE_SYMBOL_MAP_FILE"),
+        metavar="PATH",
+        help=(
+            "With --mutpred2-properties-join-key gene-aa: a two-column TSV "
+            "(gene_symbol, mutpred2_gene_symbol) remapping input gene symbols "
+            "(from --gene-symbol-col) to the symbol used in "
+            "--mutpred2-properties-file, for cases where a gene is named "
+            "differently between the two (e.g. a combined-target dataset's "
+            "'CALM1_2_3' vs. 'CALM1'). Only genes that differ need an entry; "
+            "genes absent from the map are looked up unchanged. No effect with "
+            "--mutpred2-properties-join-key genomic. Defaults to "
+            "MUTPRED2_GENE_SYMBOL_MAP_FILE env var."
         ),
     )
     p.add_argument(
@@ -1140,7 +1376,8 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="variant_urn",
         help=(
             "Input column with the MaveDB variant URN, used as part of the lookup key "
-            "for --mutpred2-properties-file (default: variant_urn)"
+            "for --mutpred2-properties-file with --mutpred2-properties-join-key genomic "
+            "(default: variant_urn)"
         ),
     )
     p.add_argument(
@@ -1218,7 +1455,8 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="gene_symbol",
         help=(
             "Input column with the gene symbol, used as part of the lookup key for "
-            "--mutpred2-training-file when that file has no 'hgvs_p' column "
+            "--mutpred2-training-file when that file has no 'hgvs_p' column, and for "
+            "--mutpred2-properties-file with --mutpred2-properties-join-key gene-aa "
             "(default: gene_symbol)"
         ),
     )
@@ -1228,6 +1466,34 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help=(
             "Input column with protein HGVS value(s), used as part of the lookup key "
             "for --mutpred2-training-file (default: mapped_hgvs_p)"
+        ),
+    )
+    p.add_argument(
+        "--mapped-hgvs-p-ref-col",
+        default="mapped_hgvs_p_ref",
+        help=(
+            "Input column with the single-letter reference amino acid, used with "
+            "--mapped-hgvs-p-start-col and --mapped-hgvs-p-alt-col to build the AA "
+            "substitution key (e.g. 'T2A') for --mutpred2-properties-file with "
+            "--mutpred2-properties-join-key gene-aa (default: mapped_hgvs_p_ref)"
+        ),
+    )
+    p.add_argument(
+        "--mapped-hgvs-p-start-col",
+        default="mapped_hgvs_p_start",
+        help=(
+            "Input column with the amino acid position, used as part of the AA "
+            "substitution key for --mutpred2-properties-file with "
+            "--mutpred2-properties-join-key gene-aa (default: mapped_hgvs_p_start)"
+        ),
+    )
+    p.add_argument(
+        "--mapped-hgvs-p-alt-col",
+        default="mapped_hgvs_p_alt",
+        help=(
+            "Input column with the single-letter alternate amino acid, used as part "
+            "of the AA substitution key for --mutpred2-properties-file with "
+            "--mutpred2-properties-join-key gene-aa (default: mapped_hgvs_p_alt)"
         ),
     )
     p.add_argument(
@@ -1357,10 +1623,24 @@ def main(argv: Optional[list[str]] = None) -> None:
     if args.mutpred2_training_file and not Path(args.mutpred2_training_file).exists():
         logger.error("MutPred2 training-variants file not found: %s", args.mutpred2_training_file)
         raise SystemExit(1)
+    if args.mutpred2_gene_symbol_map_file and not Path(args.mutpred2_gene_symbol_map_file).exists():
+        logger.error(
+            "MutPred2 gene-symbol-map file not found: %s", args.mutpred2_gene_symbol_map_file
+        )
+        raise SystemExit(1)
 
     mutpred2_properties_cache: Optional[dict[tuple[str, str, int, int, str, str], str]] = None
+    mutpred2_gene_aa_cache: Optional[dict[tuple[str, str], str]] = None
+    mutpred2_gene_symbol_map: Optional[dict[str, str]] = None
     if mutpred2_properties_file:
-        mutpred2_properties_cache = _load_mutpred2_properties_file_cache(mutpred2_properties_file)
+        if args.mutpred2_properties_join_key == "gene-aa":
+            mutpred2_gene_aa_cache = _load_mutpred2_properties_gene_aa_cache(mutpred2_properties_file)
+            if args.mutpred2_gene_symbol_map_file:
+                mutpred2_gene_symbol_map = _load_mutpred2_gene_symbol_map(
+                    args.mutpred2_gene_symbol_map_file
+                )
+        else:
+            mutpred2_properties_cache = _load_mutpred2_properties_file_cache(mutpred2_properties_file)
         if dbnsfp_path is not None:
             logger.warning(
                 "Both --dbnsfp-file and --mutpred2-properties-file given; using "
@@ -1391,7 +1671,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     output_path = Path(args.output_file)
     delim = "\t" if input_path.suffix.lower() in (".tsv", ".txt") else ","
 
-    mutpred2_enabled = mutpred2_properties_cache is not None or dbnsfp_path is not None
+    mutpred2_enabled = (
+        mutpred2_properties_cache is not None
+        or mutpred2_gene_aa_cache is not None
+        or dbnsfp_path is not None
+    )
 
     ann_cols: list[str] = []
     if revel_enabled:
@@ -1409,7 +1693,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     am_cache: dict[tuple[str, int, str, str], Optional[tuple[str, str]]] = {}
     mutpred2_cache: dict[tuple[str, int, str, str], Optional[str]] = {}
 
-    mutpred2_dbnsfp_enabled = dbnsfp_path is not None and mutpred2_properties_cache is None
+    mutpred2_dbnsfp_enabled = (
+        dbnsfp_path is not None
+        and mutpred2_properties_cache is None
+        and mutpred2_gene_aa_cache is None
+    )
     if args.max_workers > 1 and (revel_path is not None or am_path is not None or mutpred2_dbnsfp_enabled):
         logger.info("Prefetch pass: scanning input for unique SNVs (max_workers=%d)…", args.max_workers)
         with input_path.open("r", encoding="utf-8", newline="") as scan_fh:
@@ -1508,6 +1796,9 @@ def main(argv: Optional[list[str]] = None) -> None:
                 revel_file_cache=revel_file_cache,
                 am_file_cache=am_file_cache,
                 mutpred2_properties_cache=mutpred2_properties_cache,
+                mutpred2_gene_aa_cache=mutpred2_gene_aa_cache,
+                mutpred2_gene_aa_long_indels=args.mutpred2_gene_aa_long_indels,
+                mutpred2_gene_symbol_map=mutpred2_gene_symbol_map,
                 variant_urn_col=args.variant_urn_col,
                 mapped_hgvs_g_chromosome_col=args.mapped_hgvs_g_chromosome_col,
                 mapped_hgvs_g_start_col=args.mapped_hgvs_g_start_col,
@@ -1519,6 +1810,9 @@ def main(argv: Optional[list[str]] = None) -> None:
                 mutpred2_training_set=mutpred2_training_set,
                 gene_symbol_col=args.gene_symbol_col,
                 mapped_hgvs_p_col=args.mapped_hgvs_p_col,
+                mapped_hgvs_p_ref_col=args.mapped_hgvs_p_ref_col,
+                mapped_hgvs_p_start_col=args.mapped_hgvs_p_start_col,
+                mapped_hgvs_p_alt_col=args.mapped_hgvs_p_alt_col,
             )
             row.update(ann)
             writer.writerow(row)
@@ -1566,8 +1860,21 @@ def main(argv: Optional[list[str]] = None) -> None:
         )
     if mutpred2_properties_cache is not None:
         logger.info(
-            "MutPred2 (properties file): %d/%d rows scored (%d candidates in file cache)",
+            "MutPred2 (properties file, genomic join): %d/%d rows scored "
+            "(%d candidates in file cache)",
             scored_mutpred2, processed, len(mutpred2_properties_cache),
+        )
+    elif mutpred2_gene_aa_cache is not None:
+        logger.info(
+            "MutPred2 (properties file, gene-AA join): %d/%d rows scored "
+            "(%d (gene, AA) keys in file cache); joined on %s/%s+%s+%s vs. "
+            "properties-file gene_symbol/AA; long indels (>3bp ref/alt): %s; "
+            "gene-symbol map: %s",
+            scored_mutpred2, processed, len(mutpred2_gene_aa_cache),
+            args.gene_symbol_col, args.mapped_hgvs_p_ref_col,
+            args.mapped_hgvs_p_start_col, args.mapped_hgvs_p_alt_col,
+            args.mutpred2_gene_aa_long_indels,
+            f"{len(mutpred2_gene_symbol_map)} entries" if mutpred2_gene_symbol_map else "none",
         )
     elif dbnsfp_path is not None:
         logger.info(
