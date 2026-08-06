@@ -25,6 +25,13 @@ Variant rows fall into three categories, detected automatically:
    genomic HGVS on GRCh38, then queries the ClinGen Allele Registry to populate
    ``mapped_hgvs_g``, ``mapped_hgvs_c``, and ``mapped_hgvs_p``.
 
+   This category also covers fully qualified **genomic** HGVS (e.g.
+   ``NC_000023.11:g.41334227_41334230delinsC``), which is already assay-level and
+   is queried directly. Because the row's own accession is genomic (not a
+   transcript), it cannot be used to select the ClinGen transcript allele;
+   ``--preferred-transcript``/``--preferred-transcript-col`` is used instead if
+   given, falling back to ClinGen's MANE transcript otherwise.
+
 2. **Sequence-based nucleotide** – ``raw_hgvs_nt`` is present but lacks a transcript
    prefix (e.g. ``c.1218G>A``). The ``target_sequence`` column is required. Rows that
    share the same ``--group-by`` column value are aligned together to GRCh38 via
@@ -440,6 +447,19 @@ def _is_valid_case1_raw_hgvs_nt(hgvs: str) -> bool:
     accession = m.group("accession")
     # Require a reference-sequence-like accession token (for example NM_/NC_/ENST).
     return bool(re.match(r"^(?:[A-Z]{2}_[0-9]+(?:\.[0-9]+)?|ENST[0-9]+(?:\.[0-9]+)?)$", accession))
+
+
+def _is_case1_genomic(raw_hgvs_nt: str) -> bool:
+    """Return True if a case-1 ``raw_hgvs_nt`` string's body is genomic (``g.``).
+
+    Case 1 covers any fully qualified ``accession:body`` HGVS string, which
+    includes both reference-based c./n. HGVS (``NM_000277.3:c.1218G>A``) and
+    genomic HGVS (``NC_000023.11:g.100A>T``). Only the former self-references
+    a transcript accession usable for extracting mapped_hgvs_c/p from ClinGen;
+    genomic rows need a MANE or explicit preferred-transcript lookup instead.
+    """
+    m = _CASE1_RAW_HGVS_NT_RE.match((raw_hgvs_nt or "").strip())
+    return bool(m) and m.group("body")[0].lower() == "g"
 
 
 def _detect_case(raw_nt: Optional[str], raw_pro: Optional[str]) -> Optional[int]:
@@ -921,13 +941,21 @@ def _normalize_transcript_accession(accession: str) -> str:
 def _process_case1(
     raw_hgvs_nt: str,
     dcd: Optional[dict],
+    preferred_transcript_nm: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """Handle a reference-based c./n. HGVS variant (case 1).
+    """Handle a reference-based c./n. HGVS variant, or a genomic (g.) HGVS
+    variant with an explicit accession (case 1).
 
     Returns ``(mapped_hgvs_c, mapped_hgvs_g, mapped_hgvs_p, error, clingen_allele_id)``.
 
     This path intentionally mirrors MaveDB's dcd_mapping-based handling for
     accession-referenced variants, even when no sequence alignment is required.
+
+    Genomic rows (``NC_...:g...``) are already assay-level, so the
+    dcd_mapping normalization step is skipped, and the row's own accession
+    (which is genomic, not a transcript) is not used to select the ClinGen
+    transcript allele. Instead *preferred_transcript_nm* is used if given,
+    falling back to ClinGen's MANE transcript otherwise.
     """
     raw = raw_hgvs_nt.strip()
     colon_pos = raw.find(":")
@@ -935,7 +963,10 @@ def _process_case1(
         return raw, None, None, f"Expected 'accession:variant' format; got: {raw!r}", None
 
     original_accession = raw[:colon_pos]
-    if dcd is not None:
+    is_genomic = _is_case1_genomic(raw)
+    if is_genomic:
+        assay_level_hgvs = raw
+    elif dcd is not None:
         fetch_clingen_genomic_hgvs = dcd["fetch_clingen_genomic_hgvs"]
         try:
             assay_level_hgvs = fetch_clingen_genomic_hgvs(raw)
@@ -951,7 +982,8 @@ def _process_case1(
     if data is None:
         return raw, None, None, f"ClinGen returned no data for {assay_level_hgvs!r}", None
 
-    hgvs_g, hgvs_c_from_clingen, hgvs_p = _extract_hgvs_from_clingen(data, original_accession)
+    transcript_accession = preferred_transcript_nm if is_genomic else original_accession
+    hgvs_g, hgvs_c_from_clingen, hgvs_p = _extract_hgvs_from_clingen(data, transcript_accession)
     clingen_allele_id = _extract_clingen_allele_id(data)
     final_hgvs_c = hgvs_c_from_clingen or raw
     if hgvs_g is None and assay_level_hgvs.startswith("NC_"):
@@ -963,47 +995,60 @@ def _process_case1_batch(
     raw_hgvs_nt_values: list[str],
     dcd: Optional[dict],
     max_concurrency: int,
+    preferred_transcript_nms: Optional[list[Optional[str]]] = None,
 ) -> list[
     tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]
 ]:
     """Process a batch of class-1 HGVS values, querying ClinGen concurrently.
 
+    *preferred_transcript_nms*, if given, must be the same length as
+    *raw_hgvs_nt_values*; each entry is used as the ClinGen transcript
+    selector for genomic (``g.``) rows only (see :func:`_process_case1`).
+
     Returns one ``(mapped_hgvs_c, mapped_hgvs_g, mapped_hgvs_p, error,
     clingen_allele_id)`` tuple per input string in the same order.
     """
+    if preferred_transcript_nms is None:
+        preferred_transcript_nms = [None] * len(raw_hgvs_nt_values)
+
     fetch_clingen_genomic_hgvs = dcd["fetch_clingen_genomic_hgvs"] if dcd is not None else None
     prepared: list[dict] = []
     assays_to_query: list[str] = []
     assays_seen: set[str] = set()
 
-    for raw_hgvs_nt in raw_hgvs_nt_values:
+    for raw_hgvs_nt, preferred_transcript_nm in zip(raw_hgvs_nt_values, preferred_transcript_nms):
         raw = raw_hgvs_nt.strip()
         colon_pos = raw.find(":")
         if colon_pos <= 0:
             prepared.append(
                 {
                     "raw": raw,
-                    "original_accession": None,
+                    "transcript_accession": None,
                     "assay_level_hgvs": None,
                     "error": f"Expected 'accession:variant' format; got: {raw!r}",
                 }
             )
             continue
 
-        assay_level_hgvs = raw
-        if fetch_clingen_genomic_hgvs is not None:
-            # fetch_clingen_genomic_hgvs is a synchronous dcd_mapping call that
-            # itself hits ClinGen internally.  We don't control its concurrency,
-            # so these normalization calls are sequential.  The subsequent
-            # ClinGen Allele Registry lookups (for hgvs_g/c/p and allele ID) are
-            # batched concurrently below via _query_clingen_by_hgvs_batch.
-            assay_level_hgvs = fetch_clingen_genomic_hgvs(raw)
+        original_accession = raw[:colon_pos]
+        is_genomic = _is_case1_genomic(raw)
+        if is_genomic:
+            assay_level_hgvs = raw
+        else:
+            assay_level_hgvs = raw
+            if fetch_clingen_genomic_hgvs is not None:
+                # fetch_clingen_genomic_hgvs is a synchronous dcd_mapping call that
+                # itself hits ClinGen internally.  We don't control its concurrency,
+                # so these normalization calls are sequential.  The subsequent
+                # ClinGen Allele Registry lookups (for hgvs_g/c/p and allele ID) are
+                # batched concurrently below via _query_clingen_by_hgvs_batch.
+                assay_level_hgvs = fetch_clingen_genomic_hgvs(raw)
 
         if assay_level_hgvs is None:
             prepared.append(
                 {
                     "raw": raw,
-                    "original_accession": raw[:colon_pos],
+                    "transcript_accession": preferred_transcript_nm if is_genomic else original_accession,
                     "assay_level_hgvs": None,
                     "error": f"ClinGen returned no data for {raw!r}",
                 }
@@ -1013,7 +1058,7 @@ def _process_case1_batch(
         prepared.append(
             {
                 "raw": raw,
-                "original_accession": raw[:colon_pos],
+                "transcript_accession": preferred_transcript_nm if is_genomic else original_accession,
                 "assay_level_hgvs": assay_level_hgvs,
                 "error": None,
             }
@@ -1045,14 +1090,14 @@ def _process_case1_batch(
             continue
 
         raw = item["raw"]
-        original_accession = item["original_accession"]
+        transcript_accession = item["transcript_accession"]
         assay_level_hgvs = item["assay_level_hgvs"]
         data = clingen_results.get(assay_level_hgvs)
         if data is None:
             results.append((raw, None, None, f"ClinGen returned no data for {assay_level_hgvs!r}", None))
             continue
 
-        hgvs_g, hgvs_c_from_clingen, hgvs_p = _extract_hgvs_from_clingen(data, original_accession)
+        hgvs_g, hgvs_c_from_clingen, hgvs_p = _extract_hgvs_from_clingen(data, transcript_accession)
         clingen_allele_id = _extract_clingen_allele_id(data)
         final_hgvs_c = hgvs_c_from_clingen or raw
         if hgvs_g is None and assay_level_hgvs.startswith("NC_"):
@@ -1903,10 +1948,12 @@ def map_variants(
             sequence-based groups (cases 2 and 3), overriding automatic MANE/UTA
             selection.  Must include the version suffix (e.g. ``NM_007194.4``).  If the
             accession cannot be resolved in UTA the mapper falls back to automatic
-            selection and emits a warning.
+            selection and emits a warning.  Also used to select the ClinGen transcript
+            allele for genomic (``g.``) case-1 rows, overriding the MANE fallback.
         preferred_transcript_col: Optional column in the input file whose value
-            specifies the preferred NM_ accession for each sequence-based group.
-            Blank values are ignored; the global ``preferred_transcript`` is used as a
+            specifies the preferred NM_ accession for each sequence-based group (or,
+            for genomic case-1 rows, for that row).  Blank values are ignored; the
+            global ``preferred_transcript`` is used as a
             fallback when the column is blank or absent.  The column value is assumed to
             be the same for all rows in a group (i.e. rows sharing a target sequence).
         preserve_order: Order guarantee for output rows. Options are:
@@ -2166,14 +2213,29 @@ def map_variants(
                     )
 
             raw_hgvs_nt_values = [entry[2] for entry in case1_rows]
+            # Per-row preferred transcript (used for genomic case-1 rows only):
+            # column value takes precedence over the global override.
+            preferred_transcript_nms = [
+                (
+                    (entry[1].get(preferred_transcript_col) or "").strip() or preferred_transcript
+                    if preferred_transcript_col
+                    else preferred_transcript
+                )
+                or None
+                for entry in case1_rows
+            ]
             if max_clingen_concurrency > 1 and len(raw_hgvs_nt_values) > 1:
                 batch_results = _process_case1_batch(
                     raw_hgvs_nt_values,
                     dcd_for_case1,
                     max_concurrency=max_clingen_concurrency,
+                    preferred_transcript_nms=preferred_transcript_nms,
                 )
             else:
-                batch_results = [_process_case1(raw_nt, dcd_for_case1) for raw_nt in raw_hgvs_nt_values]
+                batch_results = [
+                    _process_case1(raw_nt, dcd_for_case1, preferred_transcript_nm=ptx)
+                    for raw_nt, ptx in zip(raw_hgvs_nt_values, preferred_transcript_nms)
+                ]
 
             for (idx, row, _), (hgvs_c, hgvs_g, hgvs_p, err, clingen_allele_id) in zip(case1_rows, batch_results):
                 # For case-1 variants the strand can be looked up from UTA using the

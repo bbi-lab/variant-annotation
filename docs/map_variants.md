@@ -33,18 +33,26 @@ File paths passed to `run_map_variants.sh` are automatically translated to conta
 
 The script detects three mutually exclusive cases from the `raw_hgvs_nt` and `raw_hgvs_pro` columns:
 
-### Case 1 — Reference-based transcript HGVS
+### Case 1 — Reference-based transcript HGVS, or fully-qualified genomic HGVS
 
-**Condition:** `raw_hgvs_nt` contains a **valid, fully-qualified** accession-based nucleotide HGVS string (e.g. `NM_000277.3:c.1218G>A` or `NC_000012.12:g.102917016C>A`).
+**Condition:** `raw_hgvs_nt` contains a **valid, fully-qualified** accession-based nucleotide HGVS string. This covers two distinct sub-cases, both handled here because both are already accession-qualified and need no BLAT alignment:
 
-**Processing:**
+- **Transcript-referenced** (e.g. `NM_000277.3:c.1218G>A`, `ENST00000316054.9:c.1142G>A`) — the accession is itself a transcript.
+- **Genomic** (e.g. `NC_000012.12:g.102917016C>A`) — the accession is a chromosome (`NC_`); there is no transcript to self-reference.
+
+**Processing (transcript-referenced rows):**
 1. The HGVS is passed through `dcd_mapping.vrs_map.fetch_clingen_genomic_hgvs` to obtain an assay-level genomic HGVS (this normalises the notation and resolves any Ensembl → RefSeq conversion if needed).
 2. The assay-level HGVS is queried in the ClinGen Allele Registry.
 3. The transcript allele matching the original accession is selected from the response to populate `mapped_hgvs_c` and `mapped_hgvs_p`; the GRCh38 genomic allele populates `mapped_hgvs_g`.
 
+**Processing (genomic rows):**
+1. The row is already assay-level genomic, so the `fetch_clingen_genomic_hgvs` normalisation step is skipped and the raw HGVS is queried directly.
+2. Because the row's own accession is genomic rather than a transcript, it cannot be used to select a `transcriptAlleles` entry from the ClinGen response. Instead the mapper uses `--preferred-transcript`/`--preferred-transcript-col` if supplied, otherwise ClinGen's own MANE-designated transcript for that locus — see [Genomic case-1 rows](#genomic-case-1-rows) below. If neither ClinGen nor an override can identify a transcript allele, `mapped_hgvs_c` falls back to the raw genomic string and `mapped_hgvs_p` is left blank.
+3. The GRCh38 genomic allele from the response (or the input HGVS itself, if already `NC_`-prefixed) populates `mapped_hgvs_g`.
+
 **Requirements:** None beyond the input column. `target_sequence` is not required.
 
-**Note:** If `dcd_mapping` is unavailable (e.g. not installed), the script falls back to querying ClinGen directly with the raw input HGVS.
+**Note:** If `dcd_mapping` is unavailable (e.g. not installed), transcript-referenced rows fall back to querying ClinGen directly with the raw input HGVS. Genomic rows are unaffected either way, since they never call into `dcd_mapping`.
 
 ---
 
@@ -173,10 +181,21 @@ When resolving the NP_ for an override, the mapper checks the MANE table first (
 
 | Option | Default | Description |
 |---|---|---|
-| `--preferred-transcript NM_ACCESSION` | — | NM_ accession (including version, e.g. `NM_007194.4`) to use as the reference transcript for **all** sequence-based groups, overriding automatic MANE/UTA selection. |
-| `--preferred-transcript-col COLUMN` | — | Column in the input file whose value specifies the preferred NM_ accession for each group. Blank values are ignored. `--preferred-transcript` is used as a fallback when the column is blank or absent. Assumed to be identical for all rows sharing a target sequence. |
+| `--preferred-transcript NM_ACCESSION` | — | NM_ accession (including version, e.g. `NM_007194.4`) to use as the reference transcript for **all** sequence-based groups (cases 2 & 3), overriding automatic MANE/UTA selection. Also used, per row, to select the ClinGen transcript allele for genomic case-1 rows — see [Genomic case-1 rows](#genomic-case-1-rows). |
+| `--preferred-transcript-col COLUMN` | — | Column in the input file whose value specifies the preferred NM_ accession. For sequence-based groups this is assumed identical for all rows sharing a target sequence; for genomic case-1 rows it is read per row. Blank values are ignored. `--preferred-transcript` is used as a fallback when the column is blank or absent. |
 
-When both options are provided the column value takes precedence over the global flag for any group that has a non-blank column value.
+When both options are provided the column value takes precedence over the global flag for any group (or, for genomic case-1 rows, any row) that has a non-blank column value.
+
+#### Genomic case-1 rows
+
+Genomic case-1 rows (`raw_hgvs_nt` like `NC_000012.12:g.102917016C>A`) never go through the BLAT/UTA pipeline above — there is no sequence to align, and the row is already assay-level. Transcript selection for these rows is correspondingly simpler:
+
+1. The genomic HGVS is queried in the ClinGen Allele Registry directly.
+2. If `--preferred-transcript`/`--preferred-transcript-col` names an accession, the `transcriptAlleles` entry whose HGVS begins with that accession is used to populate `mapped_hgvs_c` and `mapped_hgvs_p`.
+3. Otherwise, ClinGen's own MANE-designated transcript for that locus (the `MANE` field on the matching `transcriptAlleles` entry) is used.
+4. If neither of the above yields a transcript allele — for example, the ClinGen record has no MANE annotation and no override was given — `mapped_hgvs_c` falls back to the raw genomic string and `mapped_hgvs_p` is left blank, exactly as for a case-1 row where the accession itself can't be matched.
+
+Because this MANE lookup comes straight from ClinGen rather than the local UTA/MANE-summary files, it is not subject to the UTA/MANE version-mismatch pitfall described below — but it is still worth supplying `--preferred-transcript`/`--preferred-transcript-col` whenever you know the intended transcript, both for reproducibility and to cover loci ClinGen has not annotated with a MANE transcript.
 
 **Finding the correct NM_ accession.** The MANE Select transcript is the canonical choice for most protein-coding genes. Look it up in the [NCBI MANE summary file](https://ftp.ncbi.nlm.nih.gov/refseq/MANE/MANE_human/current/) or on the gene's RefSeq page. Include the version suffix (e.g. `NM_007194.4`, not `NM_007194`).
 
@@ -282,7 +301,7 @@ unit to reduce wall-clock time.
 
 | Case | What is batched |
 |---|---|
-| **1** (reference-based) | After `fetch_clingen_genomic_hgvs` resolves each assay-level HGVS (sequentially — this is a synchronous `dcd_mapping` call), all unique assay-level strings in the input chunk are collected and queried concurrently. |
+| **1** (reference-based) | Transcript-referenced rows: after `fetch_clingen_genomic_hgvs` resolves each assay-level HGVS (sequentially — this is a synchronous `dcd_mapping` call), all unique assay-level strings in the input chunk are collected and queried concurrently. Genomic rows skip the `fetch_clingen_genomic_hgvs` step (already assay-level) and are queried concurrently directly. |
 | **2** (sequence-based) | After `dcd_mapping` completes for the whole group, all unique assay-level strings are collected and queried concurrently. |
 | **3** (protein-only) | Same as case 2 — batched after the group's DCD pipeline run finishes. |
 
@@ -428,7 +447,10 @@ This is valid HGVS and is written to `mapped_hgvs_g`.
 : Transient network errors are retried with exponential backoff. If ClinGen consistently returns nothing for a specific HGVS, the variant may not be registered; check the ClinGen Allele Registry directly. For no-change alleles (e.g. a `delinsXXX` where XXX equals the reference sequence), this error is expected — ClinGen has no record for reference alleles. See [No-change alleles](#no-change-alleles).
 
 **Wrong protein reference selected (`mapped_hgvs_p` uses an unexpected NP_ accession)**
-: The mapper chooses the reference transcript automatically by aligning the target sequence via BLAT, querying UTA for overlapping transcripts, and then filtering those transcripts against the MANE summary file. If the version of the MANE Select transcript in the local UTA database does not exactly match the version stored in the MANE summary file (e.g. UTA has `NM_007194.3` while the MANE file has `NM_007194.4`), the MANE filter returns no results and the mapper falls back to selecting the longest overlapping transcript — which may not be the intended MANE Select. Use `--preferred-transcript` (or `--preferred-transcript-col`) to supply the correct NM_ accession directly. The MANE table is checked first, so providing the MANE-listed version (e.g. `NM_007194.4`) works even if that exact version is absent from UTA.
+: The mapper chooses the reference transcript automatically by aligning the target sequence via BLAT, querying UTA for overlapping transcripts, and then filtering those transcripts against the MANE summary file. If the version of the MANE Select transcript in the local UTA database does not exactly match the version stored in the MANE summary file (e.g. UTA has `NM_007194.3` while the MANE file has `NM_007194.4`), the MANE filter returns no results and the mapper falls back to selecting the longest overlapping transcript — which may not be the intended MANE Select. Use `--preferred-transcript` (or `--preferred-transcript-col`) to supply the correct NM_ accession directly. The MANE table is checked first, so providing the MANE-listed version (e.g. `NM_007194.4`) works even if that exact version is absent from UTA. This applies to sequence-based groups (cases 2 & 3); for genomic case-1 rows see the next entry.
+
+**Genomic case-1 row: `mapped_hgvs_c` equals the raw genomic HGVS, `mapped_hgvs_p` is blank**
+: This means ClinGen either has no MANE-designated transcript for that locus, or (on older runs, before this behavior was fixed) the row's own genomic accession was mistakenly used to select a transcript allele — which never matches, since the accession is a chromosome (`NC_`), not a transcript. Supply `--preferred-transcript` or `--preferred-transcript-col` naming the intended NM_ accession so the mapper selects that transcript's allele directly instead of relying on ClinGen's MANE field. See [Genomic case-1 rows](#genomic-case-1-rows).
 
 **Ensembl ENST accessions**
 : If `raw_hgvs_nt` contains an ENST-prefixed HGVS (e.g. `ENST00000316054.9:c.1142G>A`), the script attempts to resolve a RefSeq NM_ accession via the Ensembl REST API before querying ClinGen. This requires internet access to `https://rest.ensembl.org`.

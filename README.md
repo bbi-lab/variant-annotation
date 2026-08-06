@@ -231,7 +231,7 @@ src/scripts/run_map_variants.sh input.tsv output.tsv \
 
 **Notes:**
 - Three variant cases are detected automatically from the input columns — see [docs/map_variants.md](docs/map_variants.md) for full details:
-  - **Case 1** (`raw_hgvs_nt` with a transcript accession prefix, e.g. `NM_000277.3:c.1218G>A`): normalised through `dcd_mapping` and ClinGen; no target sequence needed
+  - **Case 1** (`raw_hgvs_nt` with an accession prefix, e.g. `NM_000277.3:c.1218G>A` or a fully-qualified genomic `NC_000012.12:g.102917016C>A`): normalised through `dcd_mapping` and ClinGen; no target sequence needed. For genomic input, the transcript for `mapped_hgvs_c`/`mapped_hgvs_p` comes from ClinGen's MANE annotation, or from `--preferred-transcript`/`--preferred-transcript-col` if given
   - **Case 2** (`raw_hgvs_nt` without an accession prefix, e.g. `c.1218G>A`): BLAT-aligned from `target_sequence`; all rows sharing the same `--group-by` value are aligned together
   - **Case 3** (protein-only, `raw_hgvs_pro` with no `raw_hgvs_nt`): BLAT-aligned at the protein annotation layer
 - `--drop-columns target_sequence` removes the large sequence column from the output (recommended)

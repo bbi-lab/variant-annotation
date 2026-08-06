@@ -367,6 +367,7 @@ def test_map_variants_targets_file_unknown_name_logs_warning(tmp_path, monkeypat
     [
         ("NM_000001.1:c.123A>G", "", 1),
         ("ENST00000316054.9:c.1142G>A", "", 1),
+        ("NC_000023.11:g.41334227_41334230delinsC", "", 1),
         ("c.123A>G", "", 2),
         ("not_an_accession:c.123A>G", "", 2),
         ("", "p.Ala1Val", 3),
@@ -376,6 +377,20 @@ def test_map_variants_targets_file_unknown_name_logs_warning(tmp_path, monkeypat
 )
 def test_detect_case_variants(raw_nt, raw_pro, expected):
     assert mv._detect_case(raw_nt, raw_pro) == expected
+
+
+@pytest.mark.parametrize(
+    "raw_nt,expected",
+    [
+        ("NC_000023.11:g.41334227_41334230delinsC", True),
+        ("NM_000001.1:c.123A>G", False),
+        ("NM_000001.1:n.123A>G", False),
+        ("not_an_accession:c.123A>G", False),
+        ("", False),
+    ],
+)
+def test_is_case1_genomic(raw_nt, expected):
+    assert mv._is_case1_genomic(raw_nt) is expected
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +668,7 @@ def test_map_variants_routes_class1_class2_class3(tmp_path, monkeypatch):
     called_case1 = []
     pipeline_calls = []
 
-    def fake_case1(raw_hgvs_nt, dcd):
+    def fake_case1(raw_hgvs_nt, dcd, preferred_transcript_nm=None):
         called_case1.append(raw_hgvs_nt)
         return (
             "NM_000001.1:c.10A>G",
@@ -810,3 +825,167 @@ def test_process_case1_batch_reports_invalid_and_missing_clingen(monkeypatch):
 
     assert "Expected 'accession:variant' format" in (results[0][3] or "")
     assert "ClinGen returned no data" in (results[1][3] or "")
+
+
+def test_process_case1_genomic_falls_back_to_mane_transcript(monkeypatch):
+    """A genomic raw_hgvs_nt must not be used as its own transcript selector.
+
+    Passing the genomic accession itself into ``_extract_hgvs_from_clingen``
+    would never match a transcript allele, silently leaving mapped_hgvs_c as
+    the raw genomic string and mapped_hgvs_p unset. The fix requires passing
+    None (MANE fallback) instead when no preferred transcript is given.
+    """
+    seen_transcript_accessions = []
+
+    def fake_extract(data, transcript_accession):
+        seen_transcript_accessions.append(transcript_accession)
+        if transcript_accession is None:
+            return "NC_000023.11:g.100_103delinsC", "NM_001356.5:c.-25_-23del", "NP_001347.3:p.="
+        return None, None, None
+
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs", lambda hgvs: {"hgvs": hgvs})
+    monkeypatch.setattr(mv, "_extract_hgvs_from_clingen", fake_extract)
+    monkeypatch.setattr(mv, "_extract_clingen_allele_id", lambda data: "CA001")
+
+    raw = "NC_000023.11:g.100_103delinsC"
+    hgvs_c, hgvs_g, hgvs_p, error, allele_id = mv._process_case1(raw, dcd=None)
+
+    assert seen_transcript_accessions == [None]
+    assert hgvs_c == "NM_001356.5:c.-25_-23del"
+    assert hgvs_p == "NP_001347.3:p.="
+    assert error is None
+    assert allele_id == "CA001"
+
+
+def test_process_case1_genomic_honors_preferred_transcript(monkeypatch):
+    seen_transcript_accessions = []
+
+    def fake_extract(data, transcript_accession):
+        seen_transcript_accessions.append(transcript_accession)
+        return "NC_000023.11:g.100_103delinsC", f"{transcript_accession}:c.1A>G", "NP_1:p.Ala1Val"
+
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs", lambda hgvs: {"hgvs": hgvs})
+    monkeypatch.setattr(mv, "_extract_hgvs_from_clingen", fake_extract)
+    monkeypatch.setattr(mv, "_extract_clingen_allele_id", lambda data: "CA002")
+
+    raw = "NC_000023.11:g.100_103delinsC"
+    hgvs_c, hgvs_g, hgvs_p, error, allele_id = mv._process_case1(
+        raw, dcd=None, preferred_transcript_nm="NM_001356.5"
+    )
+
+    assert seen_transcript_accessions == ["NM_001356.5"]
+    assert hgvs_c == "NM_001356.5:c.1A>G"
+
+
+def test_process_case1_transcript_referenced_ignores_preferred_transcript(monkeypatch):
+    """Non-genomic case-1 rows must keep using their own accession, unaffected
+    by preferred_transcript_nm (that override only applies to genomic rows)."""
+    seen_transcript_accessions = []
+
+    def fake_extract(data, transcript_accession):
+        seen_transcript_accessions.append(transcript_accession)
+        return None, f"{transcript_accession}:c.10A>G", "NP_1:p.Lys4Arg"
+
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs", lambda hgvs: {"hgvs": hgvs})
+    monkeypatch.setattr(mv, "_extract_hgvs_from_clingen", fake_extract)
+    monkeypatch.setattr(mv, "_extract_clingen_allele_id", lambda data: "CA003")
+
+    raw = "NM_000001.1:c.10A>G"
+    hgvs_c, hgvs_g, hgvs_p, error, allele_id = mv._process_case1(
+        raw, dcd=None, preferred_transcript_nm="NM_999999.9"
+    )
+
+    assert seen_transcript_accessions == ["NM_000001.1"]
+    assert hgvs_c == "NM_000001.1:c.10A>G"
+
+
+def test_process_case1_batch_genomic_and_transcript_rows_select_correct_accession(monkeypatch):
+    seen_transcript_accessions = []
+
+    async def fake_query_batch(assays, max_concurrency=5):
+        return {assay: {"assay": assay} for assay in assays}
+
+    def fake_extract(data, transcript_accession):
+        seen_transcript_accessions.append(transcript_accession)
+        hgvs_c = f"{transcript_accession}:c.1A>G" if transcript_accession else None
+        return data["assay"], hgvs_c, None
+
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs_batch", fake_query_batch)
+    monkeypatch.setattr(mv, "_extract_hgvs_from_clingen", fake_extract)
+    monkeypatch.setattr(mv, "_extract_clingen_allele_id", lambda data: None)
+
+    raws = [
+        "NC_000023.11:g.100_103delinsC",  # genomic, explicit preferred transcript
+        "NM_000001.1:c.10A>G",  # transcript-referenced, self accession
+        "NC_000001.11:g.200A>T",  # genomic, no preferred transcript -> MANE (None)
+    ]
+    preferred = ["NM_001356.5", None, None]
+
+    results = mv._process_case1_batch(raws, dcd=None, max_concurrency=3, preferred_transcript_nms=preferred)
+
+    assert seen_transcript_accessions == ["NM_001356.5", "NM_000001.1", None]
+    assert results[0][0] == "NM_001356.5:c.1A>G"
+    assert results[1][0] == "NM_000001.1:c.1A>G"
+    # MANE fallback found nothing in this fake, so it degrades to the raw genomic string.
+    assert results[2][0] == raws[2]
+
+
+def test_map_variants_case1_genomic_rows_honor_preferred_transcript_col(tmp_path, monkeypatch):
+    input_path = tmp_path / "in.tsv"
+    output_path = tmp_path / "out.tsv"
+
+    rows = [
+        {
+            "variant_urn": "v1",
+            "raw_hgvs_nt": "NC_000001.11:g.100A>G",
+            "raw_hgvs_pro": "",
+            "target_sequence": "",
+            "preferred_transcript": "NM_AAA.1",
+        },
+        {
+            "variant_urn": "v2",
+            "raw_hgvs_nt": "NC_000001.11:g.200A>T",
+            "raw_hgvs_pro": "",
+            "target_sequence": "",
+            "preferred_transcript": "NM_BBB.1",
+        },
+    ]
+    with open(input_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["variant_urn", "raw_hgvs_nt", "raw_hgvs_pro", "target_sequence", "preferred_transcript"],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    seen_transcript_accessions = []
+
+    def fake_extract(data, transcript_accession):
+        seen_transcript_accessions.append(transcript_accession)
+        hgvs_p = transcript_accession.replace("NM_", "NP_") + ":p.Ala1Val"
+        return data["assay"], f"{transcript_accession}:c.1A>G", hgvs_p
+
+    async def fake_query_batch(assays, max_concurrency=5):
+        return {assay: {"assay": assay} for assay in assays}
+
+    monkeypatch.setattr(
+        mv, "_try_import_dcd_mapping", lambda: {"fetch_clingen_genomic_hgvs": lambda raw: raw}
+    )
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs_batch", fake_query_batch)
+    monkeypatch.setattr(mv, "_extract_hgvs_from_clingen", fake_extract)
+    monkeypatch.setattr(mv, "_extract_clingen_allele_id", lambda data: None)
+
+    mv.map_variants(
+        str(input_path),
+        str(output_path),
+        preferred_transcript_col="preferred_transcript",
+    )
+
+    assert seen_transcript_accessions == ["NM_AAA.1", "NM_BBB.1"]
+
+    out_rows = _read_tsv(output_path)
+    assert out_rows[0]["mapped_hgvs_c"] == "NM_AAA.1:c.1A>G"
+    assert out_rows[1]["mapped_hgvs_c"] == "NM_BBB.1:c.1A>G"
+    assert out_rows[0]["mapped_hgvs_c"] != out_rows[0]["raw_hgvs_nt"]
+    assert out_rows[0]["mapped_hgvs_p"] == "NP_AAA.1:p.Ala1Val"

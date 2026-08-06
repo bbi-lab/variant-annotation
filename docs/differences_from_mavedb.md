@@ -23,7 +23,7 @@ This is the most significant semantic difference.
 
 **MaveDB:** One transcript accession is determined per *score set*, not per row. `get_target_coding_info()` checks the score set's `target_accession` (for accession-based targets) or the `cdna.sequence_accessions` field in `post_mapped_metadata` (for sequence-based targets). All variants in the score set use that single accession when extracting `hgvs_c` from ClinGen. If `post_mapped_metadata` contains more than one cDNA accession, the job raises `ValueError`. Multi-target score sets are explicitly not supported (`NotImplementedError`) — `populate_hgvs_for_score_set` skips them entirely.
 
-**This pipeline:** The transcript accession is extracted per row from `raw_hgvs_nt` (e.g. `NM_000277.3` from `NM_000277.3:c.1218G>A`). Different rows may use different transcripts. Multi-target inputs (multiple gene groups with different sequences/accessions) are naturally supported.
+**This pipeline:** The transcript accession is extracted per row from `raw_hgvs_nt` (e.g. `NM_000277.3` from `NM_000277.3:c.1218G>A`). Different rows may use different transcripts. Multi-target inputs (multiple gene groups with different sequences/accessions) are naturally supported. This self-referencing extraction only works when `raw_hgvs_nt` is itself transcript-referenced; when it is a fully-qualified genomic HGVS (`NC_...:g...`), there is no transcript accession to extract, so the mapper instead uses ClinGen's MANE-designated transcript, or `--preferred-transcript`/`--preferred-transcript-col` if supplied — see [map_variants.md — Genomic case-1 rows](map_variants.md#genomic-case-1-rows).
 
 #### Preferred-transcript overrides (this pipeline only)
 
@@ -31,10 +31,10 @@ Automatic transcript selection can fail when the local UTA database and the bund
 
 MaveDB has no mechanism to override transcript selection at run time. In the worker model, the transcript accession is determined from fields already stored in the database (`target_accession` or `cdna.sequence_accessions` in `post_mapped_metadata`); a bad automatic selection would require re-running the full mapping job with a corrected database.
 
-This pipeline adds two override options for sequence-based groups:
+This pipeline adds two override options for sequence-based groups (and, per row, for genomic case-1 rows — see above):
 
-- **`--preferred-transcript NM_ACCESSION`** — applies a single NM_ accession to all sequence-based groups in the run.
-- **`--preferred-transcript-col COLUMN`** — reads the preferred NM_ from a column in the input file, allowing different groups to specify different transcripts. Blank values fall back to `--preferred-transcript` (if set) or automatic selection.
+- **`--preferred-transcript NM_ACCESSION`** — applies a single NM_ accession to all sequence-based groups in the run (or to every genomic case-1 row, if no column override is given).
+- **`--preferred-transcript-col COLUMN`** — reads the preferred NM_ from a column in the input file, allowing different groups (or, for genomic case-1 rows, different rows) to specify different transcripts. Blank values fall back to `--preferred-transcript` (if set) or automatic selection.
 
 When an override is supplied, the mapper skips `select_transcripts` (steps 3–5 of the automatic pipeline) and resolves the NP_ protein accession by checking the MANE table first, then UTA. This means a MANE-listed accession such as `NM_007194.4` resolves correctly even if UTA only has `NM_007194.3`. BLAT alignment is still performed (it is required for VRS coordinate mapping). If the accession cannot be resolved in either source, automatic selection is used and a warning is emitted.
 
