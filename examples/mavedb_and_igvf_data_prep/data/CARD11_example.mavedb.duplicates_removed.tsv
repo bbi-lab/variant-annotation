@@ -1,0 +1,2 @@
+seq	reference	coding variant	variant_type	region	Rep1_counts_selection	Rep2_counts_selection	Rep3_counts_selection	Rep1_counts_noselection	Rep2_counts_noselection	Rep3_counts_noselection	Rep1_FC	Rep2_FC	Rep3_FC	Functional Score	Classification
+CCCAGAGCCCAGCAGCTCCTCCTAGTGTAACTGCAGCGCCTG	CCCAGAGCCCAGCAGCTACTCCTAGTGAAACTGCAGCGCCTG	NM_032415.7:c.2533A>T	nonsense	453	180	278	352	284	834	511	-1.107047901	-1.749688306	-0.473230513	-1.109988906	functional

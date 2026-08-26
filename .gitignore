@@ -224,3 +224,4 @@ __marimo__/
 /data/uta/uta_20241220.pgd.gz
 !/data/.gitkeep
 *.tsv
+!/examples/**/*.tsv
