@@ -196,6 +196,22 @@ services:
       - .:/usr/src/app
       - ${VARIANT_DATA_DIR:-./data}:/work
 
+  correct-reference-alleles:
+    <<: *tools-image
+    profiles:
+      - tools
+    depends_on:
+      - seqrepo
+      - uta
+    env_file:
+      - settings/.env
+    entrypoint: ["python", "-m", "src.correct_reference_alleles"]
+    command: ["--help"]
+    volumes:
+      - .:/usr/src/app
+      - variant-annotation-seqrepo:/usr/local/share/seqrepo
+      - ${VARIANT_DATA_DIR:-./data}:/work
+
   utilities:
     <<: *tools-image
     profiles:
