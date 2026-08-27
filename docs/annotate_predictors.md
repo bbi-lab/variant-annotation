@@ -14,7 +14,7 @@ At least one of `--revel-file`, `--revel-cache-file`, `--alphamissense-file`, `-
 
 | Tool | Output column(s) | Range | Column flag | Env variable |
 |---|---|---|---|---|
-| REVEL | `revel.score` | 0–1 (higher = more pathogenic) | `--revel-file` | `REVEL_FILE` |
+| REVEL | `revel.score` | 0–1 (higher = more pathogenic) | `--revel-file` (+ `--revel-mode`, see below) | `REVEL_FILE` |
 | AlphaMissense | `alphamissense.pathogenicity` | 0–1 | `--alphamissense-file` | `ALPHAMISSENSE_FILE` |
 | AlphaMissense | `alphamissense.class` | `likely_benign` / `ambiguous` / `likely_pathogenic` | (same file) | |
 | MutPred2 (via properties file — preferred) | `mutpred2.score` | 0–1 | `--mutpred2-properties-file` | `MUTPRED2_PROPERTIES_FILE` |
@@ -27,6 +27,27 @@ Only the columns for tools whose data files are provided will appear in the outp
 MutPred2 has two, mutually exclusive sources. If `--mutpred2-properties-file` is given it takes precedence and `--dbnsfp-file` is ignored (a warning is logged when both are supplied).
 
 The two training-set columns are independent, optional additions — they can be supplied with or without any of the score sources above, and don't require `tabix`.
+
+---
+
+## REVEL disambiguation modes
+
+REVEL's precomputed file has one row per genomic position **per overlapping transcript**. A genomic position can be missense on one transcript and non-missense (e.g. synonymous) on the transcript this project annotates — so which row(s) count matters. `--revel-mode {coordinate,transcript,aa}` (default: `transcript`) controls it:
+
+| Mode | Behavior | Requires |
+|---|---|---|
+| `coordinate` | Max score across every row matching `(chrom, pos, ref, alt)`, regardless of transcript. Legacy behavior; can attach a score to a variant this project itself calls non-missense. | Plain 5-column `revel_hg38.tsv.gz` |
+| `transcript` (default) | Additionally require the row's Ensembl transcript ID to match this variant's own transcript (mapped from RefSeq via `--revel-mane-file` or `--revel-transcript-mapping-file`). | Extended `revel_hg38.tsv.gz` (see "Data file preparation" below) + a transcript mapping |
+| `aa` | Additionally require the row's `aaref`/`aaalt` to equal this variant's own amino-acid ref/alt. Since REVEL's rows are always missense (`aaref != aaalt`), a variant with `aa_ref == aa_alt` (synonymous) can never match. Reproduces the join used by the original pipeline notebook. | Extended `revel_hg38.tsv.gz` |
+
+`transcript` mode reads the variant's RefSeq transcript from `--mapped-hgvs-c-transcript-col` (default: `mapped_hgvs_c_transcript`) and needs exactly one of:
+
+- `--revel-mane-file MANE.GRCh38.*.summary.txt.gz` — NCBI MANE summary file (same format as `src/remap_transcript_ids.py`'s `--mane-file`), restricted to MANE Select / MANE Plus Clinical transcripts (sequence-identical between RefSeq and Ensembl).
+- `--revel-transcript-mapping-file FILE` — custom two-column TSV/CSV with headers `source_id`, `target_id` (RefSeq → Ensembl).
+
+`aa` mode reads the variant's own amino-acid ref/alt from `--mapped-hgvs-p-ref-col`/`--mapped-hgvs-p-alt-col` (same columns used for `--mutpred2-properties-join-key gene-aa`).
+
+Choosing `transcript` or `aa` mode with a REVEL file that lacks the extended columns fails fast at startup with an explanatory error rather than silently annotating with the wrong scope.
 
 ---
 
@@ -152,12 +173,17 @@ Passed via `--mutpred2-gene-symbol-map-file PATH` or the `MUTPRED2_GENE_SYMBOL_M
    unzip revel_with_transcript_ids.csv.zip
    tail -n +2 revel_with_transcript_ids.csv \
      | awk -F',' 'NF>=9 && $3!="" && $3!="." \
-                  {print $1"\t"$3"\t"$4"\t"$5"\t"$8}' \
-     | (printf '#chr\tpos\tref\talt\trevel_score\n'; sort -k1,1V -k2,2n) \
+                  {print $1"\t"$3"\t"$4"\t"$5"\t"$8"\t"$6"\t"$7"\t"$9}' \
+     | (printf '#chr\tpos\tref\talt\trevel_score\taaref\taaalt\tensembl_transcriptid\n'; sort -k1,1V -k2,2n) \
      | bgzip > revel_hg38.tsv.gz
    tabix -s 1 -b 2 -e 2 -S 1 revel_hg38.tsv.gz
    ```
-   The resulting file has five tab-separated columns: `#chr pos ref alt revel_score`.
+   The resulting file has eight tab-separated columns: `#chr pos ref alt revel_score aaref aaalt ensembl_transcriptid`. The first five match the older 5-column layout, so `--revel-mode coordinate` works with either; `--revel-mode transcript`/`aa` need the extended layout — see "REVEL disambiguation modes" above.
+
+   For `--revel-mode transcript`, also get a RefSeq → Ensembl transcript mapping — e.g. the NCBI MANE summary file:
+   ```
+   https://ftp.ncbi.nlm.nih.gov/refseq/MANE/MANE_human/current/MANE.GRCh38.*.summary.txt.gz
+   ```
 
 ### MutPred2 (via properties file)
 
@@ -245,6 +271,23 @@ src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
 src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
   --revel-training-file data/revel_training_variants.tsv \
   --mutpred2-training-file data/mutpred2_training_variants.tsv
+
+# REVEL only, transcript-sensitive mode (the default) via a MANE mapping
+src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
+  --revel-file revel_hg38.tsv.gz \
+  --revel-mode transcript \
+  --revel-mane-file MANE.GRCh38.v1.3.summary.txt.gz
+
+# REVEL only, amino-acid-filtered mode (reproduces the original pipeline
+# notebook's join; a synonymous variant can never inherit a score)
+src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
+  --revel-file revel_hg38.tsv.gz \
+  --revel-mode aa
+
+# REVEL only, legacy unfiltered mode (works with the plain 5-column file)
+src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
+  --revel-file revel_hg38.tsv.gz \
+  --revel-mode coordinate
 ```
 
 ---
@@ -254,6 +297,10 @@ src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
 | Option | Env variable | Default | Description |
 |---|---|---|---|
 | `--revel-file PATH` | `REVEL_FILE` | — | bgzipped, tabix-indexed REVEL TSV |
+| `--revel-mode {coordinate,transcript,aa}` | — | `transcript` | How REVEL's one-row-per-overlapping-transcript layout is disambiguated — see "REVEL disambiguation modes" above |
+| `--revel-mane-file PATH` | `REVEL_MANE_FILE` | — | NCBI MANE summary file mapping RefSeq → Ensembl transcripts, for `--revel-mode transcript`. Mutually exclusive with `--revel-transcript-mapping-file` |
+| `--revel-transcript-mapping-file PATH` | `REVEL_TRANSCRIPT_MAPPING_FILE` | — | Custom two-column TSV/CSV (`source_id`, `target_id`) RefSeq → Ensembl mapping, alternative to `--revel-mane-file` |
+| `--mapped-hgvs-c-transcript-col COL` | — | `mapped_hgvs_c_transcript` | Input column with the bare RefSeq transcript accession, used by `--revel-mode transcript` |
 | `--revel-cache-file PATH` | `REVEL_CACHE_FILE` | — | Two-column TSV `(hgvs, revel.score)` pre-loaded as a file-based REVEL cache; checked before tabix |
 | `--alphamissense-file PATH` | `ALPHAMISSENSE_FILE` | — | bgzipped, tabix-indexed AlphaMissense TSV |
 | `--alphamissense-cache-file PATH` | `ALPHAMISSENSE_CACHE_FILE` | — | Three-column TSV `(hgvs, alphamissense.pathogenicity, alphamissense.class)` pre-loaded as a file-based AlphaMissense cache; checked before tabix |

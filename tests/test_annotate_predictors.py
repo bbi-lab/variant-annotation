@@ -3,35 +3,36 @@
 from __future__ import annotations
 
 import csv
+import gzip
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-import gzip
-
 import src.annotate_predictors as mod
 from src.annotate_predictors import (
-    _snv_from_hgvs_g,
-    _lookup_revel,
-    _lookup_alphamissense,
+    NC_TO_CHROM_GRCH38,
+    _build_aa_substitution,
     _get_dbnsfp_col_indices,
-    _lookup_mutpred2,
-    _lookup_mutpred2_from_properties_file,
+    _load_mutpred2_gene_symbol_map,
     _load_mutpred2_properties_file_cache,
     _load_mutpred2_properties_gene_aa_cache,
-    _lookup_mutpred2_from_gene_aa_cache,
-    _load_mutpred2_gene_symbol_map,
-    _build_aa_substitution,
-    _lookup_revel_train,
-    _lookup_mutpred2_train,
-    _load_revel_training_variants,
     _load_mutpred2_training_variants,
+    _load_revel_training_variants,
+    _lookup_alphamissense,
+    _lookup_mutpred2,
+    _lookup_mutpred2_from_gene_aa_cache,
+    _lookup_mutpred2_from_properties_file,
+    _lookup_mutpred2_train,
+    _lookup_revel,
+    _lookup_revel_train,
+    _resolve_ensembl_transcript,
+    _snv_from_hgvs_g,
+    _transcript_ids_match,
     _unqualify_hgvs_p,
+    _validate_revel_file_for_mode,
     annotate_row,
-    NC_TO_CHROM_GRCH38,
 )
-
 
 # ---------------------------------------------------------------------------
 # _snv_from_hgvs_g
@@ -151,6 +152,223 @@ def test_lookup_revel_tries_chr_prefix(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# _lookup_revel — mode="transcript" / mode="aa"
+# ---------------------------------------------------------------------------
+
+def test_lookup_revel_transcript_mode_filters_by_transcript(tmp_path):
+    """Two transcripts overlap the position; only the matching one's score is used."""
+    lines = [
+        "1\t69094\tT\tA\t0.9900\tT\tI\tENST00000123456.1",  # other transcript
+        "1\t69094\tT\tA\t0.4200\tT\tI\tENST00000999999.2",  # our transcript
+    ]
+    dummy_path = tmp_path / "revel.tsv.gz"
+    dummy_path.touch()
+    cache: dict = {}
+
+    with patch.object(mod, "_run_tabix", return_value=lines):
+        result = _lookup_revel(
+            dummy_path, "1", 69094, "T", "A", cache,
+            mode="transcript", transcript_id="ENST00000999999.2",
+        )
+
+    assert result == "0.4200"
+
+
+def test_lookup_revel_transcript_mode_version_stripped_match(tmp_path):
+    """A different transcript version still matches on the base accession."""
+    lines = ["1\t69094\tT\tA\t0.5000\tT\tI\tENST00000999999.5"]
+    dummy_path = tmp_path / "revel.tsv.gz"
+    dummy_path.touch()
+    cache: dict = {}
+
+    with patch.object(mod, "_run_tabix", return_value=lines):
+        result = _lookup_revel(
+            dummy_path, "1", 69094, "T", "A", cache,
+            mode="transcript", transcript_id="ENST00000999999.2",
+        )
+
+    assert result == "0.5000"
+
+
+def test_lookup_revel_transcript_mode_no_transcript_id_returns_none(tmp_path):
+    """No resolved transcript (e.g. RefSeq → Ensembl mapping missed) → no score, no tabix call."""
+    dummy_path = tmp_path / "revel.tsv.gz"
+    dummy_path.touch()
+    cache: dict = {}
+
+    with patch.object(mod, "_run_tabix", side_effect=AssertionError("should not call tabix")):
+        result = _lookup_revel(dummy_path, "1", 69094, "T", "A", cache, mode="transcript", transcript_id=None)
+
+    assert result is None
+
+
+def test_lookup_revel_aa_mode_matches_own_amino_acid_change(tmp_path):
+    """A missense variant whose aa_ref/aa_alt matches the REVEL row's own aaref/aaalt."""
+    lines = [
+        "17\t58703209\tT\tC\t0.9900\tG\tI\tENST00000111111.1",  # different AA change
+        "17\t58703209\tT\tC\t0.0410\tA\tT\tENST00000222222.1",  # our AA change
+    ]
+    dummy_path = tmp_path / "revel.tsv.gz"
+    dummy_path.touch()
+    cache: dict = {}
+
+    with patch.object(mod, "_run_tabix", return_value=lines):
+        result = _lookup_revel(
+            dummy_path, "17", 58703209, "T", "C", cache,
+            mode="aa", aa_ref="A", aa_alt="T",
+        )
+
+    assert result == "0.0410"
+
+
+def test_lookup_revel_aa_mode_synonymous_variant_never_matches(tmp_path):
+    """Regression test: NM_058216.3:c.585T>C (RAD51C, chr17:58703209 T>C) is synonymous
+    (p.Ala195=, aa_ref == aa_alt == 'A') on this project's transcript, but REVEL's own
+    file lists a nonzero score at that genomic position for a *different*, missense,
+    transcript (aaref='A', aaalt='T'). REVEL's rows are always missense (aaref !=
+    aaalt), so a synonymous variant's aa_ref == aa_alt key can never match any row —
+    mode="aa" must return None here, unlike the unfiltered "coordinate" mode.
+    """
+    lines = ["17\t58703209\tT\tC\t0.0410\tA\tT\tENST00000222222.1"]
+    dummy_path = tmp_path / "revel.tsv.gz"
+    dummy_path.touch()
+    cache: dict = {}
+
+    with patch.object(mod, "_run_tabix", return_value=lines):
+        result = _lookup_revel(
+            dummy_path, "17", 58703209, "T", "C", cache,
+            mode="aa", aa_ref="A", aa_alt="A",
+        )
+
+    assert result is None
+
+    # The same lookup in unfiltered "coordinate" mode does pick up the score —
+    # this is the bug being guarded against by preferring "aa"/"transcript" mode.
+    with patch.object(mod, "_run_tabix", return_value=lines):
+        coordinate_result = _lookup_revel(dummy_path, "17", 58703209, "T", "C", {}, mode="coordinate")
+    assert coordinate_result == "0.0410"
+
+
+def test_lookup_revel_aa_mode_no_aa_ref_alt_returns_none(tmp_path):
+    dummy_path = tmp_path / "revel.tsv.gz"
+    dummy_path.touch()
+    cache: dict = {}
+
+    with patch.object(mod, "_run_tabix", side_effect=AssertionError("should not call tabix")):
+        result = _lookup_revel(dummy_path, "1", 69094, "T", "A", cache, mode="aa", aa_ref=None, aa_alt=None)
+
+    assert result is None
+
+
+def test_lookup_revel_transcript_and_aa_mode_cache_independently(tmp_path):
+    """The same genomic key under different modes/context must not share a cache slot."""
+    lines_missense = ["1\t69094\tT\tA\t0.9900\tT\tI\tENST00000999999.1"]
+    dummy_path = tmp_path / "revel.tsv.gz"
+    dummy_path.touch()
+    cache: dict = {}
+
+    with patch.object(mod, "_run_tabix", return_value=lines_missense):
+        coord_result = _lookup_revel(dummy_path, "1", 69094, "T", "A", cache, mode="coordinate")
+        transcript_result = _lookup_revel(
+            dummy_path, "1", 69094, "T", "A", cache,
+            mode="transcript", transcript_id="ENST00000999999.1",
+        )
+        aa_result = _lookup_revel(dummy_path, "1", 69094, "T", "A", cache, mode="aa", aa_ref="T", aa_alt="I")
+
+    assert coord_result == "0.9900"
+    assert transcript_result == "0.9900"
+    assert aa_result == "0.9900"
+    assert len(cache) == 3
+
+
+# ---------------------------------------------------------------------------
+# _transcript_ids_match / _resolve_ensembl_transcript
+# ---------------------------------------------------------------------------
+
+def test_transcript_ids_match_exact():
+    assert _transcript_ids_match("ENST00000357654.9", "ENST00000357654.9") is True
+
+
+def test_transcript_ids_match_version_stripped_fallback():
+    assert _transcript_ids_match("ENST00000357654.9", "ENST00000357654.3") is True
+
+
+def test_transcript_ids_match_different_transcript():
+    assert _transcript_ids_match("ENST00000357654.9", "ENST00000111111.1") is False
+
+
+def test_transcript_ids_match_empty_values():
+    assert _transcript_ids_match("", "ENST00000357654.9") is False
+    assert _transcript_ids_match("ENST00000357654.9", "") is False
+
+
+def test_resolve_ensembl_transcript_exact_match():
+    mapping = {"NM_058216.3": "ENST00000359321.9"}
+    assert _resolve_ensembl_transcript("NM_058216.3", mapping, {}) == "ENST00000359321.9"
+
+
+def test_resolve_ensembl_transcript_base_accession_fallback():
+    mapping = {"NM_058216.2": "ENST00000359321.9"}
+    base_mapping = {"NM_058216": "ENST00000359321.9"}
+    assert _resolve_ensembl_transcript("NM_058216.3", mapping, base_mapping) == "ENST00000359321.9"
+
+
+def test_resolve_ensembl_transcript_unmapped_returns_none():
+    assert _resolve_ensembl_transcript("NM_999999.1", {}, {}) is None
+
+
+def test_resolve_ensembl_transcript_empty_input_returns_none():
+    assert _resolve_ensembl_transcript("", {"NM_058216.3": "ENST00000359321.9"}, {}) is None
+
+
+# ---------------------------------------------------------------------------
+# _validate_revel_file_for_mode
+# ---------------------------------------------------------------------------
+
+def test_validate_revel_file_for_mode_coordinate_never_checks_header(tmp_path):
+    """coordinate mode has no column requirement beyond the base 5, so no tabix -H call."""
+    dummy_path = tmp_path / "revel.tsv.gz"
+    dummy_path.touch()
+    with patch("subprocess.run", side_effect=AssertionError("should not call tabix -H")):
+        _validate_revel_file_for_mode(dummy_path, "coordinate")
+
+
+def test_validate_revel_file_for_mode_transcript_accepts_extended_header(tmp_path):
+    dummy_path = tmp_path / "revel.tsv.gz"
+    dummy_path.touch()
+    header = "#chr\tpos\tref\talt\trevel_score\taaref\taaalt\tensembl_transcriptid\n"
+    fake_proc = type("P", (), {"stdout": header, "returncode": 0})()
+    with patch("subprocess.run", return_value=fake_proc):
+        _validate_revel_file_for_mode(dummy_path, "transcript")
+
+
+def test_validate_revel_file_for_mode_transcript_rejects_short_header(tmp_path):
+    dummy_path = tmp_path / "revel.tsv.gz"
+    dummy_path.touch()
+    header = "#chr\tpos\tref\talt\trevel_score\n"
+    fake_proc = type("P", (), {"stdout": header, "returncode": 0})()
+    with patch("subprocess.run", return_value=fake_proc), pytest.raises(ValueError, match="extended column layout"):
+        _validate_revel_file_for_mode(dummy_path, "transcript")
+
+
+def test_validate_revel_file_for_mode_aa_accepts_seven_columns(tmp_path):
+    dummy_path = tmp_path / "revel.tsv.gz"
+    dummy_path.touch()
+    header = "#chr\tpos\tref\talt\trevel_score\taaref\taaalt\n"
+    fake_proc = type("P", (), {"stdout": header, "returncode": 0})()
+    with patch("subprocess.run", return_value=fake_proc):
+        _validate_revel_file_for_mode(dummy_path, "aa")
+
+
+def test_validate_revel_file_for_mode_no_header_raises(tmp_path):
+    dummy_path = tmp_path / "revel.tsv.gz"
+    dummy_path.touch()
+    fake_proc = type("P", (), {"stdout": "", "returncode": 1})()
+    with patch("subprocess.run", return_value=fake_proc), pytest.raises(ValueError):
+        _validate_revel_file_for_mode(dummy_path, "aa")
+
+
+# ---------------------------------------------------------------------------
 # _get_dbnsfp_col_indices
 # ---------------------------------------------------------------------------
 
@@ -198,9 +416,8 @@ def test_get_dbnsfp_col_indices_no_header_raises(tmp_path):
     mod._dbnsfp_col_index_cache.clear()
 
     fake_proc = type("P", (), {"stdout": "", "returncode": 0})()
-    with patch("subprocess.run", return_value=fake_proc):
-        with pytest.raises(ValueError, match="No header line"):
-            _get_dbnsfp_col_indices(dummy)
+    with patch("subprocess.run", return_value=fake_proc), pytest.raises(ValueError, match="No header line"):
+        _get_dbnsfp_col_indices(dummy)
 
 
 # ---------------------------------------------------------------------------
@@ -1276,6 +1493,7 @@ def test_main_writes_score_columns(tmp_path, monkeypatch):
     mod.main([
         str(in_path), str(out_path),
         "--revel-file", str(revel_path),
+        "--revel-mode", "coordinate",
         "--alphamissense-file", str(am_path),
     ])
 
@@ -1287,6 +1505,153 @@ def test_main_writes_score_columns(tmp_path, monkeypatch):
     # Non-SNV row → empty
     assert rows[1]["revel.score"] == ""
     assert rows[1]["alphamissense.pathogenicity"] == ""
+
+
+def _patch_tabix_version_check(monkeypatch):
+    """Stub the 'tabix --version' probe in main() so tests don't need a real tabix binary."""
+    import subprocess as _subprocess
+
+    real_run = _subprocess.run
+
+    def fake_run(*a, **kw):
+        if a and "--version" in a[0]:
+            return type("R", (), {"returncode": 0})()
+        return real_run(*a, **kw)
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+
+def test_main_revel_mode_transcript_requires_a_mapping_source(tmp_path, monkeypatch):
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+    revel_path = tmp_path / "revel.tsv.gz"
+    revel_path.touch()
+    _write_tsv(in_path, [{"id": "v1", "mapped_hgvs_g": "NC_000001.11:g.69094T>A"}], ["id", "mapped_hgvs_g"])
+
+    _patch_tabix_version_check(monkeypatch)
+
+    with pytest.raises(SystemExit):
+        mod.main([
+            str(in_path), str(out_path),
+            "--revel-file", str(revel_path),
+            "--revel-mode", "transcript",
+        ])
+
+
+def test_main_revel_mode_transcript_rejects_both_mapping_sources(tmp_path, monkeypatch):
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+    revel_path = tmp_path / "revel.tsv.gz"
+    revel_path.touch()
+    mane_path = tmp_path / "mane.txt"
+    mane_path.write_text("RefSeq_nuc\tRefSeq_prot\tEnsembl_nuc\tEnsembl_prot\tMANE_status\n")
+    mapping_path = tmp_path / "mapping.tsv"
+    mapping_path.write_text("source_id\ttarget_id\n")
+    _write_tsv(in_path, [{"id": "v1", "mapped_hgvs_g": "NC_000001.11:g.69094T>A"}], ["id", "mapped_hgvs_g"])
+
+    _patch_tabix_version_check(monkeypatch)
+
+    with pytest.raises(SystemExit):
+        mod.main([
+            str(in_path), str(out_path),
+            "--revel-file", str(revel_path),
+            "--revel-mode", "transcript",
+            "--revel-mane-file", str(mane_path),
+            "--revel-transcript-mapping-file", str(mapping_path),
+        ])
+
+
+def test_main_revel_mode_transcript_rejects_narrow_revel_file(tmp_path, monkeypatch):
+    """A plain 5-column REVEL file lacks the columns --revel-mode transcript needs."""
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+    revel_path = tmp_path / "revel.tsv.gz"
+    revel_path.touch()
+    mapping_path = tmp_path / "mapping.tsv"
+    mapping_path.write_text("source_id\ttarget_id\nNM_058216.3\tENST00000359321.9\n")
+    _write_tsv(in_path, [{"id": "v1", "mapped_hgvs_g": "NC_000001.11:g.69094T>A"}], ["id", "mapped_hgvs_g"])
+
+    import subprocess as _subprocess
+    real_run = _subprocess.run
+
+    def fake_run(*a, **kw):
+        if a and "--version" in a[0]:
+            return type("R", (), {"returncode": 0})()
+        if a and "-H" in a[0]:
+            return type("R", (), {"stdout": "#chr\tpos\tref\talt\trevel_score\n", "returncode": 0})()
+        return real_run(*a, **kw)
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    with pytest.raises(SystemExit):
+        mod.main([
+            str(in_path), str(out_path),
+            "--revel-file", str(revel_path),
+            "--revel-mode", "transcript",
+            "--revel-transcript-mapping-file", str(mapping_path),
+        ])
+
+
+def test_main_revel_mode_aa_end_to_end_reproduces_rad51c_fix(tmp_path, monkeypatch):
+    """Full main() run with --revel-mode aa: the RAD51C-style synonymous variant
+    (aa_ref == aa_alt) gets no score, while a missense variant at the same
+    genomic position with a matching aaref/aaalt does.
+    """
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+    revel_path = tmp_path / "revel.tsv.gz"
+    revel_path.touch()
+    _write_tsv(
+        in_path,
+        [
+            {
+                "id": "synonymous",
+                "mapped_hgvs_g": "NC_000017.11:g.58703209T>C",
+                "mapped_hgvs_p_ref": "A",
+                "mapped_hgvs_p_alt": "A",
+            },
+            {
+                "id": "missense",
+                "mapped_hgvs_g": "NC_000017.11:g.58703209T>C",
+                "mapped_hgvs_p_ref": "A",
+                "mapped_hgvs_p_alt": "T",
+            },
+        ],
+        ["id", "mapped_hgvs_g", "mapped_hgvs_p_ref", "mapped_hgvs_p_alt"],
+    )
+
+    def fake_tabix(path: Path, chrom: str, pos: int) -> list[str]:
+        if pos == 58703209:
+            return ["17\t58703209\tT\tC\t0.0410\tA\tT\tENST00000222222.1"]
+        return []
+
+    monkeypatch.setattr(mod, "_run_tabix", fake_tabix)
+
+    import subprocess as _subprocess
+    real_run = _subprocess.run
+
+    def fake_run(*a, **kw):
+        if a and "--version" in a[0]:
+            return type("R", (), {"returncode": 0})()
+        if a and "-H" in a[0]:
+            return type("R", (), {
+                "stdout": "#chr\tpos\tref\talt\trevel_score\taaref\taaalt\tensembl_transcriptid\n",
+                "returncode": 0,
+            })()
+        return real_run(*a, **kw)
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    mod.main([
+        str(in_path), str(out_path),
+        "--revel-file", str(revel_path),
+        "--revel-mode", "aa",
+    ])
+
+    rows = _read_tsv(out_path)
+    scores = {row["id"]: row["revel.score"] for row in rows}
+    assert scores["synonymous"] == ""
+    assert scores["missense"] == "0.0410"
 
 
 def test_main_mutpred2_properties_file_pipe_aligned_output(tmp_path):
@@ -1706,6 +2071,123 @@ def test_annotate_row_revel_train_pipe_aligned_per_candidate(tmp_path):
     )
 
     assert ann["revel.train"] == "true|false"
+
+
+def test_annotate_row_revel_aa_mode_synonymous_variant_gets_no_score(tmp_path):
+    """End-to-end regression test for the RAD51C NM_058216.3:c.585T>C bug: a
+    synonymous variant (aa_ref == aa_alt) must not inherit a REVEL score from a
+    different, missense, transcript at the same genomic position.
+    """
+    revel_path = tmp_path / "revel.tsv.gz"
+    revel_path.touch()
+    lines = ["17\t58703209\tT\tC\t0.0410\tA\tT\tENST00000222222.1"]
+    row = {
+        "mapped_hgvs_g": "NC_000017.11:g.58703209T>C",
+        "mapped_hgvs_p_ref": "A",
+        "mapped_hgvs_p_alt": "A",
+    }
+
+    with patch.object(mod, "_run_tabix", return_value=lines):
+        ann = annotate_row(
+            row,
+            nc_to_chrom=NC_TO_CHROM_GRCH38,
+            mapped_hgvs_g_col="mapped_hgvs_g",
+            revel_path=revel_path,
+            alphamissense_path=None,
+            revel_cache={},
+            am_cache={},
+            revel_mode="aa",
+            mapped_hgvs_p_ref_col="mapped_hgvs_p_ref",
+            mapped_hgvs_p_alt_col="mapped_hgvs_p_alt",
+        )
+
+    assert ann["revel.score"] == ""
+
+
+def test_annotate_row_revel_aa_mode_missense_variant_gets_score(tmp_path):
+    revel_path = tmp_path / "revel.tsv.gz"
+    revel_path.touch()
+    lines = ["17\t58703209\tT\tC\t0.0410\tA\tT\tENST00000222222.1"]
+    row = {
+        "mapped_hgvs_g": "NC_000017.11:g.58703209T>C",
+        "mapped_hgvs_p_ref": "A",
+        "mapped_hgvs_p_alt": "T",
+    }
+
+    with patch.object(mod, "_run_tabix", return_value=lines):
+        ann = annotate_row(
+            row,
+            nc_to_chrom=NC_TO_CHROM_GRCH38,
+            mapped_hgvs_g_col="mapped_hgvs_g",
+            revel_path=revel_path,
+            alphamissense_path=None,
+            revel_cache={},
+            am_cache={},
+            revel_mode="aa",
+            mapped_hgvs_p_ref_col="mapped_hgvs_p_ref",
+            mapped_hgvs_p_alt_col="mapped_hgvs_p_alt",
+        )
+
+    assert ann["revel.score"] == "0.0410"
+
+
+def test_annotate_row_revel_transcript_mode_resolves_refseq_to_ensembl(tmp_path):
+    revel_path = tmp_path / "revel.tsv.gz"
+    revel_path.touch()
+    lines = [
+        "17\t58703209\tT\tC\t0.9900\tA\tT\tENST00000111111.1",  # other transcript
+        "17\t58703209\tT\tC\t0.0410\tA\tT\tENST00000359321.9",  # our transcript
+    ]
+    row = {
+        "mapped_hgvs_g": "NC_000017.11:g.58703209T>C",
+        "mapped_hgvs_c_transcript": "NM_058216.3",
+    }
+    mapping = {"NM_058216.3": "ENST00000359321.9"}
+
+    with patch.object(mod, "_run_tabix", return_value=lines):
+        ann = annotate_row(
+            row,
+            nc_to_chrom=NC_TO_CHROM_GRCH38,
+            mapped_hgvs_g_col="mapped_hgvs_g",
+            revel_path=revel_path,
+            alphamissense_path=None,
+            revel_cache={},
+            am_cache={},
+            revel_mode="transcript",
+            revel_transcript_mapping=mapping,
+            revel_transcript_base_mapping={},
+            mapped_hgvs_c_transcript_col="mapped_hgvs_c_transcript",
+        )
+
+    assert ann["revel.score"] == "0.0410"
+
+
+def test_annotate_row_revel_transcript_mode_unmapped_transcript_gets_no_score(tmp_path):
+    """A RefSeq transcript absent from the mapping resolves to None, so no score."""
+    revel_path = tmp_path / "revel.tsv.gz"
+    revel_path.touch()
+    lines = ["17\t58703209\tT\tC\t0.0410\tA\tT\tENST00000359321.9"]
+    row = {
+        "mapped_hgvs_g": "NC_000017.11:g.58703209T>C",
+        "mapped_hgvs_c_transcript": "NM_999999.1",
+    }
+
+    with patch.object(mod, "_run_tabix", return_value=lines):
+        ann = annotate_row(
+            row,
+            nc_to_chrom=NC_TO_CHROM_GRCH38,
+            mapped_hgvs_g_col="mapped_hgvs_g",
+            revel_path=revel_path,
+            alphamissense_path=None,
+            revel_cache={},
+            am_cache={},
+            revel_mode="transcript",
+            revel_transcript_mapping={},
+            revel_transcript_base_mapping={},
+            mapped_hgvs_c_transcript_col="mapped_hgvs_c_transcript",
+        )
+
+    assert ann["revel.score"] == ""
 
 
 def test_annotate_row_mutpred2_train_duplicated_across_candidates(tmp_path):

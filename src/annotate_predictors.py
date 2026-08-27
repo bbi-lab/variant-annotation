@@ -7,6 +7,25 @@ Supported scores (hg38 / GRCh38 only):
     Source: https://sites.google.com/site/revelgenomics/downloads
     Range:  0–1 (higher = more likely pathogenic)
     Scope:  missense SNVs only
+    --revel-mode {coordinate,transcript,aa} (default: transcript) controls how
+    REVEL's one-row-per-overlapping-transcript layout is disambiguated at a
+    given genomic position:
+      coordinate: take the maximum score across every matching row,
+        regardless of transcript. Since a genomic position can be missense
+        on one transcript and non-missense (e.g. synonymous) on the
+        transcript this project annotates, this mode can attach a REVEL
+        score to a variant this project itself calls non-missense.
+      transcript (default): additionally require the row's Ensembl
+        transcript ID to match this variant's own transcript (from
+        --mapped-hgvs-c-transcript-col, mapped RefSeq → Ensembl via
+        --revel-mane-file or --revel-transcript-mapping-file). Requires the
+        extended REVEL file layout (see "Data file preparation" below).
+      aa: additionally require the row's aaref/aaalt columns to equal this
+        variant's own amino-acid ref/alt (from --mapped-hgvs-p-ref-col /
+        --mapped-hgvs-p-alt-col). Since REVEL's rows are always missense
+        (aaref != aaalt), a variant with aa_ref == aa_alt (synonymous) can
+        never match — this reproduces the join used by the original
+        pipeline notebook. Also requires the extended REVEL file layout.
 
   AlphaMissense (Google DeepMind)
   --alphamissense-file AlphaMissense_hg38.tsv.gz
@@ -94,10 +113,29 @@ unzip it, then run::
 
     tail -n +2 revel_with_transcript_ids.csv \\
       | awk -F',' 'NF>=9 && $3!="" && $3!="." \\
-                   {print $1"\\t"$3"\\t"$4"\\t"$5"\\t"$8}' \\
-      | (printf '#chr\\tpos\\tref\\talt\\trevel_score\\n'; sort -k1,1V -k2,2n) \\
+                   {print $1"\\t"$3"\\t"$4"\\t"$5"\\t"$8"\\t"$6"\\t"$7"\\t"$9}' \\
+      | (printf '#chr\\tpos\\tref\\talt\\trevel_score\\taaref\\taaalt\\tensembl_transcriptid\\n'; sort -k1,1V -k2,2n) \\
       | bgzip > revel_hg38.tsv.gz
     tabix -s 1 -b 2 -e 2 -S 1 revel_hg38.tsv.gz
+
+This extended 8-column layout keeps chr/pos/ref/alt/revel_score in the same
+first five columns as before (so --revel-mode coordinate needs nothing
+else), and appends aaref/aaalt/ensembl_transcriptid, which --revel-mode
+transcript and --revel-mode aa require. A revel_hg38.tsv.gz produced by the
+older 5-column command (chr/pos/ref/alt/revel_score only) still works with
+--revel-mode coordinate.
+
+--revel-mode transcript additionally needs a RefSeq → Ensembl transcript
+mapping, since REVEL's file identifies transcripts by Ensembl ID while this
+project's own transcript column is RefSeq. Pass either:
+
+  --revel-mane-file MANE.GRCh38.*.summary.txt.gz
+    NCBI MANE summary file (https://ftp.ncbi.nlm.nih.gov/refseq/MANE/MANE_human/current/).
+    Restricted to MANE Select / MANE Plus Clinical transcripts, which are
+    sequence-identical between RefSeq and Ensembl. Same file format as
+    src/remap_transcript_ids.py's --mane-file.
+  --revel-transcript-mapping-file FILE
+    Custom two-column TSV/CSV with headers source_id, target_id (RefSeq → Ensembl).
 
 The resulting file has five tab-separated columns::
 
@@ -135,7 +173,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-from itertools import islice
 import logging
 import os
 import re
@@ -143,10 +180,17 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
+
+from src.remap_transcript_ids import (
+    _build_base_mapping,
+    _build_custom_mapping,
+    _build_mane_mapping,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -549,25 +593,123 @@ def _lookup_mutpred2_train(
     return any((gene, _unqualify_hgvs_p(c)) in training_set for c in candidates)
 
 
+def _transcript_ids_match(revel_transcript_id: str, target_transcript_id: str) -> bool:
+    """Compare an Ensembl transcript accession from REVEL against the resolved target.
+
+    Tries an exact (versioned) match first, then falls back to the
+    version-stripped base accession, since REVEL and a MANE mapping may pin
+    different versions of the same underlying transcript.
+    """
+    if not revel_transcript_id or not target_transcript_id:
+        return False
+    if revel_transcript_id == target_transcript_id:
+        return True
+    base_a = revel_transcript_id.rsplit(".", 1)[0] if "." in revel_transcript_id else revel_transcript_id
+    base_b = target_transcript_id.rsplit(".", 1)[0] if "." in target_transcript_id else target_transcript_id
+    return base_a == base_b
+
+
+def _resolve_ensembl_transcript(
+    refseq_transcript: str,
+    mapping: dict[str, str],
+    base_mapping: dict[str, str],
+) -> Optional[str]:
+    """Resolve a RefSeq transcript accession to its Ensembl equivalent, or ``None``.
+
+    Tries the full versioned accession first, then the version-stripped base
+    accession. Unlike :func:`src.remap_transcript_ids._remap_accession`, an
+    accession absent from both mappings resolves to ``None`` rather than
+    being returned unchanged — a REVEL transcript-mode lookup with no known
+    Ensembl equivalent must not silently fall back to matching nothing as if
+    it were a literal accession.
+    """
+    if not refseq_transcript:
+        return None
+    if refseq_transcript in mapping:
+        return mapping[refseq_transcript]
+    base = refseq_transcript.rsplit(".", 1)[0] if "." in refseq_transcript else refseq_transcript
+    return base_mapping.get(base)
+
+
+_REVEL_MODE_MIN_COLS = {"coordinate": 5, "aa": 7, "transcript": 8}
+
+
+def _get_revel_header_col_count(path: Path) -> Optional[int]:
+    """Return the number of tab-separated columns in *path*'s '#'-prefixed header, or ``None``."""
+    proc = subprocess.run(["tabix", "-H", str(path)], capture_output=True, text=True, check=False)
+    header_line = next((line for line in proc.stdout.splitlines() if line.startswith("#")), None)
+    if header_line is None:
+        return None
+    return len(header_line.lstrip("#").split("\t"))
+
+
+def _validate_revel_file_for_mode(path: Path, mode: str) -> None:
+    """Raise ``ValueError`` if *path* lacks the columns required by *mode*."""
+    required = _REVEL_MODE_MIN_COLS[mode]
+    if required <= 5:
+        return
+    n_cols = _get_revel_header_col_count(path)
+    if n_cols is None or n_cols < required:
+        extra = "aaref/aaalt/ensembl_transcriptid" if mode == "transcript" else "aaref/aaalt"
+        raise ValueError(
+            f"REVEL file {path} does not have the extended column layout required by "
+            f"--revel-mode {mode} (found {n_cols if n_cols is not None else 'no'} header "
+            f"column(s) via 'tabix -H', need at least {required}, including {extra}). "
+            "Regenerate it per the REVEL section of docs/annotate_predictors.md, or use "
+            "--revel-mode coordinate with the existing file."
+        )
+
+
 def _lookup_revel(
     path: Path,
     chrom: str,
     pos: int,
     ref: str,
     alt: str,
-    cache: dict[tuple[str, int, str, str], Optional[str]],
+    cache: dict[tuple, Optional[str]],
+    *,
+    mode: str = "coordinate",
+    transcript_id: Optional[str] = None,
+    aa_ref: Optional[str] = None,
+    aa_alt: Optional[str] = None,
 ) -> Optional[str]:
     """Return the maximum REVEL score string for an SNV, or ``None`` if absent.
 
-    REVEL may have multiple rows per position (one per transcript); we return
-    the maximum score across all matching rows.
+    REVEL may have multiple rows per position (one per overlapping
+    transcript). *mode* controls how those rows are disambiguated:
+
+      "coordinate" (default here; the annotate_predictors CLI default is
+        "transcript" — see --revel-mode): take the maximum score across
+        every matching row regardless of transcript. Since a genomic
+        position can be missense on one transcript and non-missense (e.g.
+        synonymous) on another, this mode can attach a score to a variant
+        whose own annotated consequence is non-missense.
+      "transcript": additionally require the row's Ensembl transcript-ID
+        column (field 7) to match *transcript_id* (see
+        :func:`_transcript_ids_match`).
+      "aa": additionally require the row's aaref/aaalt columns (fields 5, 6)
+        to equal *aa_ref*/*aa_alt* (case-insensitive). Since REVEL's rows
+        are always missense (aaref != aaalt), a variant with aa_ref ==
+        aa_alt (synonymous) can never match.
 
     Expected prepared-file column layout (tab-separated, 0-indexed):
       0: chr  1: pos  2: ref  3: alt  4: revel_score
+      Extended (required for "transcript"/"aa" modes — see
+      docs/annotate_predictors.md for the preparation command):
+      5: aaref  6: aaalt  7: ensembl_transcriptid
     """
-    key = (chrom, pos, ref, alt)
+    aa_ref = aa_ref.upper() if aa_ref else None
+    aa_alt = aa_alt.upper() if aa_alt else None
+    key = (mode, chrom, pos, ref, alt, transcript_id or "", aa_ref or "", aa_alt or "")
     if key in cache:
         return cache[key]
+
+    if mode == "transcript" and not transcript_id:
+        cache[key] = None
+        return None
+    if mode == "aa" and not (aa_ref and aa_alt):
+        cache[key] = None
+        return None
 
     best: Optional[float] = None
     for chrom_try in _chrom_candidates(chrom):
@@ -583,6 +725,14 @@ def _lookup_revel(
             if r_pos != pos:
                 continue
             if fields[2].upper() != ref or fields[3].upper() != alt:
+                continue
+            if mode == "transcript" and (
+                len(fields) < 8 or not _transcript_ids_match(fields[7].strip(), transcript_id)  # type: ignore[arg-type]
+            ):
+                continue
+            if mode == "aa" and (
+                len(fields) < 7 or fields[5].strip().upper() != aa_ref or fields[6].strip().upper() != aa_alt
+            ):
                 continue
             try:
                 score = float(fields[4])
@@ -961,7 +1111,11 @@ def annotate_row(
     revel_path: Optional[Path],
     alphamissense_path: Optional[Path],
     dbnsfp_path: Optional[Path] = None,
-    revel_cache: dict[tuple[str, int, str, str], Optional[str]],
+    revel_cache: dict[tuple, Optional[str]],
+    revel_mode: str = "coordinate",
+    revel_transcript_mapping: Optional[dict[str, str]] = None,
+    revel_transcript_base_mapping: Optional[dict[str, str]] = None,
+    mapped_hgvs_c_transcript_col: Optional[str] = None,
     am_cache: dict[tuple[str, int, str, str], Optional[tuple[str, str]]],
     mutpred2_cache: Optional[dict[tuple[str, int, str, str], Optional[str]]] = None,
     revel_file_cache: Optional[dict[str, str]] = None,
@@ -992,6 +1146,16 @@ def annotate_row(
     (keyed on the c-string from *mapped_hgvs_c_col*) first, then falling back
     to a tabix lookup via the g-string from *mapped_hgvs_g_col*.  Non-SNV
     candidates that are absent from the file cache produce empty strings.
+
+    *revel_mode* (default "coordinate" here; the CLI default is
+    "transcript") is passed through to :func:`_lookup_revel` for every
+    tabix-backed REVEL candidate — see that function for what each mode
+    means. "transcript" mode resolves this row's own RefSeq transcript (from
+    *mapped_hgvs_c_transcript_col*) to Ensembl via *revel_transcript_mapping*
+    / *revel_transcript_base_mapping* once per row (the transcript doesn't
+    vary across DNA reverse-translation candidates). "aa" mode reads the
+    row's own amino-acid ref/alt from *mapped_hgvs_p_ref_col* /
+    *mapped_hgvs_p_alt_col*, also once per row.
 
     MutPred2 has three, mutually-exclusive sources. If *mutpred2_properties_cache*
     is given, each reverse-translation candidate is looked up individually
@@ -1078,6 +1242,24 @@ def annotate_row(
     revel_enabled = revel_path is not None or revel_file_cache is not None
     am_enabled = alphamissense_path is not None or am_file_cache is not None
 
+    revel_transcript_id: Optional[str] = None
+    revel_aa_ref: Optional[str] = None
+    revel_aa_alt: Optional[str] = None
+    if revel_enabled and revel_path is not None and revel_mode == "transcript":
+        raw_transcript = (
+            (row.get(mapped_hgvs_c_transcript_col) or "").strip() if mapped_hgvs_c_transcript_col else ""
+        )
+        if raw_transcript:
+            raw_transcript = _split_pipe(raw_transcript)[0]
+        revel_transcript_id = _resolve_ensembl_transcript(
+            raw_transcript, revel_transcript_mapping or {}, revel_transcript_base_mapping or {}
+        )
+    elif revel_enabled and revel_path is not None and revel_mode == "aa":
+        raw_aa_ref = (row.get(mapped_hgvs_p_ref_col) or "").strip() if mapped_hgvs_p_ref_col else ""
+        raw_aa_alt = (row.get(mapped_hgvs_p_alt_col) or "").strip() if mapped_hgvs_p_alt_col else ""
+        revel_aa_ref = raw_aa_ref.upper() or None
+        revel_aa_alt = raw_aa_alt.upper() or None
+
     revel_vals: list[str] = []
     am_path_vals: list[str] = []
     am_class_vals: list[str] = []
@@ -1100,7 +1282,13 @@ def annotate_row(
                 r = revel_file_cache.get(hgvs_c)
             if r is None and snv is not None and revel_path is not None:
                 chrom, pos, ref, alt = snv
-                r = _lookup_revel(revel_path, chrom, pos, ref, alt, revel_cache)
+                r = _lookup_revel(
+                    revel_path, chrom, pos, ref, alt, revel_cache,
+                    mode=revel_mode,
+                    transcript_id=revel_transcript_id,
+                    aa_ref=revel_aa_ref,
+                    aa_alt=revel_aa_alt,
+                )
             revel_vals.append(r or "")
 
         if am_enabled:
@@ -1213,15 +1401,25 @@ def _collect_needed_snv_keys(
     am_enabled: bool,
     am_file_cache: Optional[dict[str, tuple[str, str]]],
     mutpred2_dbnsfp_enabled: bool,
-) -> tuple[set[tuple[str, int, str, str]], set[tuple[str, int, str, str]], set[tuple[str, int, str, str]]]:
+    revel_mode: str = "coordinate",
+    revel_transcript_mapping: Optional[dict[str, str]] = None,
+    revel_transcript_base_mapping: Optional[dict[str, str]] = None,
+    mapped_hgvs_c_transcript_col: Optional[str] = None,
+    mapped_hgvs_p_ref_col: Optional[str] = None,
+    mapped_hgvs_p_alt_col: Optional[str] = None,
+) -> tuple[set[tuple], set[tuple[str, int, str, str]], set[tuple[str, int, str, str]]]:
     """Scan *rows* and return the unique SNV keys that will need a tabix lookup.
 
     Mirrors the candidate-splitting logic in :func:`annotate_row`, but only
     for the g./c. HGVS columns that feed REVEL/AlphaMissense/dbNSFP — the
     other lookups (MutPred2-properties-file, training-set overlap) are plain
     dict/set lookups and don't benefit from tabix prefetching.
+
+    *revel_needed* entries are 8-tuples matching :func:`_lookup_revel`'s
+    cache key (``mode, chrom, pos, ref, alt, transcript_id, aa_ref, aa_alt``)
+    so prefetched results land in the same cache slots the main pass reads.
     """
-    revel_needed: set[tuple[str, int, str, str]] = set()
+    revel_needed: set[tuple] = set()
     am_needed: set[tuple[str, int, str, str]] = set()
     mp2_needed: set[tuple[str, int, str, str]] = set()
 
@@ -1232,6 +1430,25 @@ def _collect_needed_snv_keys(
             if mapped_hgvs_c_col
             else []
         )
+
+        revel_transcript_id: Optional[str] = None
+        revel_aa_ref: Optional[str] = None
+        revel_aa_alt: Optional[str] = None
+        if revel_enabled and revel_mode == "transcript":
+            raw_transcript = (
+                (row.get(mapped_hgvs_c_transcript_col) or "").strip() if mapped_hgvs_c_transcript_col else ""
+            )
+            if raw_transcript:
+                raw_transcript = _split_pipe(raw_transcript)[0]
+            revel_transcript_id = _resolve_ensembl_transcript(
+                raw_transcript, revel_transcript_mapping or {}, revel_transcript_base_mapping or {}
+            )
+        elif revel_enabled and revel_mode == "aa":
+            raw_aa_ref = (row.get(mapped_hgvs_p_ref_col) or "").strip() if mapped_hgvs_p_ref_col else ""
+            raw_aa_alt = (row.get(mapped_hgvs_p_alt_col) or "").strip() if mapped_hgvs_p_alt_col else ""
+            revel_aa_ref = raw_aa_ref.upper() or None
+            revel_aa_alt = raw_aa_alt.upper() or None
+
         for i, hgvs_g in enumerate(g_candidates):
             if not hgvs_g:
                 continue
@@ -1241,7 +1458,10 @@ def _collect_needed_snv_keys(
             hgvs_c = c_candidates[i] if i < len(c_candidates) else ""
 
             if revel_enabled and not (hgvs_c and revel_file_cache is not None and hgvs_c in revel_file_cache):
-                revel_needed.add(snv)
+                revel_needed.add((
+                    revel_mode, snv[0], snv[1], snv[2], snv[3],
+                    revel_transcript_id or "", revel_aa_ref or "", revel_aa_alt or "",
+                ))
             if am_enabled and not (hgvs_c and am_file_cache is not None and hgvs_c in am_file_cache):
                 am_needed.add(snv)
             if mutpred2_dbnsfp_enabled:
@@ -1287,6 +1507,55 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "bgzipped, tabix-indexed REVEL TSV (revel_hg38.tsv.gz). "
             "See module docstring for preparation instructions. "
             "Defaults to REVEL_FILE env var."
+        ),
+    )
+    p.add_argument(
+        "--revel-mode",
+        choices=["coordinate", "transcript", "aa"],
+        default="transcript",
+        help=(
+            "How REVEL's one-row-per-overlapping-transcript layout is disambiguated "
+            "at a given genomic position (default: transcript). 'coordinate': max "
+            "score across every matching row regardless of transcript (legacy "
+            "behavior; works with the plain 5-column revel_hg38.tsv.gz). "
+            "'transcript': require the row's Ensembl transcript ID to match this "
+            "variant's own transcript (mapped from --mapped-hgvs-c-transcript-col "
+            "via --revel-mane-file or --revel-transcript-mapping-file). 'aa': "
+            "require the row's aaref/aaalt to match this variant's own amino-acid "
+            "ref/alt (from --mapped-hgvs-p-ref-col/--mapped-hgvs-p-alt-col) — a "
+            "variant with aa_ref == aa_alt (synonymous) can never match, since "
+            "REVEL's rows are always missense. 'transcript' and 'aa' both require "
+            "the extended REVEL file layout — see module docstring."
+        ),
+    )
+    p.add_argument(
+        "--revel-mane-file",
+        default=os.environ.get("REVEL_MANE_FILE"),
+        metavar="PATH",
+        help=(
+            "NCBI MANE summary file (MANE.GRCh38.*.summary.txt[.gz]) used to map this "
+            "variant's RefSeq transcript to Ensembl for --revel-mode transcript. "
+            "Mutually exclusive with --revel-transcript-mapping-file. "
+            "Defaults to REVEL_MANE_FILE env var."
+        ),
+    )
+    p.add_argument(
+        "--revel-transcript-mapping-file",
+        default=os.environ.get("REVEL_TRANSCRIPT_MAPPING_FILE"),
+        metavar="PATH",
+        help=(
+            "Custom two-column TSV/CSV (headers source_id, target_id) mapping RefSeq "
+            "transcript accessions to Ensembl, used by --revel-mode transcript instead "
+            "of --revel-mane-file. Defaults to REVEL_TRANSCRIPT_MAPPING_FILE env var."
+        ),
+    )
+    p.add_argument(
+        "--mapped-hgvs-c-transcript-col",
+        default="mapped_hgvs_c_transcript",
+        help=(
+            "Input column with the bare RefSeq transcript accession (e.g. "
+            "'NM_058216.3'), used by --revel-mode transcript "
+            "(default: mapped_hgvs_c_transcript)"
         ),
     )
     p.add_argument(
@@ -1475,7 +1744,8 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "Input column with the single-letter reference amino acid, used with "
             "--mapped-hgvs-p-start-col and --mapped-hgvs-p-alt-col to build the AA "
             "substitution key (e.g. 'T2A') for --mutpred2-properties-file with "
-            "--mutpred2-properties-join-key gene-aa (default: mapped_hgvs_p_ref)"
+            "--mutpred2-properties-join-key gene-aa (default: mapped_hgvs_p_ref). "
+            "Also used (with --mapped-hgvs-p-alt-col) for --revel-mode aa."
         ),
     )
     p.add_argument(
@@ -1493,7 +1763,8 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help=(
             "Input column with the single-letter alternate amino acid, used as part "
             "of the AA substitution key for --mutpred2-properties-file with "
-            "--mutpred2-properties-join-key gene-aa (default: mapped_hgvs_p_alt)"
+            "--mutpred2-properties-join-key gene-aa (default: mapped_hgvs_p_alt). "
+            "Also used (with --mapped-hgvs-p-ref-col) for --revel-mode aa."
         ),
     )
     p.add_argument(
@@ -1611,6 +1882,36 @@ def main(argv: Optional[list[str]] = None) -> None:
     if revel_path is not None and not revel_path.exists():
         logger.error("REVEL file not found: %s", revel_path)
         raise SystemExit(1)
+
+    revel_transcript_mapping: dict[str, str] = {}
+    revel_transcript_base_mapping: dict[str, str] = {}
+    if revel_path is not None and args.revel_mode != "coordinate":
+        try:
+            _validate_revel_file_for_mode(revel_path, args.revel_mode)
+        except ValueError as exc:
+            logger.error(str(exc))
+            raise SystemExit(1)
+        if args.revel_mode == "transcript":
+            if bool(args.revel_mane_file) == bool(args.revel_transcript_mapping_file):
+                logger.error(
+                    "--revel-mode transcript requires exactly one of --revel-mane-file "
+                    "or --revel-transcript-mapping-file."
+                )
+                raise SystemExit(1)
+            if args.revel_mane_file:
+                if not Path(args.revel_mane_file).exists():
+                    logger.error("REVEL MANE mapping file not found: %s", args.revel_mane_file)
+                    raise SystemExit(1)
+                revel_transcript_mapping = _build_mane_mapping(args.revel_mane_file, "to-ensembl")
+            else:
+                if not Path(args.revel_transcript_mapping_file).exists():
+                    logger.error(
+                        "REVEL transcript mapping file not found: %s",
+                        args.revel_transcript_mapping_file,
+                    )
+                    raise SystemExit(1)
+                revel_transcript_mapping = _build_custom_mapping(args.revel_transcript_mapping_file)
+            revel_transcript_base_mapping = _build_base_mapping(revel_transcript_mapping)
     if am_path is not None and not am_path.exists():
         logger.error("AlphaMissense file not found: %s", am_path)
         raise SystemExit(1)
@@ -1689,7 +1990,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     if mutpred2_training_set is not None:
         ann_cols.extend(MUTPRED2_TRAIN_COLS)
 
-    revel_cache: dict[tuple[str, int, str, str], Optional[str]] = {}
+    revel_cache: dict[tuple, Optional[str]] = {}
     am_cache: dict[tuple[str, int, str, str], Optional[tuple[str, str]]] = {}
     mutpred2_cache: dict[tuple[str, int, str, str], Optional[str]] = {}
 
@@ -1717,6 +2018,12 @@ def main(argv: Optional[list[str]] = None) -> None:
                 am_enabled=am_path is not None,
                 am_file_cache=am_file_cache,
                 mutpred2_dbnsfp_enabled=mutpred2_dbnsfp_enabled,
+                revel_mode=args.revel_mode,
+                revel_transcript_mapping=revel_transcript_mapping,
+                revel_transcript_base_mapping=revel_transcript_base_mapping,
+                mapped_hgvs_c_transcript_col=args.mapped_hgvs_c_transcript_col,
+                mapped_hgvs_p_ref_col=args.mapped_hgvs_p_ref_col,
+                mapped_hgvs_p_alt_col=args.mapped_hgvs_p_alt_col,
             )
 
         logger.info(
@@ -1727,7 +2034,13 @@ def main(argv: Optional[list[str]] = None) -> None:
         if revel_needed:
             revel_cache.update(_prefetch_into_cache(
                 revel_needed,
-                lambda key: _lookup_revel(revel_path, key[0], key[1], key[2], key[3], {}),  # type: ignore[arg-type]
+                lambda key: _lookup_revel(
+                    revel_path, key[1], key[2], key[3], key[4], {},  # type: ignore[arg-type]
+                    mode=key[0],
+                    transcript_id=key[5] or None,
+                    aa_ref=key[6] or None,
+                    aa_alt=key[7] or None,
+                ),
                 args.max_workers,
             ))
         if am_needed:
@@ -1791,6 +2104,10 @@ def main(argv: Optional[list[str]] = None) -> None:
                 alphamissense_path=am_path,
                 dbnsfp_path=dbnsfp_path,
                 revel_cache=revel_cache,
+                revel_mode=args.revel_mode,
+                revel_transcript_mapping=revel_transcript_mapping,
+                revel_transcript_base_mapping=revel_transcript_base_mapping,
+                mapped_hgvs_c_transcript_col=args.mapped_hgvs_c_transcript_col,
                 am_cache=am_cache,
                 mutpred2_cache=mutpred2_cache,
                 revel_file_cache=revel_file_cache,
@@ -1850,8 +2167,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     elapsed = max(time.monotonic() - started, 1e-9)
     if revel_path is not None:
         logger.info(
-            "REVEL: %d/%d rows scored (cache: %d unique SNVs queried)",
-            scored_revel, processed, len(revel_cache),
+            "REVEL: %d/%d rows scored (mode: %s, cache: %d unique SNVs queried)",
+            scored_revel, processed, args.revel_mode, len(revel_cache),
         )
     if am_path is not None:
         logger.info(
