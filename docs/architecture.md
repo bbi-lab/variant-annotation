@@ -26,17 +26,26 @@ variant_annotation/lib/          ← installed library
     _core.py                     ← business logic; imports ports, not clients
     types.py                     ← public input/output types
     __init__.py                  ← re-exports public API
+  vep/                           ← feature module (same layout)
+    _ports.py                    ← VepLookup / VariantRecoder / ReferenceSequence
+    _core.py                     ← resolution kernel + orchestration
+    types.py                     ← public input/output types
+    __init__.py                  ← re-exports public API + RESOLVER_VERSION
   clients/                       ← protocol implementations
-    uta.py                       ← UTA-backed TranscriptSource
+    uta.py                       ← UTA-backed TranscriptSource / ReferenceSequence
     coordinates.py               ← HGVS-mapper-backed CoordinateTranslator
+    ensembl.py                   ← Ensembl-REST-backed VepLookup / VariantRecoder
   pipeline/                      ← CSV composition boundary (CLI-only)
     reverse_translate_step.py    ← ColumnConfig + process_rows
   hgvs/                          ← shared vocabulary module
+    no_change.py                 ← reference-identical recognition (no src/ dependency)
   accessions.py                  ← shared vocabulary module
   consequence.py                 ← shared vocabulary module
+  sequence_ontology.py           ← shared vocabulary module
 
 src/                             ← composition roots + CLI entry points
   reverse_translate_protein_variants.py   ← wires clients into process_rows
+  annotate_vep.py                ← wires clients into resolve_consequences
   add_vcf_identifiers.py         ← (not yet refactored to import downward)
   ...
 ```
@@ -101,10 +110,19 @@ injection, not a universal requirement.
 
 ## Shared vocabulary modules
 
-`hgvs/`, `accessions.py`, and `consequence.py` are shared vocabulary: pure
-functions and types that multiple modules in the library need. They have no
-external service dependencies and no ports. Any `lib/` module can import from them
-without risk of creating a dependency cycle.
+`hgvs/`, `accessions.py`, `consequence.py`, and `sequence_ontology.py` are shared
+vocabulary: pure functions and types that multiple modules in the library need. They
+have no external service dependencies and no ports. Any `lib/` module can import from
+them without risk of creating a dependency cycle.
+
+`sequence_ontology.py` holds the published Sequence Ontology consequence terms and
+Ensembl's severity ranking over them. It is named for the vocabulary, not for `vep/`
+— the module that first needed it — because any consumer reasoning about molecular
+consequences wants the same ranked term set. Note that it deliberately does *not*
+also hold `consequence.py`'s `ProteinConsequence`: those two share a word, not a
+concept. `ProteinConsequence` is a variant's protein-level representation (the hub
+type the collapse/expand operation pivots on); `sequence_ontology` is an external
+controlled vocabulary. Merging them would make the module name describe neither.
 
 `hgvs/` graduated from a single utility function into a directory because HGVS
 parsing logic was needed by `clients/`, `pipeline/`, and the CLI scripts — enough
