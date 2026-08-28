@@ -6,9 +6,11 @@ real API returns, trimmed to the fields resolution reads.
 
 import pytest
 
+from variant_annotation.lib import sequence_ontology as so
 from variant_annotation.lib.vep import (
     NO_CHANGE_TERM,
     ConsequenceOutcome,
+    ConsequenceResolution,
     ConsequenceSource,
     VepInput,
     combine_recoded,
@@ -321,8 +323,6 @@ def test_all_absent_recoded_forms_combine_to_absent():
 
 def test_a_failed_recoded_form_makes_the_answer_errored_not_absent():
     """A partial failure is unknown, not a confirmed negative — storing it as absent would be a lie."""
-    from variant_annotation.lib.vep.types import ConsequenceResolution
-
     errored = ConsequenceResolution(input=VepInput("NC_1:g.2A>G"), outcome=ConsequenceOutcome.ERRORED, error="boom")
 
     combined = combine_recoded(VepInput("NP_1:p.Met1Val"), [_absent("NC_1:g.1A>G"), errored])
@@ -332,8 +332,6 @@ def test_a_failed_recoded_form_makes_the_answer_errored_not_absent():
 
 
 def test_a_resolved_form_outweighs_a_failed_sibling():
-    from variant_annotation.lib.vep.types import ConsequenceResolution
-
     errored = ConsequenceResolution(input=VepInput("NC_1:g.2A>G"), outcome=ConsequenceOutcome.ERRORED, error="boom")
 
     combined = combine_recoded(VepInput("NP_1:p.Met1Val"), [_resolved("NC_1:g.1A>G", "missense_variant"), errored])
@@ -374,6 +372,4 @@ def test_a_protein_missense_is_not_reported_as_transcript_ablation():
 
 def test_no_change_term_is_not_an_so_term():
     """#760: 'no change' is a distinct claim from synonymous_variant, and must not borrow its label."""
-    from variant_annotation.lib import sequence_ontology as so
-
     assert not so.is_known_term(NO_CHANGE_TERM)
