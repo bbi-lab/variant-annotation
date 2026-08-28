@@ -185,14 +185,15 @@ broader library structure.
 ```python
 from variant_annotation.lib.translation import (
     construct_equivalent_variants,  # batch entry point — prefer over calling construct_one in a loop
-    construct_one,                  # single-variant convenience
-    CoordinateTranslator,           # protocol — satisfy with clients/coordinates.py
-    TranscriptSource,               # protocol — satisfy with clients/uta.py
-    TranslationConfig,              # behaviour knobs
-    TranslationResult,              # success output
-    TranslationError,               # failure/skip output
-    VariantInput,                   # input type
-    WtCodonMode,                    # enum for wt_codon_mode
+    construct_one,  # single-variant convenience
+    CoordinateTranslator,  # protocol — satisfy with clients/coordinates.py
+    TranscriptSource,  # protocol — satisfy with clients/uta.py
+    TranslationConfig,  # behaviour knobs
+    TranslationResult,  # success output
+    TranslationError,  # failure/skip output
+    TranslationErrorReason,  # enum typing an error as NOT_TRANSLATABLE vs FAILED
+    VariantInput,  # input type
+    WtCodonMode,  # enum for wt_codon_mode
 )
 ```
 
@@ -208,14 +209,26 @@ intentional: startup overhead is amortized across the whole batch. Prefer
 
 ### TranslationError is not always a failure
 
-`TranslationError` covers two distinct cases. A genuine failure means something
-went wrong (transcript not found, subprocess crashed). A no-equivalence-class
-result means the variant is a deletion, insertion, frameshift, or other
-non-substitution — these produce no DNA candidates and surface as
-`TranslationError` with a specific message. Only substitution consequences
-(missense, synonymous, nonsense) have an equivalence class. Callers should
-classify variants by edit type before calling rather than pattern-matching error
-strings after.
+`TranslationError` covers two distinct cases, told apart by its typed
+`reason` (a `TranslationErrorReason`) — never by parsing the `error` text:
+
+- `NOT_TRANSLATABLE` — the protein consequence's edit type has no DNA equivalence
+  class to construct, so there was never anything to reverse-translate. This is a
+  benign structural gap, not a failure. A single-residue substitution (missense,
+  synonymous, nonsense) **and** a single-residue deletion are translatable; a
+  frameshift, insertion, multi-residue delins, duplication, stop-loss, or
+  extension is not. The library screens these out **up front** by edit type,
+  so a non-translatable input costs no subprocess work.
+- `FAILED` — a genuine error: the input could not be collapsed to a protein
+  consequence, the subprocess failed or returned a mismatched row count, or a
+  translatable consequence yielded no candidate (e.g. a reference-AA mismatch).
+
+The up-front screen defers to the reverse-translate tool's own
+`parse_hgvs_protein_change` (plus its stop-loss refusal) rather than re-deriving the
+rule — the tool is the single authority on what is translatable, so there is nothing
+to keep in sync. Callers map `reason` to their own disposition (in mavedb-api,
+`NOT_TRANSLATABLE` → a skip, `FAILED` → tallies failures) rather than pattern-matching
+the message.
 
 ### TranslationResult.hgvs_p
 

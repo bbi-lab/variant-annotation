@@ -37,6 +37,7 @@ from .types import (
     ProjectionPair,
     TranslationConfig,
     TranslationError,
+    TranslationErrorReason,
     TranslationResult,
     VariantInput,
     WtCodonMode,
@@ -297,6 +298,39 @@ def _parse_protein_aa_change(hgvs_p: str) -> tuple[str, int, str] | None:
     return ref_aa3, pos, ref_aa3 if alt_raw == "=" else alt_raw
 
 
+def _untranslatable_edit_reason(hgvs_p: str) -> str | None:
+    """Return why this protein edit cannot be reverse-translated, or ``None`` when it can.
+
+    Reverse translation enumerates codon-local DNA edits that reproduce a protein edit. Only a
+    single-residue substitution (missense, synonymous, or nonsense) and a single-residue deletion
+    have such a DNA class — a deletion is expressly included (it maps to its codon deletion), so this
+    is not a "substitutions only" rule. Frameshift, insertion, multi-residue delins, duplication,
+    stop-loss and extension edits change protein length or span in ways no codon-local DNA edit
+    reproduces, so there is nothing to construct — a benign structural gap, not a failure.
+
+    The reverse-translate tool is the single authority on that boundary, so this asks the tool's own
+    parser directly rather than re-deriving the rule: an edit is translatable exactly when
+    ``parse_hgvs_protein_change`` accepts it and it is not a stop-loss (which the tool parses but
+    refuses in ``reverse_translate_hgvs_p``). Screening here, before the subprocess, spares a
+    non-translatable edit a wasted subprocess slot while staying definitionally in step with what the
+    subprocess would do.
+    """
+    # variant-translation ships its modules under the top-level ``src`` package. Imported lazily: its
+    # module pulls in hgvs/click at import time, which we keep off ``import _core``.
+    from src.scripts.reverse_translate_variants import parse_hgvs_protein_change
+
+    try:
+        change = parse_hgvs_protein_change(hgvs_p)
+    except Exception:
+        return f"Protein edit type has no DNA equivalence class to reverse-translate: {hgvs_p!r}"
+
+    # A reference stop parses cleanly but means stop-loss/extension, which the tool refuses.
+    if change.reference_aa == "*":
+        return f"Stop-loss has no DNA equivalence class to reverse-translate: {hgvs_p!r}"
+
+    return None
+
+
 def _build_wt_c_hgvs(transcript: str, aa_position: int, codon: str) -> str:
     c_start = (aa_position - 1) * 3 + 1
     return f"{transcript}:c.{c_start}_{aa_position * 3}delins{codon}"
@@ -385,6 +419,8 @@ def _build_result(
     error = error_messages[0] if error_messages else None
 
     if not pairs:
+        # Only translatable edit types reach the tool (non-translatable ones are screened out up
+        # front), so an empty result here is a genuine failure.
         return TranslationError(
             input=inp,
             error=error or "Reverse translation returned no candidate DNA variants",
@@ -446,10 +482,23 @@ def construct_equivalent_variants(
 
     for i, (inp, consequence) in enumerate(zip(inputs, consequences)):
         if isinstance(consequence, str):
+            # Collapse failed — a genuine error (unresolved transcript, forward-translation failure).
             early_errors.append(TranslationError(input=inp, error=consequence))
-        else:
-            batch_consequences.append(consequence)
-            batch_positions.append(i)
+            continue
+
+        # Screen by edit type before spending a subprocess slot: an edit the reverse-translate tool
+        # cannot express has no DNA equivalence class, so record it as a benign NOT_TRANSLATABLE skip
+        # rather than feeding the tool an input it can only reject. The screen faithfully mirrors the
+        # tool's own accept/reject boundary, so it never withholds a candidate the tool would have produced.
+        untranslatable = _untranslatable_edit_reason(consequence.hgvs_p)
+        if untranslatable is not None:
+            early_errors.append(
+                TranslationError(input=inp, error=untranslatable, reason=TranslationErrorReason.NOT_TRANSLATABLE)
+            )
+            continue
+
+        batch_consequences.append(consequence)
+        batch_positions.append(i)
 
     output_rows: list[_BatchOutputRow] = []
     error_rows: list[_BatchErrorRow] = []

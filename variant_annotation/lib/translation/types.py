@@ -12,6 +12,29 @@ class WtCodonMode(str, Enum):
     ALL = "all"
 
 
+class TranslationErrorReason(str, Enum):
+    """Why equivalence-class construction produced no result for an input.
+
+    The two states are kept distinct because a consumer must handle them
+    differently, and collapsing them loses information that cannot be recovered
+    later (prior art: dcd_mapping's ``MappingOutcome``, which likewise separates a
+    benign structural gap from a failure):
+
+    - ``NOT_TRANSLATABLE`` — the protein consequence's edit type has no synonymous
+      DNA equivalence class to construct (a single-residue substitution or
+      deletion has one; frameshift, insertion, multi-residue delins, duplication,
+      stop-loss and extension edits do not). A settled negative: re-running yields
+      the same nothing. Not a failure — there was never anything to translate.
+    - ``FAILED`` — a genuine error: the input could not be collapsed to a protein
+      consequence, the reverse-translate subprocess failed or returned a
+      mismatched row count, or a translatable consequence yielded no candidate.
+      The result is unknown/broken, not a settled negative.
+    """
+
+    NOT_TRANSLATABLE = "not_translatable"
+    FAILED = "failed"
+
+
 @dataclass
 class VariantInput:
     """A single variant to construct equivalents for.
@@ -81,10 +104,17 @@ class TranslationResult:
 
 @dataclass
 class TranslationError:
-    """Failed or skipped equivalence-class construction for one VariantInput."""
+    """Failed or skipped equivalence-class construction for one VariantInput.
+
+    ``reason`` types the outcome so a caller can tell a benign non-translatable
+    input from a genuine failure without parsing ``error`` (see
+    :class:`TranslationErrorReason`). ``error`` remains a human-readable
+    description for logs and metadata.
+    """
 
     input: VariantInput
     error: str
+    reason: TranslationErrorReason = TranslationErrorReason.FAILED
 
 
 @dataclass
