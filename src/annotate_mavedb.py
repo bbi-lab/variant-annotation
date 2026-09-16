@@ -146,6 +146,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +234,22 @@ def load_requested_calibration_map(path: Path) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 # MaveDB API fetchers
 # ---------------------------------------------------------------------------
+
+
+def build_session(retries=8, backoff_factor=2.0):
+    """Build a `requests.Session` that retries the transient 5xx errors this API returns often."""
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=("GET",),
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.headers.update({"User-Agent": "variant-annotation/annotate_mavedb"})
+    return session
 
 
 def fetch_calibrations(
@@ -581,7 +599,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     out_delim = "\t" if output_path.suffix.lower() in (".tsv", ".txt") else ","
 
     api_url = args.mavedb_api_url.rstrip("/")
-    session = requests.Session()
+    session = build_session()
     calibration_cache: dict[str, list[dict[str, Any]]] = {}
     class_id_cache: dict[str, dict[str, int]] = {}
 
