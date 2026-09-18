@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "variant-annotation"
-version = "0.1.0-dev"
+version = "0.1.0-dev.1"
 authors = [
     { name="Jeremy Stone", email="74574922+jstone-dev@users.noreply.github.com" },
 ]
