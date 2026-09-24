@@ -1529,18 +1529,24 @@ def _hgvs_from_annotation(annotation) -> Optional[str]:
 
 
 def _reformat_identity_hgvs_as_delins(hgvs: str) -> Optional[str]:
-    """Reformat a VRS identity expression as an equivalent delins.
+    """Reformat a VRS identity expression as an equivalent explicit delins.
 
     dcd_mapping (and, on occasion, ClinGen's own Allele Registry response --
     see the call sites in :func:`_extract_hgvs_ca`) emits non-standard
     strings like ``NC_000007.14:g.144548593CCT=`` or ``NM_022445.4:c.612C=``
-    for alleles that are identical to the reference (e.g. a delins that
-    inserts the same bases that are already present). This function converts
-    them to a proper HGVS delins where ref == alt, e.g.
-    ``NC_000007.14:g.144548593_144548595delinsCCT``, which is both valid HGVS
-    and unambiguous for downstream consumers such as ClinGen and
-    add_vcf_identifiers.py's HGVS parser (neither of which understands the
-    non-standard embedded-bases-before-``=`` form).
+    for alleles that are identical to the reference. This function converts
+    them to a proper HGVS delins with the *same* sequence spelled out on both
+    sides, e.g. ``NC_000007.14:g.144548593_144548595delCCTinsCCT``, which is
+    both valid HGVS and unambiguous for downstream consumers such as ClinGen
+    and add_vcf_identifiers.py's HGVS parser (neither of which understands
+    the non-standard embedded-bases-before-``=`` form).
+
+    The deleted sequence is spelled out explicitly (``del<bases>ins<bases>``)
+    rather than left bare (``delins<bases>``) so that add_vcf_identifiers.py
+    parses this as ref == alt == bases instead of ref == "" -- a bare
+    ``delins<bases>`` reads as a pure insertion there, which sends it through
+    VCF-anchor padding (prepending the reference base at that position) and
+    ends up asserting a real sequence change where none exists.
 
     Returns ``None`` when the string does not match the expected pattern (e.g.
     no embedded bases before ``=``).
@@ -1552,8 +1558,8 @@ def _reformat_identity_hgvs_as_delins(hgvs: str) -> Optional[str]:
     start = int(pos_str)
     end = start + len(bases) - 1
     if start == end:
-        return f"{prefix}{start}delins{bases}"
-    return f"{prefix}{start}_{end}delins{bases}"
+        return f"{prefix}{start}del{bases}ins{bases}"
+    return f"{prefix}{start}_{end}del{bases}ins{bases}"
 
 
 async def _run_dcd_mapping_pipeline(
