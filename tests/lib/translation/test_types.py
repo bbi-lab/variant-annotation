@@ -19,7 +19,7 @@ def test_translation_error_defaults_to_failed():
 
 
 def test_translation_error_reason_members():
-    assert {r.value for r in TranslationErrorReason} == {"not_translatable", "failed"}
+    assert {r.value for r in TranslationErrorReason} == {"not_translatable", "failed", "upstream_unavailable"}
 
 
 def test_translation_config_defaults():
@@ -33,3 +33,8 @@ def test_translation_config_defaults():
 def test_translation_config_rejects_wt_codon_mode_without_indels():
     with pytest.raises(ValueError, match="include_indels=True"):
         TranslationConfig(wt_codon_mode=WtCodonMode.UNAMBIGUOUS, include_indels=False)
+
+
+def test_translation_config_rejects_zero_upstream_attempts():
+    with pytest.raises(ValueError, match="upstream_max_attempts"):
+        TranslationConfig(upstream_max_attempts=0)

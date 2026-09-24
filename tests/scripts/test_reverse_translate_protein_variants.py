@@ -1,3 +1,4 @@
+import contextlib
 import csv
 
 import pytest
@@ -9,15 +10,6 @@ from variant_annotation.lib.translation.types import (
     TranslationConfig,
     WtCodonMode,
 )
-
-
-
-class _FakeConnection:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
 
 
 def _write_tsv(path, rows):
@@ -42,8 +34,10 @@ def _read_tsv(path):
 
 def _patch_clients(monkeypatch):
     monkeypatch.setenv("UTA_DB_URL", "postgresql://user:pass@localhost:5432/uta")
-    monkeypatch.setattr("src.reverse_translate_protein_variants.connect_uta", lambda url: _FakeConnection())
-    monkeypatch.setattr("src.reverse_translate_protein_variants.UtaClient", lambda conn: object())
+    monkeypatch.setattr(
+        "src.reverse_translate_protein_variants.UtaClient",
+        type("U", (), {"from_url": staticmethod(lambda url: contextlib.nullcontext(object()))})(),
+    )
     monkeypatch.setattr(
         "src.reverse_translate_protein_variants.HgvsMapper",
         type("M", (), {"from_url": staticmethod(lambda url, assembly: object())})(),

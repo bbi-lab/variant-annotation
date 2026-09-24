@@ -471,3 +471,200 @@ def test_construct_equivalent_variants_end_to_end_returns_projection_pairs(monke
     ]
     # Protein input -> protein apex is authoritative, not re-emitted as a derived member.
     assert results[0].hgvs_p is None
+
+
+# ---------------------------------------------------------------------------
+# transient UTA failures
+# ---------------------------------------------------------------------------
+
+_UTA_DROP = (
+    'connection to server at "uta.biocommons.org" (35.95.195.14), port 5432 failed: '
+    "server closed the connection unexpectedly"
+)
+_NO_WAIT = TranslationConfig(upstream_retry_backoff_seconds=0)
+
+
+def _row(hgvs_c):
+    return _core._BatchOutputRow(projection_pairs=[ProjectionPair(hgvs_c=hgvs_c, hgvs_g=None)])
+
+
+def _empty_row():
+    return _core._BatchOutputRow(projection_pairs=[])
+
+
+def _two_inputs():
+    return [
+        VariantInput(hgvs="NP_000001.1:p.Ala1Val", transcript="NM_000001.1"),
+        VariantInput(hgvs="NP_000001.1:p.Cys2Trp", transcript="NM_000001.1"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        _UTA_DROP,
+        "could not connect to server: Connection refused",
+        'connection to server at "uta" port 5432 failed: timeout expired',
+        "SSL SYSCALL error: EOF detected",
+        "Failed reverse translation (terminating connection due to administrator command)",
+    ],
+)
+def test_is_transient_upstream_error_recognises_connection_failures(message):
+    assert _core._is_transient_upstream_error(message)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        'connection to server at "uta" port 5432 failed: FATAL:  password authentication failed for user "x"',
+        'FATAL:  database "uta" does not exist',
+        "Reference amino acid mismatch: HGVS p. requests A at position 1",
+    ],
+)
+def test_is_transient_upstream_error_rejects_non_transient_failures(message):
+    assert not _core._is_transient_upstream_error(message)
+
+
+def test_subprocess_exit_on_uta_drop_is_retried_until_it_succeeds(monkeypatch):
+    monkeypatch.setattr(_core, "_find_reverse_translate_cli", lambda: "/bin/true")
+    calls = []
+
+    def _flaky(cli, cons, *, config):
+        calls.append(len(cons))
+        if len(calls) == 1:
+            raise RuntimeError(f"reverse-translate-variants failed: {_UTA_DROP}")
+        return [_row("NM_000001.1:c.2C>T"), _row("NM_000001.1:c.5G>T")], []
+
+    monkeypatch.setattr(_core, "_run_reverse_translate_batch", _flaky)
+
+    results, errors = construct_equivalent_variants(
+        _two_inputs(), transcripts=_StubTranscripts(), coordinates=_StubCoordinates(), config=_NO_WAIT
+    )
+    assert calls == [2, 2]
+    assert errors == []
+    assert [r.projection_pairs[0].hgvs_c for r in results] == ["NM_000001.1:c.2C>T", "NM_000001.1:c.5G>T"]
+
+
+def test_subprocess_exit_on_uta_drop_exhausting_retries_is_upstream_unavailable(monkeypatch):
+    monkeypatch.setattr(_core, "_find_reverse_translate_cli", lambda: "/bin/true")
+    calls = []
+
+    def _down(cli, cons, *, config):
+        calls.append(len(cons))
+        raise RuntimeError(f"reverse-translate-variants failed: {_UTA_DROP}")
+
+    monkeypatch.setattr(_core, "_run_reverse_translate_batch", _down)
+
+    results, errors = construct_equivalent_variants(
+        _two_inputs(), transcripts=_StubTranscripts(), coordinates=_StubCoordinates(), config=_NO_WAIT
+    )
+    assert len(calls) == _NO_WAIT.upstream_max_attempts
+    assert results == []
+    assert [e.reason for e in errors] == [TranslationErrorReason.UPSTREAM_UNAVAILABLE] * 2
+
+
+def test_non_transient_subprocess_exit_is_failed_without_retry(monkeypatch):
+    monkeypatch.setattr(_core, "_find_reverse_translate_cli", lambda: "/bin/true")
+    calls = []
+
+    def _broken(cli, cons, *, config):
+        calls.append(len(cons))
+        raise RuntimeError("reverse-translate-variants failed: Unsupported --uniprot-target value")
+
+    monkeypatch.setattr(_core, "_run_reverse_translate_batch", _broken)
+
+    _, errors = construct_equivalent_variants(
+        _two_inputs(), transcripts=_StubTranscripts(), coordinates=_StubCoordinates(), config=_NO_WAIT
+    )
+    assert calls == [2]
+    assert [e.reason for e in errors] == [TranslationErrorReason.FAILED] * 2
+
+
+def test_rows_dropped_mid_run_are_retried_alone_and_spliced_back(monkeypatch):
+    monkeypatch.setattr(_core, "_find_reverse_translate_cli", lambda: "/bin/true")
+    batches = []
+
+    def _drop_second_row_once(cli, cons, *, config):
+        batches.append([c.hgvs_p for c in cons])
+        if len(batches) == 1:
+            dropped = _core._BatchErrorRow(
+                transcript="NM_000001.1", hgvs_p=cons[1].hgvs_p, error=f"Failed reverse translation ({_UTA_DROP})"
+            )
+            return [_row("NM_000001.1:c.2C>T"), _empty_row()], [dropped]
+        return [_row("NM_000001.1:c.5G>T")], []
+
+    monkeypatch.setattr(_core, "_run_reverse_translate_batch", _drop_second_row_once)
+
+    results, errors = construct_equivalent_variants(
+        _two_inputs(), transcripts=_StubTranscripts(), coordinates=_StubCoordinates(), config=_NO_WAIT
+    )
+    assert batches == [["NP_000001.1:p.Ala1Val", "NP_000001.1:p.Cys2Trp"], ["NP_000001.1:p.Cys2Trp"]]
+    assert errors == []
+    assert [(r.input.hgvs, r.projection_pairs[0].hgvs_c) for r in results] == [
+        ("NP_000001.1:p.Ala1Val", "NM_000001.1:c.2C>T"),
+        ("NP_000001.1:p.Cys2Trp", "NM_000001.1:c.5G>T"),
+    ]
+
+
+def test_rows_dropped_on_every_attempt_are_upstream_unavailable(monkeypatch):
+    monkeypatch.setattr(_core, "_find_reverse_translate_cli", lambda: "/bin/true")
+
+    def _always_drop_second(cli, cons, *, config):
+        dropped = _core._BatchErrorRow(
+            transcript="NM_000001.1", hgvs_p="NP_000001.1:p.Cys2Trp", error=f"Failed reverse translation ({_UTA_DROP})"
+        )
+        rows = [_empty_row() if c.hgvs_p == "NP_000001.1:p.Cys2Trp" else _row("NM_000001.1:c.2C>T") for c in cons]
+        return rows, [dropped]
+
+    monkeypatch.setattr(_core, "_run_reverse_translate_batch", _always_drop_second)
+
+    results, errors = construct_equivalent_variants(
+        _two_inputs(), transcripts=_StubTranscripts(), coordinates=_StubCoordinates(), config=_NO_WAIT
+    )
+    assert [r.input.hgvs for r in results] == ["NP_000001.1:p.Ala1Val"]
+    assert len(errors) == 1
+    assert errors[0].input.hgvs == "NP_000001.1:p.Cys2Trp"
+    assert errors[0].reason is TranslationErrorReason.UPSTREAM_UNAVAILABLE
+
+
+def test_failed_row_rerun_keeps_rows_from_the_earlier_run(monkeypatch):
+    monkeypatch.setattr(_core, "_find_reverse_translate_cli", lambda: "/bin/true")
+    calls = []
+
+    def _rerun_crashes(cli, cons, *, config):
+        calls.append(len(cons))
+        if len(calls) == 1:
+            dropped = _core._BatchErrorRow(
+                transcript="NM_000001.1", hgvs_p=cons[1].hgvs_p, error=f"Failed reverse translation ({_UTA_DROP})"
+            )
+            return [_row("NM_000001.1:c.2C>T"), _empty_row()], [dropped]
+        raise RuntimeError("reverse-translate-variants failed: unexpected crash")
+
+    monkeypatch.setattr(_core, "_run_reverse_translate_batch", _rerun_crashes)
+
+    results, errors = construct_equivalent_variants(
+        _two_inputs(), transcripts=_StubTranscripts(), coordinates=_StubCoordinates(), config=_NO_WAIT
+    )
+    assert calls == [2, 1]
+    assert [r.input.hgvs for r in results] == ["NP_000001.1:p.Ala1Val"]
+    assert [e.reason for e in errors] == [TranslationErrorReason.UPSTREAM_UNAVAILABLE]
+
+
+def test_empty_row_with_non_transient_error_is_not_retried(monkeypatch):
+    monkeypatch.setattr(_core, "_find_reverse_translate_cli", lambda: "/bin/true")
+    calls = []
+
+    def _ref_mismatch(cli, cons, *, config):
+        calls.append(len(cons))
+        mismatch = _core._BatchErrorRow(
+            transcript="NM_000001.1", hgvs_p=cons[0].hgvs_p, error="Reference amino acid mismatch"
+        )
+        return [_empty_row()], [mismatch]
+
+    monkeypatch.setattr(_core, "_run_reverse_translate_batch", _ref_mismatch)
+
+    _, errors = construct_equivalent_variants(
+        _two_inputs()[:1], transcripts=_StubTranscripts(), coordinates=_StubCoordinates(), config=_NO_WAIT
+    )
+    assert calls == [1]
+    assert errors[0].reason is TranslationErrorReason.FAILED

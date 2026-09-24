@@ -17,7 +17,7 @@ from typing import Any, Optional
 from dotenv import load_dotenv
 
 from variant_annotation.lib.clients.coordinates import HgvsMapper
-from variant_annotation.lib.clients.uta import UtaClient, connect_uta
+from variant_annotation.lib.clients.uta import UtaClient
 from variant_annotation.lib.pipeline.reverse_translate_step import ColumnConfig, process_rows
 from variant_annotation.lib.translation.types import TranslationConfig, WtCodonMode
 
@@ -50,8 +50,7 @@ def reverse_translate_protein_variants(
     if not uta_db_url:
         raise RuntimeError("UTA_DB_URL must be set for protein reverse translation.")
 
-    with connect_uta(uta_db_url) as uta_conn:
-        transcripts = UtaClient(uta_conn)
+    with UtaClient.from_url(uta_db_url) as transcripts:
         coordinates = HgvsMapper.from_url(uta_db_url, assembly=config.assembly)
 
         def flush_block(

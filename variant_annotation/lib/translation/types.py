@@ -15,7 +15,7 @@ class WtCodonMode(str, Enum):
 class TranslationErrorReason(str, Enum):
     """Why equivalence-class construction produced no result for an input.
 
-    The two states are kept distinct because a consumer must handle them
+    The states are kept distinct because a consumer must handle them
     differently, and collapsing them loses information that cannot be recovered
     later (prior art: dcd_mapping's ``MappingOutcome``, which likewise separates a
     benign structural gap from a failure):
@@ -29,10 +29,14 @@ class TranslationErrorReason(str, Enum):
       consequence, the reverse-translate subprocess failed or returned a
       mismatched row count, or a translatable consequence yielded no candidate.
       The result is unknown/broken, not a settled negative.
+    - ``UPSTREAM_UNAVAILABLE`` — a reference data service (UTA) dropped or refused
+      the connection and retries were exhausted. Transient: the input itself is
+      fine, and re-running once the service recovers is expected to succeed.
     """
 
     NOT_TRANSLATABLE = "not_translatable"
     FAILED = "failed"
+    UPSTREAM_UNAVAILABLE = "upstream_unavailable"
 
 
 @dataclass
@@ -133,8 +137,14 @@ class TranslationConfig:
     strict_ref_aa: bool = True
     use_inv_notation: bool = False
     allow_length_changing_stop_candidates: bool = True
+    # Attempts per reverse-translate subprocess call when it fails on a transient UTA connection
+    # error; the delay doubles after each failed attempt.
+    upstream_max_attempts: int = 3
+    upstream_retry_backoff_seconds: float = 2.0
 
     def __post_init__(self) -> None:
+        if self.upstream_max_attempts < 1:
+            raise ValueError("upstream_max_attempts must be at least 1.")
         if self.wt_codon_mode is not WtCodonMode.NONE and not self.include_indels:
             raise ValueError(
                 "wt_codon_mode requires include_indels=True, "

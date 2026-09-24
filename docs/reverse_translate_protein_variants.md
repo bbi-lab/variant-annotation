@@ -191,7 +191,7 @@ from variant_annotation.lib.translation import (
     TranslationConfig,  # behaviour knobs
     TranslationResult,  # success output
     TranslationError,  # failure/skip output
-    TranslationErrorReason,  # enum typing an error as NOT_TRANSLATABLE vs FAILED
+    TranslationErrorReason,  # enum typing an error as NOT_TRANSLATABLE, FAILED, or UPSTREAM_UNAVAILABLE
     VariantInput,  # input type
     WtCodonMode,  # enum for wt_codon_mode
 )
@@ -209,7 +209,7 @@ intentional: startup overhead is amortized across the whole batch. Prefer
 
 ### TranslationError is not always a failure
 
-`TranslationError` covers two distinct cases, told apart by its typed
+`TranslationError` covers three distinct cases, told apart by its typed
 `reason` (a `TranslationErrorReason`) — never by parsing the `error` text:
 
 - `NOT_TRANSLATABLE` — the protein consequence's edit type has no DNA equivalence
@@ -222,13 +222,30 @@ intentional: startup overhead is amortized across the whole batch. Prefer
 - `FAILED` — a genuine error: the input could not be collapsed to a protein
   consequence, the subprocess failed or returned a mismatched row count, or a
   translatable consequence yielded no candidate (e.g. a reference-AA mismatch).
+- `UPSTREAM_UNAVAILABLE` — UTA dropped or refused the connection and the retries
+  were exhausted. The input is fine; re-running once UTA recovers is expected to
+  succeed.
 
 The up-front screen defers to the reverse-translate tool's own
 `parse_hgvs_protein_change` (plus its stop-loss refusal) rather than re-deriving the
 rule — the tool is the single authority on what is translatable, so there is nothing
 to keep in sync. Callers map `reason` to their own disposition (in mavedb-api,
-`NOT_TRANSLATABLE` → a skip, `FAILED` → tallies failures) rather than pattern-matching
-the message.
+`NOT_TRANSLATABLE` → a skip, `FAILED` → a translation error, `UPSTREAM_UNAVAILABLE` →
+an upstream API error) rather than pattern-matching the message.
+
+### Transient UTA failures are retried
+
+The reverse-translate subprocess opens its own UTA connection (from `UTA_DB_URL`),
+and remote UTA servers drop connections under load. The library recognises
+connection-failure messages and retries: a subprocess that exits on one re-runs the
+whole batch, and rows that come back empty with a connection error re-run on their
+own. Attempts and backoff come from `TranslationConfig.upstream_max_attempts`
+(default 3) and `upstream_retry_backoff_seconds` (default 2, doubling each attempt).
+Authentication and missing-database errors are not retried.
+
+`UtaClient` owns its connection in the same way. Construct it with
+`UtaClient.from_url(url)` and use it as a context manager: it connects on first use
+and reconnects with backoff when the server drops the connection.
 
 ### TranslationResult.hgvs_p
 

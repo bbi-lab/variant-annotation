@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
@@ -57,6 +58,29 @@ _WT_UNAMBIGUOUS_CODONS: dict[str, str] = {
 # Optional prediction parens: c_to_p renders inferred consequences as p.(Phe2335=), so the WT
 # codon path must parse the parenthesized form, not just the bare p.Phe2335=.
 _P_HGVS_AA_CHANGE_RE = re.compile(r"(?:^|:)p\.\(?(?P<ref>[A-Z][a-z]{2})(?P<pos>\d+)(?P<alt>[A-Z][a-z]{2}|=)\)?$")
+
+
+# Lowercased fragments of libpq/psycopg2 connection-failure messages. The reverse-translate
+# subprocess reports UTA errors only as text (stderr on exit, or its per-row error column), so a
+# transient outage is recognised by message. Authentication and missing-database errors are
+# deliberately absent: those are configuration faults that retrying cannot fix.
+_TRANSIENT_UPSTREAM_MARKERS = (
+    "server closed the connection unexpectedly",
+    "could not connect to server",
+    "connection refused",
+    "connection timed out",
+    "timeout expired",
+    "terminating connection",
+    "ssl syscall error",
+    "could not receive data from server",
+    "could not send data to server",
+    "temporary failure in name resolution",
+)
+
+
+def _is_transient_upstream_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in _TRANSIENT_UPSTREAM_MARKERS)
 
 
 class _Kind(Enum):
@@ -298,6 +322,81 @@ def _parse_protein_aa_change(hgvs_p: str) -> tuple[str, int, str] | None:
     return ref_aa3, pos, ref_aa3 if alt_raw == "=" else alt_raw
 
 
+def _run_reverse_translate_batch_with_retry(
+    cli_path: str,
+    consequences: list[ProteinConsequence],
+    *,
+    config: TranslationConfig,
+) -> tuple[list[_BatchOutputRow], list[_BatchErrorRow]]:
+    """Run the reverse-translate subprocess, retrying transient UTA connection failures.
+
+    The tool fails on a dropped UTA connection in two ways: a non-zero exit when the failure hits
+    its startup connect (the whole batch is lost), or empty rows carrying a per-row connection error
+    when the connection drops mid-run. The first re-runs the batch; the second re-runs only the
+    affected rows. Both share ``config.upstream_max_attempts``, with the delay doubling after each
+    failed attempt. Non-transient failures are returned or raised unchanged on first sight.
+    """
+    output_rows: list[_BatchOutputRow | None] = [None] * len(consequences)
+    errors_by_key: dict[tuple[str, str], list[_BatchErrorRow]] = {}
+    pending = list(range(len(consequences)))
+
+    for attempt in range(1, config.upstream_max_attempts + 1):
+        batch = [consequences[i] for i in pending]
+        try:
+            rows, errors = _run_reverse_translate_batch(cli_path, batch, config=config)
+        except RuntimeError as exc:
+            retryable = _is_transient_upstream_error(str(exc)) and attempt < config.upstream_max_attempts
+            if not retryable:
+                # A failed row-level re-run must not discard rows an earlier run already produced.
+                if any(row is not None for row in output_rows):
+                    break
+                raise
+            _wait_before_retry(attempt, config, f"reverse-translate-variants exited on a UTA error: {exc}")
+            continue
+
+        if len(rows) != len(batch):
+            # Nothing to splice positionally. On the first completed run the caller reports the
+            # mismatch; on a row-level re-run, keep the rows already collected.
+            if all(row is None for row in output_rows):
+                return rows, errors
+            break
+
+        batch_errors: dict[tuple[str, str], list[_BatchErrorRow]] = defaultdict(list)
+        for err in errors:
+            batch_errors[(err.transcript, err.hgvs_p)].append(err)
+        for i, row in zip(pending, rows):
+            output_rows[i] = row
+            key = (consequences[i].transcript, consequences[i].hgvs_p)
+            errors_by_key[key] = batch_errors.get(key, [])
+
+        pending = [
+            i
+            for i in pending
+            if not output_rows[i].projection_pairs  # type: ignore[union-attr]
+            and any(
+                _is_transient_upstream_error(err.error)
+                for err in errors_by_key[(consequences[i].transcript, consequences[i].hgvs_p)]
+            )
+        ]
+        if not pending or attempt == config.upstream_max_attempts:
+            break
+        _wait_before_retry(attempt, config, f"{len(pending)} row(s) failed on a UTA connection error")
+
+    return [row for row in output_rows if row is not None], [err for errs in errors_by_key.values() for err in errs]
+
+
+def _wait_before_retry(attempt: int, config: TranslationConfig, cause: str) -> None:
+    delay = config.upstream_retry_backoff_seconds * 2 ** (attempt - 1)
+    logger.warning(
+        "Retrying reverse translation (attempt %d/%d) in %.1fs; %s",
+        attempt + 1,
+        config.upstream_max_attempts,
+        delay,
+        cause,
+    )
+    time.sleep(delay)
+
+
 def _untranslatable_edit_reason(hgvs_p: str) -> str | None:
     """Return why this protein edit cannot be reverse-translated, or ``None`` when it can.
 
@@ -420,10 +519,13 @@ def _build_result(
 
     if not pairs:
         # Only translatable edit types reach the tool (non-translatable ones are screened out up
-        # front), so an empty result here is a genuine failure.
+        # front), so an empty result here is a genuine failure, or a UTA outage that outlasted
+        # the retries.
+        transient = any(_is_transient_upstream_error(msg) for msg in error_messages)
         return TranslationError(
             input=inp,
             error=error or "Reverse translation returned no candidate DNA variants",
+            reason=TranslationErrorReason.UPSTREAM_UNAVAILABLE if transient else TranslationErrorReason.FAILED,
         )
 
     hgvs_p_out = consequence.hgvs_p if _classify_kind(inp.hgvs) is not _Kind.PROTEIN else None
@@ -506,12 +608,21 @@ def construct_equivalent_variants(
 
     if batch_consequences:
         try:
-            output_rows, error_rows = _run_reverse_translate_batch(cli_path, batch_consequences, config=config)
+            output_rows, error_rows = _run_reverse_translate_batch_with_retry(
+                cli_path, batch_consequences, config=config
+            )
         except RuntimeError as exc:
             subprocess_error = str(exc)
 
     if subprocess_error:
-        return [], early_errors + [TranslationError(input=inputs[i], error=subprocess_error) for i in batch_positions]
+        reason = (
+            TranslationErrorReason.UPSTREAM_UNAVAILABLE
+            if _is_transient_upstream_error(subprocess_error)
+            else TranslationErrorReason.FAILED
+        )
+        return [], early_errors + [
+            TranslationError(input=inputs[i], error=subprocess_error, reason=reason) for i in batch_positions
+        ]
 
     if batch_consequences and len(output_rows) != len(batch_consequences):
         mismatch = f"reverse-translate-variants returned {len(output_rows)} rows for {len(batch_consequences)} inputs"
