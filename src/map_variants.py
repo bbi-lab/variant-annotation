@@ -274,11 +274,12 @@ _CASE1_RAW_HGVS_NT_RE = re.compile(
 # ``c.[1A>G;3G>T]``.
 _CASE2_C_HAPLOTYPE_RE = re.compile(r"^c\.\[(?P<body>[^\]]+)\]$")
 
-# Matches the non-standard genomic identity expression dcd_mapping emits for
-# no-change alleles, e.g. "NC_000007.14:g.144548593CCT=".
-# Groups: (1) prefix through "g.", (2) start position, (3) reference bases.
-_VRS_IDENTITY_G_RE = re.compile(
-    r"^((?:NC_|NG_|NT_|NW_)[^:]+:g\.)(\d+)([ACGTacgt]+)=$"
+# Matches the non-standard identity expression dcd_mapping (and, on occasion,
+# ClinGen's own Allele Registry response) emits for no-change alleles, e.g.
+# "NC_000007.14:g.144548593CCT=" (genomic) or "NM_022445.4:c.612C=" (transcript).
+# Groups: (1) prefix through "g."/"c."/"n.", (2) start position, (3) reference bases.
+_VRS_IDENTITY_RE = re.compile(
+    r"^((?:NC_|NG_|NT_|NW_|NM_|NR_|XM_|XR_)[^:]+:[gcn]\.)(\d+)([ACGTacgt]+)=$"
 )
 _CASE2_C_SUB_RE = re.compile(r"^(?P<coord>\d+)(?P<ref>[ACGTN])>(?P<alt>[ACGTN])$")
 _MAPPED_C_SUB_RE = re.compile(
@@ -872,6 +873,19 @@ def _extract_hgvs_ca(
                 if _is_protein_hgvs(candidate_p):
                     hgvs_p = candidate_p
                 break
+
+    # ClinGen occasionally echoes back the same non-standard identity form
+    # (embedded reference bases immediately before "=") that dcd_mapping emits
+    # for reference-identical alleles -- see _reformat_identity_hgvs_as_delins.
+    # Unlike the outbound query string (reformatted before it's ever sent to
+    # ClinGen), these come from ClinGen's *response* and were previously
+    # written straight through, corrupting hg38_start/hg38_end (or
+    # transcript_pos) downstream in add_vcf_identifiers.py, whose parser has
+    # no branch for this form.
+    if hgvs_g:
+        hgvs_g = _reformat_identity_hgvs_as_delins(hgvs_g) or hgvs_g
+    if hgvs_c:
+        hgvs_c = _reformat_identity_hgvs_as_delins(hgvs_c) or hgvs_c
 
     return hgvs_g, hgvs_c, hgvs_p
 
@@ -1515,19 +1529,23 @@ def _hgvs_from_annotation(annotation) -> Optional[str]:
 
 
 def _reformat_identity_hgvs_as_delins(hgvs: str) -> Optional[str]:
-    """Reformat a VRS genomic identity expression as an equivalent delins.
+    """Reformat a VRS identity expression as an equivalent delins.
 
-    dcd_mapping emits non-standard strings like ``NC_000007.14:g.144548593CCT=``
-    for alleles that are identical to the reference (e.g. a delins that inserts
-    the same bases that are already present).  This function converts them to a
-    proper HGVS delins where ref == alt, e.g.
+    dcd_mapping (and, on occasion, ClinGen's own Allele Registry response --
+    see the call sites in :func:`_extract_hgvs_ca`) emits non-standard
+    strings like ``NC_000007.14:g.144548593CCT=`` or ``NM_022445.4:c.612C=``
+    for alleles that are identical to the reference (e.g. a delins that
+    inserts the same bases that are already present). This function converts
+    them to a proper HGVS delins where ref == alt, e.g.
     ``NC_000007.14:g.144548593_144548595delinsCCT``, which is both valid HGVS
-    and unambiguous for downstream consumers such as ClinGen.
+    and unambiguous for downstream consumers such as ClinGen and
+    add_vcf_identifiers.py's HGVS parser (neither of which understands the
+    non-standard embedded-bases-before-``=`` form).
 
     Returns ``None`` when the string does not match the expected pattern (e.g.
     no embedded bases before ``=``).
     """
-    m = _VRS_IDENTITY_G_RE.match(hgvs.rstrip())
+    m = _VRS_IDENTITY_RE.match(hgvs.rstrip())
     if not m:
         return None
     prefix, pos_str, bases = m.group(1), m.group(2), m.group(3)
