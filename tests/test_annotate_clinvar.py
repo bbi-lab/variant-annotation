@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 import src.annotate_clinvar as mod
 from src.lib.clingen import resolve_clinvar_allele_id
 
@@ -298,6 +299,85 @@ def requests_http_error(status_code: int):
     mock_resp = MagicMock()
     mock_resp.status_code = status_code
     return req_lib.HTTPError(response=mock_resp)
+
+
+# ---------------------------------------------------------------------------
+# fetch_clinvar_tsv
+# ---------------------------------------------------------------------------
+
+
+class TestFetchClinvarTsv:
+    def _mock_ok_response(self, chunks: list[bytes] | None = None):
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.iter_content.return_value = chunks if chunks is not None else [b"data"]
+        return resp
+
+    def test_uses_cached_file_without_network_call(self, tmp_path):
+        cache_dir = tmp_path
+        dest = mod._cache_path(cache_dir, 2026, 1)
+        dest.write_bytes(b"cached")
+
+        with patch("src.annotate_clinvar.requests.get") as mock_get:
+            result = mod.fetch_clinvar_tsv(2026, 1, cache_dir)
+
+        mock_get.assert_not_called()
+        assert result == dest
+
+    def test_retries_transient_error_then_succeeds(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+        cache_dir = tmp_path
+        failing_resp = MagicMock()
+        failing_resp.raise_for_status.return_value = None
+        failing_resp.iter_content.side_effect = requests.exceptions.ChunkedEncodingError(
+            "Connection broken: IncompleteRead"
+        )
+        ok_resp = self._mock_ok_response([b"chunk1", b"chunk2"])
+
+        with patch(
+            "src.annotate_clinvar.requests.get", side_effect=[failing_resp, ok_resp]
+        ) as mock_get:
+            result = mod.fetch_clinvar_tsv(2026, 1, cache_dir, max_attempts=4)
+
+        assert mock_get.call_count == 2
+        assert result == mod._cache_path(cache_dir, 2026, 1)
+        assert result.read_bytes() == b"chunk1chunk2"
+        # The failed attempt's partial .tmp file must not linger.
+        assert not result.with_suffix(".tmp").exists()
+
+    def test_http_error_moves_to_next_url_without_retry(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+        cache_dir = tmp_path
+        http_error_resp = MagicMock()
+        http_error_resp.raise_for_status.side_effect = requests_http_error(404)
+        ok_resp = self._mock_ok_response([b"data"])
+
+        with patch(
+            "src.annotate_clinvar.requests.get", side_effect=[http_error_resp, ok_resp]
+        ) as mock_get:
+            result = mod.fetch_clinvar_tsv(2026, 1, cache_dir, max_attempts=4)
+
+        # One call for the first (failing) URL, one for the second -- no
+        # retries burned on the URL that 404s.
+        assert mock_get.call_count == 2
+        assert result.exists()
+
+    def test_raises_after_exhausting_all_urls_and_attempts(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+        cache_dir = tmp_path
+        failing_resp = MagicMock()
+        failing_resp.raise_for_status.return_value = None
+        failing_resp.iter_content.side_effect = requests.exceptions.ConnectionError(
+            "boom"
+        )
+
+        with patch("src.annotate_clinvar.requests.get", return_value=failing_resp) as mock_get:
+            with pytest.raises(RuntimeError, match="Could not download"):
+                mod.fetch_clinvar_tsv(2026, 1, cache_dir, max_attempts=2)
+
+        # 2 attempts per URL, 2 candidate URLs.
+        assert mock_get.call_count == 4
+        assert not mod._cache_path(cache_dir, 2026, 1).with_suffix(".tmp").exists()
 
 
 # ---------------------------------------------------------------------------
