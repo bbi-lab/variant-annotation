@@ -839,6 +839,7 @@ def _extract_hgvs_ca(
     hgvs_g: Optional[str] = None
     hgvs_c: Optional[str] = None
     hgvs_p: Optional[str] = None
+    genomic_allele: Optional[dict] = None
 
     # Genomic – prefer GRCh38 NC_ accession.
     for allele in data.get("genomicAlleles", []):
@@ -846,6 +847,7 @@ def _extract_hgvs_ca(
             for h in allele.get("hgvs", []):
                 if h.startswith("NC_"):
                     hgvs_g = h
+                    genomic_allele = allele
                     break
         if hgvs_g:
             break
@@ -874,18 +876,25 @@ def _extract_hgvs_ca(
                     hgvs_p = candidate_p
                 break
 
-    # ClinGen occasionally echoes back the same non-standard identity form
-    # (embedded reference bases immediately before "=") that dcd_mapping emits
-    # for reference-identical alleles -- see _reformat_identity_hgvs_as_delins.
-    # Unlike the outbound query string (reformatted before it's ever sent to
-    # ClinGen), these come from ClinGen's *response* and were previously
-    # written straight through, corrupting hg38_start/hg38_end (or
-    # transcript_pos) downstream in add_vcf_identifiers.py, whose parser has
-    # no branch for this form.
-    if hgvs_g:
-        hgvs_g = _reformat_identity_hgvs_as_delins(hgvs_g) or hgvs_g
-    if hgvs_c:
-        hgvs_c = _reformat_identity_hgvs_as_delins(hgvs_c) or hgvs_c
+    # ClinGen's own canonical rendering of a reference-identical allele uses
+    # the same non-standard identity form (embedded reference bases
+    # immediately before "=") that dcd_mapping emits for its (occasionally
+    # wrong) identity claims -- confirmed directly against the live API, this
+    # is not an echo of a malformed query. Rebuild it as an explicit delins
+    # (ref == alt == bases) so add_vcf_identifiers.py's parser (which has no
+    # branch for this non-standard form) doesn't corrupt hg38_start/hg38_end
+    # (or transcript_pos) downstream -- but only once the *genomic* allele's
+    # own structured coordinates confirm this is a real identity allele
+    # (ClinGen validates those against the actual reference genome), not
+    # merely because a string happens to end in "=". A transcript's own "c."
+    # coordinates share no coordinate space with the genomic ones, so this
+    # can't be confirmed independently per-string; it relies on hgvs_g and
+    # hgvs_c describing the same underlying (confirmed-identity) allele.
+    if _is_confirmed_identity_allele(genomic_allele.get("coordinates") if genomic_allele else None):
+        if hgvs_g:
+            hgvs_g = _reformat_confirmed_identity_hgvs(hgvs_g) or hgvs_g
+        if hgvs_c:
+            hgvs_c = _reformat_confirmed_identity_hgvs(hgvs_c) or hgvs_c
 
     return hgvs_g, hgvs_c, hgvs_p
 
@@ -1529,27 +1538,76 @@ def _hgvs_from_annotation(annotation) -> Optional[str]:
 
 
 def _reformat_identity_hgvs_as_delins(hgvs: str) -> Optional[str]:
-    """Reformat a VRS identity expression as an equivalent explicit delins.
+    """Reformat a VRS identity expression as an equivalent bare delins.
 
-    dcd_mapping (and, on occasion, ClinGen's own Allele Registry response --
-    see the call sites in :func:`_extract_hgvs_ca`) emits non-standard
-    strings like ``NC_000007.14:g.144548593CCT=`` or ``NM_022445.4:c.612C=``
-    for alleles that are identical to the reference. This function converts
-    them to a proper HGVS delins with the *same* sequence spelled out on both
-    sides, e.g. ``NC_000007.14:g.144548593_144548595delCCTinsCCT``, which is
-    both valid HGVS and unambiguous for downstream consumers such as ClinGen
-    and add_vcf_identifiers.py's HGVS parser (neither of which understands
-    the non-standard embedded-bases-before-``=`` form).
+    dcd_mapping emits non-standard strings like ``NC_000007.14:g.144548593CCT=``
+    for alleles it (sometimes incorrectly -- see below) considers identical to
+    the reference. This function converts them to a proper HGVS delins, e.g.
+    ``NC_000007.14:g.144548593_144548595delinsCCT``, which is valid HGVS and
+    parseable by ClinGen.
 
-    The deleted sequence is spelled out explicitly (``del<bases>ins<bases>``)
-    rather than left bare (``delins<bases>``) so that add_vcf_identifiers.py
-    parses this as ref == alt == bases instead of ref == "" -- a bare
-    ``delins<bases>`` reads as a pure insertion there, which sends it through
-    VCF-anchor padding (prepending the reference base at that position) and
-    ends up asserting a real sequence change where none exists.
+    This is deliberately the *bare* ``delins<bases>`` form (not
+    ``del<bases>ins<bases>``), and is only safe to use for the *outbound*
+    query sent to ClinGen, never for a string taken at face value downstream:
+    dcd_mapping's embedded reference-base claim is occasionally wrong (its
+    own alignment miscalculates which bases are actually at that genomic
+    position), and a bare delins lets ClinGen independently re-derive the
+    true reference/alt from the genome and self-correct, where an explicit
+    ``del<bases>ins<bases>`` would instead have ClinGen validate the (wrong)
+    claimed bases and reject the query outright with "Given allele from
+    reference sequence is incorrect". For ClinGen's own *response* HGVS,
+    which is already validated against the real genome, use
+    :func:`_reformat_confirmed_identity_hgvs` instead, gated on
+    :func:`_is_confirmed_identity_allele`.
 
     Returns ``None`` when the string does not match the expected pattern (e.g.
     no embedded bases before ``=``).
+    """
+    m = _VRS_IDENTITY_RE.match(hgvs.rstrip())
+    if not m:
+        return None
+    prefix, pos_str, bases = m.group(1), m.group(2), m.group(3)
+    start = int(pos_str)
+    end = start + len(bases) - 1
+    if start == end:
+        return f"{prefix}{start}delins{bases}"
+    return f"{prefix}{start}_{end}delins{bases}"
+
+
+def _is_confirmed_identity_allele(coordinates: Optional[list[dict]]) -> bool:
+    """Return True if ClinGen's structured *coordinates* confirm reference identity.
+
+    *coordinates* is a ``genomicAlleles[i]["coordinates"]`` entry from a
+    ClinGen Allele Registry response, already validated by ClinGen against
+    the real reference genome -- so ``referenceAllele == allele`` there is a
+    trustworthy confirmation of a reference-identical allele, unlike the
+    embedded bases in dcd_mapping's own identity claim (see
+    :func:`_reformat_identity_hgvs_as_delins`), which are occasionally wrong.
+    """
+    if not coordinates:
+        return False
+    coord = coordinates[0]
+    ref = coord.get("referenceAllele")
+    alt = coord.get("allele")
+    return ref is not None and ref == alt
+
+
+def _reformat_confirmed_identity_hgvs(hgvs: str) -> Optional[str]:
+    """Reformat a *confirmed* identity expression as an explicit delins.
+
+    Only call this once :func:`_is_confirmed_identity_allele` has verified
+    (via ClinGen's structured coordinates) that the allele really is
+    reference-identical -- at that point the embedded bases in *hgvs* itself
+    can be trusted (they're ClinGen's own rendering of the same validated
+    allele, just projected onto a different reference sequence -- e.g. a
+    transcript's own "c." numbering, which doesn't share a coordinate space
+    with the genomic "g." coordinates used for the confirmation, so those
+    coordinates can't be used directly to rebuild this string; the position
+    embedded in *hgvs* is already correct for its own coordinate system).
+
+    Returns an explicit ``del<bases>ins<bases>`` HGVS string (ref == alt ==
+    bases), or ``None`` when *hgvs* doesn't match the expected identity
+    pattern.
     """
     m = _VRS_IDENTITY_RE.match(hgvs.rstrip())
     if not m:

@@ -570,6 +570,150 @@ def test_extract_clingen_allele_id(data, expected):
     assert mv._extract_clingen_allele_id(data) == expected
 
 
+# ---------------------------------------------------------------------------
+# Identity-form HGVS reformatting (_reformat_identity_hgvs_as_delins,
+# _is_confirmed_identity_allele, _reformat_confirmed_identity_hgvs,
+# _extract_hgvs_ca)
+# ---------------------------------------------------------------------------
+
+
+def test_reformat_identity_hgvs_as_delins_single_base():
+    assert (
+        mv._reformat_identity_hgvs_as_delins("NC_000007.14:g.144548492G=")
+        == "NC_000007.14:g.144548492delinsG"
+    )
+
+
+def test_reformat_identity_hgvs_as_delins_multi_base():
+    assert (
+        mv._reformat_identity_hgvs_as_delins("NC_000007.14:g.144548593CCT=")
+        == "NC_000007.14:g.144548593_144548595delinsCCT"
+    )
+
+
+def test_reformat_identity_hgvs_as_delins_non_identity_returns_none():
+    # No embedded bases before "=" (an ordinary protein identity allele, for
+    # example) must not match.
+    assert mv._reformat_identity_hgvs_as_delins("NP_000518.1:p.Ser65=") is None
+
+
+@pytest.mark.parametrize(
+    "coordinates,expected",
+    [
+        ([{"referenceAllele": "G", "allele": "G", "start": 144548491, "end": 144548492}], True),
+        ([{"referenceAllele": "TG", "allele": "CC", "start": 144548592, "end": 144548594}], False),
+        ([{"referenceAllele": "G", "allele": None, "start": 1, "end": 2}], False),
+        ([], False),
+        (None, False),
+    ],
+)
+def test_is_confirmed_identity_allele(coordinates, expected):
+    assert mv._is_confirmed_identity_allele(coordinates) is expected
+
+
+def test_reformat_confirmed_identity_hgvs_explicit_both_sides():
+    assert (
+        mv._reformat_confirmed_identity_hgvs("NM_022445.4:c.612C=")
+        == "NM_022445.4:c.612delCinsC"
+    )
+
+
+def _genomic_allele(hgvs_list, ref_genome="GRCh38", coordinates=None):
+    return {
+        "referenceGenome": ref_genome,
+        "hgvs": hgvs_list,
+        "coordinates": coordinates or [],
+    }
+
+
+def _transcript_allele(hgvs_list, coordinates=None, protein_hgvs=None):
+    allele = {"hgvs": hgvs_list, "coordinates": coordinates or []}
+    if protein_hgvs is not None:
+        allele["proteinEffect"] = {"hgvs": protein_hgvs}
+    return allele
+
+
+def test_extract_hgvs_ca_confirmed_identity_reformats_both_g_and_c():
+    """A real ClinGen identity allele (genomic coordinates confirm ref==alt)
+    must be rewritten to an explicit delins for both hgvs_g and hgvs_c, e.g.
+    the TPK1 urn:mavedb:00001251-a-1#2 case from the live API."""
+    data = {
+        "genomicAlleles": [
+            _genomic_allele(
+                ["NC_000007.14:g.144548492G="],
+                coordinates=[
+                    {"referenceAllele": "G", "allele": "G", "start": 144548491, "end": 144548492}
+                ],
+            )
+        ],
+        "transcriptAlleles": [
+            _transcript_allele(
+                ["NM_022445.4:c.612C="],
+                protein_hgvs="NP_071890.2:p.Leu204=",
+            )
+        ],
+    }
+
+    hgvs_g, hgvs_c, hgvs_p = mv._extract_hgvs_ca(data, "NM_022445.4")
+
+    assert hgvs_g == "NC_000007.14:g.144548492delGinsG"
+    assert hgvs_c == "NM_022445.4:c.612delCinsC"
+    assert hgvs_p == "NP_071890.2:p.Leu204="
+
+
+def test_extract_hgvs_ca_unconfirmed_identity_left_unreformatted():
+    """A genuinely wrong dcd_mapping identity claim that ClinGen itself
+    rejected/never returned as identity (real regression case: TPK1
+    urn:mavedb:00001251-a-1#7778, a true His170_Arg171delinsGlnGly missense
+    variant) must never be reformatted into a fabricated identity allele --
+    the genomic coordinates here show a real substitution (TG -> CC), so
+    hgvs_g/hgvs_c pass through exactly as ClinGen returned them, "=" or not.
+    """
+    data = {
+        "genomicAlleles": [
+            _genomic_allele(
+                ["NC_000007.14:g.144548593_144548594delinsCC"],
+                coordinates=[
+                    {
+                        "referenceAllele": "TG",
+                        "allele": "CC",
+                        "start": 144548592,
+                        "end": 144548594,
+                    }
+                ],
+            )
+        ],
+        "transcriptAlleles": [
+            _transcript_allele(
+                ["NM_022445.4:c.510_511delinsGG"],
+                protein_hgvs="NP_071890.2:p.His170_Arg171delinsGlnGly",
+            )
+        ],
+    }
+
+    hgvs_g, hgvs_c, hgvs_p = mv._extract_hgvs_ca(data, "NM_022445.4")
+
+    assert hgvs_g == "NC_000007.14:g.144548593_144548594delinsCC"
+    assert hgvs_c == "NM_022445.4:c.510_511delinsGG"
+    assert hgvs_p == "NP_071890.2:p.His170_Arg171delinsGlnGly"
+
+
+def test_extract_hgvs_ca_no_genomic_allele_leaves_transcript_c_untouched():
+    """No genomic allele at all (so identity can't be confirmed either way)
+    must not touch a transcript-level "=" string, even if present."""
+    data = {
+        "genomicAlleles": [],
+        "transcriptAlleles": [
+            _transcript_allele(["NM_022445.4:c.612C="], protein_hgvs="NP_071890.2:p.Leu204=")
+        ],
+    }
+
+    hgvs_g, hgvs_c, hgvs_p = mv._extract_hgvs_ca(data, "NM_022445.4")
+
+    assert hgvs_g is None
+    assert hgvs_c == "NM_022445.4:c.612C="
+
+
 def test_map_variants_clingen_no_data_preserves_protein_hgvs(tmp_path, monkeypatch):
     """When ClinGen returns no data, the dcd_mapping p. result is kept in mapped_hgvs_p."""
     input_path = tmp_path / "in.tsv"
