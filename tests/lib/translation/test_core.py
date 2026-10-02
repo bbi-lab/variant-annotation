@@ -9,7 +9,7 @@ from variant_annotation.lib.translation._core import (
     _classify_kind,
     _parse_projection_pairs,
     _parse_protein_aa_change,
-    _project_coding_delins,
+    _repair_genomic_projections,
     _untranslatable_edit_reason,
     construct_equivalent_variants,
     construct_one,
@@ -675,7 +675,7 @@ def test_empty_row_with_non_transient_error_is_not_retried(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _project_coding_delins — a coding delins projects to one genomic delins
+# _repair_genomic_projections — genomic projections the CLI misstates
 # ---------------------------------------------------------------------------
 
 
@@ -685,7 +685,7 @@ class _DelinsCoordinates(_StubCoordinates):
         return "NC_000016.10:g.1315654_1315656delinsGCG"
 
 
-def test_project_coding_delins_replaces_a_cis_phased_projection_with_a_single_delins():
+def test_repair_genomic_projections_replaces_a_cis_phased_projection_with_a_single_delins():
     pairs = [
         ProjectionPair(
             hgvs_c="NM_003345.5:c.151_153delinsGCG",
@@ -694,7 +694,7 @@ def test_project_coding_delins_replaces_a_cis_phased_projection_with_a_single_de
         )
     ]
 
-    assert _project_coding_delins(pairs, _DelinsCoordinates()) == [
+    assert _repair_genomic_projections(pairs, _DelinsCoordinates()) == [
         ProjectionPair(
             hgvs_c="NM_003345.5:c.151_153delinsGCG",
             hgvs_g="NC_000016.10:g.1315654_1315656delinsGCG",
@@ -716,18 +716,18 @@ def test_project_coding_delins_replaces_a_cis_phased_projection_with_a_single_de
     ],
     ids=["snv", "already a delins", "projection failed"],
 )
-def test_project_coding_delins_leaves_other_pairs_untouched(pair):
-    assert _project_coding_delins([pair], _StubCoordinates()) == [pair]
+def test_repair_genomic_projections_leaves_other_pairs_untouched(pair):
+    assert _repair_genomic_projections([pair], _StubCoordinates()) == [pair]
 
 
-def test_project_coding_delins_failed_projection_is_none_not_the_cis_phased_form():
+def test_repair_genomic_projections_failed_projection_is_none_not_the_cis_phased_form():
     pair = ProjectionPair(
         hgvs_c="NM_003345.5:c.151_153delinsGCG",
         hgvs_g="NC_000016.10:g.[1315654A>G;1315656T>G]",
         variant_type="delins",
     )
 
-    assert _project_coding_delins([pair], _StubCoordinates()) == [
+    assert _repair_genomic_projections([pair], _StubCoordinates()) == [
         ProjectionPair(hgvs_c="NM_003345.5:c.151_153delinsGCG", hgvs_g=None, variant_type="delins")
     ]
 
@@ -747,10 +747,10 @@ class _InversionCoordinates(_StubCoordinates):
     ["NC_000017.11:g.3498898_3498899inv", "NC_000017.11:g.[3498898A>G;3498899C>T]"],
     ids=["cli wrote inv", "cli wrote cis-phased and the reprojection is inv"],
 )
-def test_project_coding_delins_rewrites_an_inversion_as_the_delins_on_its_trimmed_span(cli_hgvs_g):
+def test_repair_genomic_projections_rewrites_an_inversion_as_the_delins_on_its_trimmed_span(cli_hgvs_g):
     pair = ProjectionPair(hgvs_c="NM_000049.4:c.752_753delinsGT", hgvs_g=cli_hgvs_g, variant_type="delins")
 
-    (projected,) = _project_coding_delins([pair], _InversionCoordinates())
+    (projected,) = _repair_genomic_projections([pair], _InversionCoordinates())
 
     assert projected.hgvs_g == "NC_000017.11:g.3498898_3498899delinsGT"
 
@@ -760,7 +760,7 @@ def test_project_coding_delins_rewrites_an_inversion_as_the_delins_on_its_trimme
     ["NC_000017.11:g.3498898_3498899inv", "NC_000001.11:g.3498898_3498899delinsGT", "NC_000017.11:g.3498899delinsG"],
     ids=["literal is still an inversion", "different accession", "span does not cover the inversion"],
 )
-def test_project_coding_delins_inversion_it_cannot_rewrite_exactly_is_none(literal):
+def test_repair_genomic_projections_inversion_it_cannot_rewrite_exactly_is_none(literal):
     class _Coordinates(_InversionCoordinates):
         def c_to_g_literal(self, c):
             return literal
@@ -769,16 +769,40 @@ def test_project_coding_delins_inversion_it_cannot_rewrite_exactly_is_none(liter
         hgvs_c="NM_000049.4:c.752_753delinsGT", hgvs_g="NC_000017.11:g.3498898_3498899inv", variant_type="delins"
     )
 
-    (projected,) = _project_coding_delins([pair], _Coordinates())
+    (projected,) = _repair_genomic_projections([pair], _Coordinates())
 
     assert projected.hgvs_g is None
 
 
-def test_project_coding_delins_inversion_without_a_literal_projection_is_none():
+def test_repair_genomic_projections_inversion_without_a_literal_projection_is_none():
     pair = ProjectionPair(
         hgvs_c="NM_000049.4:c.752_753delinsGT", hgvs_g="NC_000017.11:g.3498898_3498899inv", variant_type="delins"
     )
 
-    (projected,) = _project_coding_delins([pair], _StubCoordinates())
+    (projected,) = _repair_genomic_projections([pair], _StubCoordinates())
 
     assert projected.hgvs_g is None
+
+
+@pytest.mark.parametrize(
+    "hgvs_g",
+    ["NC_000002.12:g.214730509_214745065delinsTT", "NC_000002.12:g.214730511_214745065del"],
+    ids=["delins across the intron", "deletion across the intron"],
+)
+def test_repair_genomic_projections_drops_an_insertion_projected_across_an_intron(hgvs_g):
+    pair = ProjectionPair(hgvs_c="NM_000465.4:c.1903_1904insGAA", hgvs_g=hgvs_g, variant_type="insertion")
+
+    (projected,) = _repair_genomic_projections([pair], _StubCoordinates())
+
+    assert projected == ProjectionPair(hgvs_c="NM_000465.4:c.1903_1904insGAA", hgvs_g=None, variant_type="insertion")
+
+
+@pytest.mark.parametrize(
+    "hgvs_g",
+    ["NC_000002.12:g.214730508_214730509insTTC", "NC_000002.12:g.214730508_214730510dup"],
+    ids=["insertion", "duplication"],
+)
+def test_repair_genomic_projections_keeps_an_insertion_projected_within_an_exon(hgvs_g):
+    pair = ProjectionPair(hgvs_c="NM_000465.4:c.1904_1905insAAG", hgvs_g=hgvs_g, variant_type="insertion")
+
+    assert _repair_genomic_projections([pair], _StubCoordinates()) == [pair]

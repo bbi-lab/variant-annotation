@@ -500,6 +500,8 @@ def _apply_wt_codon(
 
 _SINGLE_CODING_DELINS_RE = re.compile(r":c\.\d+_\d+delins[ACGT]+$")
 _GENOMIC_INVERSION_RE = re.compile(r"^(?P<ac>[^:]+):g\.(?P<start>\d+)_(?P<end>\d+)inv$")
+_CODING_INSERTION_RE = re.compile(r":c\.\d+_\d+ins[ACGT]+$")
+_GENOMIC_DELETION_RE = re.compile(r":g\.\d+_\d+del")
 _GENOMIC_DELINS_RE = re.compile(r"^(?P<ac>[^:]+):g\.(?P<start>\d+)(?:_(?P<end>\d+))?delins(?P<alt>[ACGTN]+)$")
 
 
@@ -527,23 +529,30 @@ def _inversion_as_delins(inversion: str, hgvs_c: str, coordinates: CoordinateTra
     return f"{inv['ac']}:g.{start}_{end}delins{alt[start - literal_start : end - literal_start + 1]}"
 
 
-def _project_coding_delins(pairs: list[ProjectionPair], coordinates: CoordinateTranslator) -> list[ProjectionPair]:
-    """Project each single coding delins to genomic as a single delins.
+def _repair_genomic_projections(pairs: list[ProjectionPair], coordinates: CoordinateTranslator) -> list[ProjectionPair]:
+    """Correct, or drop, genomic projections from reverse-translate-variants that misstate the coding change.
 
-    reverse-translate-variants writes some coding delins' genomic projections in forms VRS and ClinGen do
-    not share with dcd-mapping and the WT-codon pair below:
+    Each pair's genomic member should be the coding member's change on the genome, written the way
+    dcd-mapping and the WT-codon pair below write it. The CLI departs from that in three ways:
 
-    * a codon change with an unchanged middle base as a cis-phased pair (``g.[1315654A>G;1315656T>G]``),
-      a different VRS type, so it never matches the same change mapped as a delins;
-    * a delins whose inserted bases are the reverse complement of the reference as ``inv``, which VRS
-      cannot translate at all.
+    * a codon change with an unchanged middle base becomes a cis-phased pair (``g.[1315654A>G;1315656T>G]``),
+      a different VRS type that never matches the same change mapped as a delins: re-projected as one delins;
+    * a delins whose inserted bases are the reverse complement of the reference becomes ``inv``, which VRS
+      cannot translate: rewritten as the delins it stands for;
+    * an insertion between two exons' bases (``c.1903_1904insGAA`` at an exon junction) becomes a delins
+      deleting the intron between them: dropped. The CLI also emits the same coding allele inside one exon,
+      whose projection is correct.
 
-    Both are re-expressed as one genomic delins. A projection that can't be is ``hgvs_g=None``, as in
-    :func:`_apply_wt_codon`, never the original form.
+    A projection that can't be corrected is ``hgvs_g=None``, as in :func:`_apply_wt_codon`, never the
+    original form.
     """
     projected: list[ProjectionPair] = []
     for pair in pairs:
         hgvs_g = pair.hgvs_g
+        if hgvs_g and _CODING_INSERTION_RE.search(pair.hgvs_c) and _GENOMIC_DELETION_RE.search(hgvs_g):
+            projected.append(ProjectionPair(hgvs_c=pair.hgvs_c, hgvs_g=None, variant_type=pair.variant_type))
+            continue
+
         cis_phased = bool(hgvs_g and ":g.[" in hgvs_g)
         inversion = bool(hgvs_g and _GENOMIC_INVERSION_RE.match(hgvs_g))
         if not ((cis_phased or inversion) and _SINGLE_CODING_DELINS_RE.search(pair.hgvs_c)):
@@ -573,7 +582,7 @@ def _build_result(
     coordinates: CoordinateTranslator,
 ) -> TranslationResult | TranslationError:
     pairs = _apply_wt_codon(
-        _project_coding_delins(output_row.projection_pairs, coordinates),
+        _repair_genomic_projections(output_row.projection_pairs, coordinates),
         consequence,
         config=config,
         transcripts=transcripts,
