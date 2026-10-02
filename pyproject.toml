@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "variant-annotation"
-version = "0.1.0"
+version = "0.1.0-dev.5"
 authors = [
     { name="Jeremy Stone", email="74574922+jstone-dev@users.noreply.github.com" },
 ]
@@ -25,6 +25,7 @@ dependencies = [
     "redis",
     "requests",
     "variant-translation==1.1.0b1",
+    "pandas (>=2.2.1,<3.0.0)",
 ]
 
 [project.optional-dependencies]
@@ -58,8 +59,15 @@ line-ending = "lf"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["src*"]
-namespaces = true
+include = ["variant_annotation*"]
+
+[tool.pytest.ini_options]
+pythonpath = [".","src"]
+markers = [
+    "unit: tests a single lib function or class in isolation with all dependencies stubbed",
+    "integration: end-to-end tests that exercise multiple components together (CLI scripts, pipeline steps)",
+    "slow: tests that take notably longer due to real sleep, large fixtures, or subprocess overhead",
+]
 
 [tool.variant-translation.build-instructions]
 build_command = "python -m build"

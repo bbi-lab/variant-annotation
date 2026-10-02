@@ -29,7 +29,7 @@ from threading import Lock
 from pathlib import Path
 from typing import Optional
 
-from src.lib.clingen import query_clingen_by_hgvs
+from variant_annotation.lib.clingen import query_clingen_by_hgvs
 
 logger = logging.getLogger(__name__)
 

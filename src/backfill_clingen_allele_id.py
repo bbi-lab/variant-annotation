@@ -80,7 +80,7 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
-from src.lib.clingen import query_clingen_by_hgvs
+from variant_annotation.lib.clingen import query_clingen_by_hgvs
 
 load_dotenv()
 

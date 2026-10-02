@@ -174,6 +174,96 @@ Protein-only rows that appear consecutively in the input are accumulated into a 
 
 ---
 
+## Library internals
+
+This section is for Python callers (mavedb-api or tests) that use the library
+directly rather than the CLI. See [architecture.md](architecture.md) for the
+broader library structure.
+
+### Public API
+
+```python
+from variant_annotation.lib.translation import (
+    construct_equivalent_variants,  # batch entry point — prefer over calling construct_one in a loop
+    construct_one,  # single-variant convenience
+    CoordinateTranslator,  # protocol — satisfy with clients/coordinates.py
+    TranscriptSource,  # protocol — satisfy with clients/uta.py
+    TranslationConfig,  # behaviour knobs
+    TranslationResult,  # success output
+    TranslationError,  # failure/skip output
+    TranslationErrorReason,  # enum typing an error as NOT_TRANSLATABLE, FAILED, or UPSTREAM_UNAVAILABLE
+    VariantInput,  # input type
+    WtCodonMode,  # enum for wt_codon_mode
+)
+```
+
+### Collapse → expand
+
+`construct_equivalent_variants` works in two phases. First, every input (p., c.,
+or g. HGVS) is collapsed to a `ProteinConsequence` — c./g. inputs are
+forward-translated, p. inputs resolve their transcript via UTA. Then all
+consequences are expanded via a single `reverse-translate-variants` subprocess
+call that returns the full candidate set. The single subprocess call is
+intentional: startup overhead is amortized across the whole batch. Prefer
+`construct_equivalent_variants` over calling `construct_one` in a loop.
+
+### TranslationError is not always a failure
+
+`TranslationError` covers three distinct cases, told apart by its typed
+`reason` (a `TranslationErrorReason`) — never by parsing the `error` text:
+
+- `NOT_TRANSLATABLE` — the protein consequence's edit type has no DNA equivalence
+  class to construct, so there was never anything to reverse-translate. This is a
+  benign structural gap, not a failure. A single-residue substitution (missense,
+  synonymous, nonsense) **and** a single-residue deletion are translatable; a
+  frameshift, insertion, multi-residue delins, duplication, stop-loss, or
+  extension is not. The library screens these out **up front** by edit type,
+  so a non-translatable input costs no subprocess work.
+- `FAILED` — a genuine error: the input could not be collapsed to a protein
+  consequence, the subprocess failed or returned a mismatched row count, or a
+  translatable consequence yielded no candidate (e.g. a reference-AA mismatch).
+- `UPSTREAM_UNAVAILABLE` — UTA dropped or refused the connection and the retries
+  were exhausted. The input is fine; re-running once UTA recovers is expected to
+  succeed.
+
+The up-front screen defers to the reverse-translate tool's own
+`parse_hgvs_protein_change` (plus its stop-loss refusal) rather than re-deriving the
+rule — the tool is the single authority on what is translatable, so there is nothing
+to keep in sync. Callers map `reason` to their own disposition (in mavedb-api,
+`NOT_TRANSLATABLE` → a skip, `FAILED` → a translation error, `UPSTREAM_UNAVAILABLE` →
+an upstream API error) rather than pattern-matching the message.
+
+### Transient UTA failures are retried
+
+The reverse-translate subprocess opens its own UTA connection (from `UTA_DB_URL`),
+and remote UTA servers drop connections under load. The library recognises
+connection-failure messages and retries: a subprocess that exits on one re-runs the
+whole batch, and rows that come back empty with a connection error re-run on their
+own. Attempts and backoff come from `TranslationConfig.upstream_max_attempts`
+(default 3) and `upstream_retry_backoff_seconds` (default 2, doubling each attempt).
+Authentication and missing-database errors are not retried.
+
+`UtaClient` owns its connection in the same way. Construct it with
+`UtaClient.from_url(url)` and use it as a context manager: it connects on first use
+and reconnects with backoff when the server drops the connection.
+
+### TranslationResult.hgvs_p
+
+`TranslationResult.hgvs_p` is `None` for protein inputs — the caller already has
+the protein string. It is set only for c./g. inputs where the protein consequence
+was derived by forward translation during collapse.
+
+### WtCodonMode requires include_indels
+
+The WT codon candidate is expressed as an intra-codon delins
+(e.g. `NM_…:c.1_3delinsATG`), which is structurally an insertion/deletion.
+`UNAMBIGUOUS` and `ALL` therefore require `include_indels=True`;
+`TranslationConfig.__post_init__` enforces this. `UNAMBIGUOUS` adds only Met/Trp
+(single-codon amino acids) without any UTA call; `ALL` queries UTA for every
+synonymous variant via `codon_at`.
+
+---
+
 ## Troubleshooting
 
 **No candidates returned for a row**
