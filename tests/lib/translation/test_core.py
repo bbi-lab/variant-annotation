@@ -9,6 +9,7 @@ from variant_annotation.lib.translation._core import (
     _classify_kind,
     _parse_projection_pairs,
     _parse_protein_aa_change,
+    _project_coding_delins,
     _untranslatable_edit_reason,
     construct_equivalent_variants,
     construct_one,
@@ -668,3 +669,61 @@ def test_empty_row_with_non_transient_error_is_not_retried(monkeypatch):
     )
     assert calls == [1]
     assert errors[0].reason is TranslationErrorReason.FAILED
+
+
+# ---------------------------------------------------------------------------
+# _project_coding_delins — a coding delins projects to one genomic delins
+# ---------------------------------------------------------------------------
+
+
+class _DelinsCoordinates(_StubCoordinates):
+    def c_to_g(self, c):
+        assert c == "NM_003345.5:c.151_153delinsGCG"
+        return "NC_000016.10:g.1315654_1315656delinsGCG"
+
+
+def test_project_coding_delins_replaces_a_cis_phased_projection_with_a_single_delins():
+    pairs = [
+        ProjectionPair(
+            hgvs_c="NM_003345.5:c.151_153delinsGCG",
+            hgvs_g="NC_000016.10:g.[1315654A>G;1315656T>G]",
+            variant_type="delins",
+        )
+    ]
+
+    assert _project_coding_delins(pairs, _DelinsCoordinates()) == [
+        ProjectionPair(
+            hgvs_c="NM_003345.5:c.151_153delinsGCG",
+            hgvs_g="NC_000016.10:g.1315654_1315656delinsGCG",
+            variant_type="delins",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "pair",
+    [
+        ProjectionPair(hgvs_c="NM_003345.5:c.151A>G", hgvs_g="NC_000016.10:g.1315654A>G", variant_type="snv"),
+        ProjectionPair(
+            hgvs_c="NM_003345.5:c.151_153delinsGCG",
+            hgvs_g="NC_000016.10:g.1315654_1315656delinsGCG",
+            variant_type="delins",
+        ),
+        ProjectionPair(hgvs_c="NM_003345.5:c.151_153delinsGCG", hgvs_g=None, variant_type="delins"),
+    ],
+    ids=["snv", "already a delins", "projection failed"],
+)
+def test_project_coding_delins_leaves_other_pairs_untouched(pair):
+    assert _project_coding_delins([pair], _StubCoordinates()) == [pair]
+
+
+def test_project_coding_delins_failed_projection_is_none_not_the_cis_phased_form():
+    pair = ProjectionPair(
+        hgvs_c="NM_003345.5:c.151_153delinsGCG",
+        hgvs_g="NC_000016.10:g.[1315654A>G;1315656T>G]",
+        variant_type="delins",
+    )
+
+    assert _project_coding_delins([pair], _StubCoordinates()) == [
+        ProjectionPair(hgvs_c="NM_003345.5:c.151_153delinsGCG", hgvs_g=None, variant_type="delins")
+    ]

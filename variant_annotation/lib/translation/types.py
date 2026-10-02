@@ -76,7 +76,10 @@ class ProjectionPair:
             projection failed (e.g. an intronic candidate the mapper cannot
             resolve). ``None`` is a well-formed one-sided pair, NOT a
             list-desync — this is the case the old two-list shape silently
-            dropped, misaligning every candidate after it.
+            dropped, misaligning every candidate after it. A single coding
+            delins projects to a single genomic delins, never a cis-phased
+            ``g.[a;b]`` set, so it identifies as the same allele dcd-mapping
+            and the lab pipeline produce for that change.
         variant_type: The CLI's classification of the candidate ("snv",
             "insertion", "deletion", "delins"), or ``None`` if unreported.
 

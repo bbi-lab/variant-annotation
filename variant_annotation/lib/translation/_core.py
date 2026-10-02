@@ -498,6 +498,36 @@ def _apply_wt_codon(
     return pairs + [ProjectionPair(hgvs_c=wt_c, hgvs_g=wt_g or None, variant_type="delins")]
 
 
+_SINGLE_CODING_DELINS_RE = re.compile(r":c\.\d+_\d+delins[ACGT]+$")
+
+
+def _project_coding_delins(pairs: list[ProjectionPair], coordinates: CoordinateTranslator) -> list[ProjectionPair]:
+    """Project each single coding delins to genomic as a single delins, not a cis-phased set.
+
+    reverse-translate-variants writes a codon change with an unchanged middle base as one coding delins
+    (``c.151_153delinsGCG``) but splits its genomic projection into a cis-phased pair
+    (``g.[1315654A>G;1315656T>G]``). A cis-phased set and a delins are different VRS types with different
+    digests, so the projection never matches the same change mapped as a delins (dcd-mapping's form, and the
+    WT-codon pair's below), and a cis-phased genomic candidate cannot be registered with ClinGen. Projecting
+    the coding delins through ``coordinates.c_to_g`` keeps the pair's two members, and every pathway, in one
+    form. A failed projection is ``hgvs_g=None``, as in :func:`_apply_wt_codon`, never the cis-phased form.
+    """
+    projected: list[ProjectionPair] = []
+    for pair in pairs:
+        if not (pair.hgvs_g and ":g.[" in pair.hgvs_g and _SINGLE_CODING_DELINS_RE.search(pair.hgvs_c)):
+            projected.append(pair)
+            continue
+
+        try:
+            hgvs_g = coordinates.c_to_g(pair.hgvs_c)
+        except Exception:
+            logger.warning("Could not project coding delins %s to genomic", pair.hgvs_c, exc_info=True)
+            hgvs_g = None
+        projected.append(ProjectionPair(hgvs_c=pair.hgvs_c, hgvs_g=hgvs_g or None, variant_type=pair.variant_type))
+
+    return projected
+
+
 def _build_result(
     inp: VariantInput,
     consequence: ProteinConsequence,
@@ -509,7 +539,7 @@ def _build_result(
     coordinates: CoordinateTranslator,
 ) -> TranslationResult | TranslationError:
     pairs = _apply_wt_codon(
-        output_row.projection_pairs,
+        _project_coding_delins(output_row.projection_pairs, coordinates),
         consequence,
         config=config,
         transcripts=transcripts,
