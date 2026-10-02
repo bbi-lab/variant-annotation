@@ -12,11 +12,11 @@ The script is a **composition root**: it owns CSV streaming, the Redis cache, an
 
 | Column | Description |
 |---|---|
-| `vep.mutational_consequences` | `^`-delimited list of all consequence terms when the result came from a matched transcript entry; single term otherwise. Pipe-delimited across candidates. Empty for a candidate with no consequence or a failed request. |
-| `vep.most_severe_mutational_consequence` | Single most-severe consequence term per candidate. Pipe-delimited across candidates. Empty for a candidate with no consequence or a failed request. |
-| `vep.consequence_source` | `transcript`, `most_severe`, or `reference_identical` per candidate; empty when no consequence was determined. Pipe-delimited across candidates. |
-| `vep.access_date` | ISO access date per candidate, set whenever a lookup was attempted. Pipe-delimited and position-aligned to the input candidates (empty slot for empty candidates). |
-| `vep.error` | Per-candidate failure description when the candidate's request failed; empty otherwise, **including** when VEP answered with no consequence. Pipe-delimited across candidates. |
+| `vep.mutational_consequences` | `^`-delimited list of all consequence terms when the result came from a matched transcript entry; single term otherwise. Pipe-delimited across candidates. Empty for a candidate with no consequence, unless filled from a sibling (see [Multi-candidate rows](#multi-candidate-rows)). |
+| `vep.most_severe_mutational_consequence` | Single most-severe consequence term per candidate. Pipe-delimited across candidates. Empty for a candidate with no consequence, unless filled from a sibling. |
+| `vep.consequence_source` | `transcript`, `most_severe`, or `reference_identical` per candidate; empty when no consequence was determined. A sibling-filled candidate inherits its sibling's source. Pipe-delimited across candidates. |
+| `vep.access_date` | ISO access date per candidate, set whenever a lookup was attempted; for a file-cache hit, the date recorded in the file. Pipe-delimited and position-aligned to the input candidates (empty slot for empty candidates). |
+| `vep.error` | Per-candidate failure description when the candidate's request failed or VEP rejected the input; empty otherwise, **including** when VEP answered with no consequence. Kept even when a sibling fills the candidate's consequence. Pipe-delimited across candidates. |
 
 The namespace prefix defaults to `vep` and can be changed with `--vep-namespace`.
 
@@ -73,8 +73,9 @@ For each batch of input rows:
 1. **VEP POST** (`/vep/human/hgvs`) — inputs are partitioned by which transcript set they need; RefSeq inputs are sent with `refseq=1` in separate batches from Ensembl/genomic ones, because `refseq` is a per-request flag. Batches dispatch concurrently via a `ThreadPoolExecutor`.
 2. **Variant Recoder POST** (`/variant_recoder/human`) — inputs VEP neither answered nor errored on are recoded to genomic HGVS equivalents (`NC_…`). Inputs whose *request failed* are **not** recoded: the answer is unknown, so a fallback would be answering a question that was never asked.
 3. **Second VEP POST** — the recoded genomic HGVS are queried in a second concurrent pass. When several recoded equivalents exist, the most severe consequence across them is chosen and the source is necessarily `most_severe`.
-4. **Reference-identical check** — inputs still unresolved are tested for no-change form (see above).
+4. **Reference-identical check** — inputs still unresolved, and inputs VEP rejected, are tested for no-change form (see above).
 5. **Failures** — when a request fails after retries, only that batch's inputs are affected; every other batch's results stand. Failed inputs are reported with a populated `vep.error` and are **not cached**, so they retry on the next run.
+6. **VEP rejections** — VEP sometimes answers HTTP 200 with a per-variant `"error"` in place of a consequence, e.g. `Start (28695710) must be less than or equal to end+1 (28695243)` for certain insertions. These inputs are not recoded, are reported in `vep.error` as `VEP rejected the input: …`, and are **not cached**, so a later Ensembl release gets a chance to answer them.
 
 Retries cover timeouts, connection resets, 5xx, and 429 (honouring `Retry-After`). A 4xx other than 429 is **not** retried — VEP returning 400 for a protein HGVS it cannot parse is a settled answer about the input, and retrying burns quota for the same rejection.
 
@@ -84,11 +85,41 @@ Retries cover timeouts, connection resets, 5xx, and 429 (honouring `Retry-After`
 
 For rows with pipe-delimited HGVS candidates (from step 2 reverse translation), each candidate is resolved independently. All output columns are pipe-delimited with one value per candidate position, in input order. A blank candidate yields a blank in every column rather than shifting the alignment.
 
+### Consequence fill-in from siblings
+
+Candidates in one row are alternative spellings of the same variant. When some of them have no consequence (a failed request, a VEP rejection, or a silent VEP miss), the script fills them from the rest of the row:
+
+1. Every non-blank candidate with an empty `vep.most_severe_mutational_consequence` is unfilled.
+2. The most common `(vep.mutational_consequences, vep.most_severe_mutational_consequence)` pair among the resolved candidates is chosen. Ties break alphabetically on the pair.
+3. Unfilled candidates take that pair, plus the `vep.access_date` and `vep.consequence_source` of the first resolved candidate carrying it.
+4. The original `vep.error` value is kept, so a filled consequence stays distinguishable from a resolved one.
+
+When no candidate in the row resolved, nothing is filled.
+
+---
+
+## File-based consequence cache
+
+`--vep-file-cache FILE` loads a TSV of pre-computed consequences at startup. File entries take precedence over Redis and the VEP API, so a file hit is never re-queried. Use it for offline runs, reproducibility, or seeding a run from earlier output.
+
+Tab-separated with a header row, one HGVS per row. Column names use the run's `--vep-namespace` prefix (default `vep`):
+
+| Column | Description |
+|---|---|
+| `hgvs` | Input HGVS string (the cache key) |
+| `{prefix}.most_severe_mutational_consequence` | Most-severe term; blank for no consequence |
+| `{prefix}.mutational_consequences` | `^`-delimited terms; may be blank |
+| `{prefix}.consequence_source` | `transcript`, `most_severe`, or `reference_identical` (the legacy `no_change` is read as `reference_identical`) |
+| `{prefix}.access_date` | ISO date of the original lookup; written to the output in place of today's date |
+| `{prefix}.error` | Failure description; a row with an error and no consequence is reproduced as a failure |
+
+A row with neither a consequence nor an error is a confirmed miss.
+
 ---
 
 ## Redis caching
 
-Resolved and confirmed-absent answers are cached per `(resolver version, Ensembl release, transcript, HGVS)`. Absent answers are stored under a sentinel so repeated no-hit queries don't re-query the API. **Failed requests are never cached** — caching an outage would turn a transient failure into a persistent wrong result.
+Resolved and confirmed-absent answers are cached per `(resolver version, Ensembl release, transcript, HGVS)`. Absent answers are stored under a sentinel so repeated no-hit queries don't re-query the API. **Failed requests and VEP rejections are never cached**: caching an outage would turn a transient failure into a persistent wrong result.
 
 The cache key carries both versioning axes, so a stored answer is reused only when it was computed under the same rules *and* the same upstream data: the library's `RESOLVER_VERSION` (a change to the resolution rule or severity ranking) and the Ensembl release (`/info/software`, fetched once per run). Either bump invalidates the affected answers automatically, rather than relying on an operator to remember to bump the prefix. The transcript is in the key because the same HGVS resolved against two transcripts is two different questions. If the release cannot be determined, the key uses `eunknown` and those entries simply never collide with release-keyed ones.
 
@@ -116,6 +147,7 @@ Entries written before `vep:v3` used a different value shape and are simply neve
 | `--row-batch-size N` | `VEP_ROW_BATCH_SIZE` | `1000` | Input rows per lookup/write batch |
 | `--vep-timeout-seconds N` | `VEP_TIMEOUT_SECONDS` | `60` | HTTP timeout per VEP request (Recoder gets its own longer budget) |
 | `--no-recoder` | — | off | Skip the Variant Recoder fallback; report unresolvable inputs as having no consequence rather than accepting a cross-transcript answer |
+| `--vep-file-cache FILE` | — | — | TSV of pre-computed consequences; entries take precedence over Redis and the VEP API (see [File-based consequence cache](#file-based-consequence-cache)) |
 | `--keep-existing` | — | off | Skip rows already annotated (non-empty `vep.most_severe_mutational_consequence`); only annotate blank rows |
 | `--skip N` | — | `0` | Skip first N data rows |
 | `--limit N` | — | no limit | Stop after N rows |
@@ -161,6 +193,13 @@ src/scripts/run_annotate_vep.sh input.tsv output.tsv \
 - Ensembl REST API may be under maintenance or rate-limiting. Check `https://rest.ensembl.org` directly.
 - Reduce `--vep-workers` or increase `--vep-timeout-seconds`.
 - Failed requests are never cached, so they always retry. Use `--keep-existing` to skip already-annotated rows and only retry the blanks.
+
+**`vep_error` entries (VEP-internal errors)**
+
+- These are per-variant errors returned inside an otherwise successful HTTP response (HTTP 200), so they are distinct from `api_error` network failures.
+- Seen in practice for certain insertions where VEP reports a malformed coordinate range (e.g. `vep_error:Start (28695710) must be less than or equal to end+1 (28695243)`).
+- `vep_error` entries are never cached; they will be retried on each run in case a future VEP release resolves the issue.
+- For rows with multiple HGVS candidates, the script automatically fills the missing consequence from valid siblings (see *VEP-internal error fill-in for multi-candidate rows* above). `vep.error` still records the original error even when fill-in succeeds.
 
 **Consequence is `most_severe` for all rows despite transcript HGVS input**
 

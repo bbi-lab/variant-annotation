@@ -26,7 +26,8 @@ values across each ``mapped_hgvs_c`` candidate:
 
     clingen_evidence_repository.ClinVar Variation Id
     clingen_evidence_repository.Allele Registry Id
-    clingen_evidence_repository.Disease Mondo Id
+    clingen_evidence_repository.Disease
+    clingen_evidence_repository.Mondo Id
     clingen_evidence_repository.Mode of Inheritance
     clingen_evidence_repository.Assertion
     clingen_evidence_repository.Applied Evidence Codes (Met)
@@ -83,7 +84,8 @@ EREPO_COL_ALLELE_REGISTRY_ID = "Allele Registry Id"
 EREPO_OUTPUT_COLS = [
     "ClinVar Variation Id",
     "Allele Registry Id",
-    "Disease Mondo Id",
+    "Disease",
+    "Mondo Id",
     "Mode of Inheritance",
     "Assertion",
     "Applied Evidence Codes (Met)",
@@ -164,6 +166,11 @@ def _strip_gene_symbol(hgvs: str) -> str:
 def _hgvs_candidates(raw: str) -> list[str]:
     """Return all HGVS candidates from a comma-separated expression field."""
     return [h.strip() for h in raw.split(",") if h.strip()]
+
+
+def _sanitize_for_pipe_delimited(value: str) -> str:
+    """Escape pipe characters in field values for pipe-delimited output."""
+    return (value or "").replace("|", ";")
 
 
 ErepoRecord = dict[str, str]
@@ -326,7 +333,7 @@ def _join_records(records: list[ErepoRecord]) -> ErepoRecord:
             if v not in seen:
                 seen.add(v)
                 deduped.append(v)
-        merged[col] = " | ".join(deduped)
+        merged[col] = " | ".join(_sanitize_for_pipe_delimited(v) for v in deduped)
     return merged
 
 
@@ -365,8 +372,12 @@ def annotate_row(
 
     out: dict[str, str] = {}
     for col in EREPO_OUTPUT_COLS:
-        out[f"{OUTPUT_COL_PREFIX}.{col}"] = "|".join(r.get(col, "") for r in per_candidate_records)
-    out[OUTPUT_WARNINGS_COL] = "|".join(per_candidate_warnings)
+        out[f"{OUTPUT_COL_PREFIX}.{col}"] = "|".join(
+            _sanitize_for_pipe_delimited(r.get(col, "")) for r in per_candidate_records
+        )
+    out[OUTPUT_WARNINGS_COL] = "|".join(
+        _sanitize_for_pipe_delimited(w) for w in per_candidate_warnings
+    )
     return out
 
 

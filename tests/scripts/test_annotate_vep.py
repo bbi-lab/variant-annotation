@@ -121,15 +121,88 @@ def test_annotate_row_pipe_aligns_discordant_candidates():
 
 
 @pytest.mark.unit
-def test_annotate_row_preserves_empty_slot_for_unresolved_candidate():
+def test_annotate_row_preserves_empty_slots_when_no_candidate_resolved():
     """Alignment is positional, so a candidate with no answer must still occupy its slot."""
+    row = {"mapped_hgvs_g": "NC_000001.11:g.1A>T|NC_000001.11:g.2C>G"}
+    out = annotate(row, [absent("NC_000001.11:g.1A>T"), absent("NC_000001.11:g.2C>G")], hgvs_cols=["mapped_hgvs_g"])
+    assert out["vep.most_severe_mutational_consequence"] == "|"
+    assert out["vep.error"] == "|"
+
+
+# --- sibling fill-in ---
+
+
+@pytest.mark.unit
+def test_an_absent_candidate_is_filled_from_its_resolved_sibling():
     row = {"mapped_hgvs_g": "NC_000001.11:g.1A>T|NC_000001.11:g.2C>G"}
     out = annotate(
         row,
-        [resolved("NC_000001.11:g.1A>T", "missense_variant"), absent("NC_000001.11:g.2C>G")],
+        [resolved("NC_000001.11:g.1A>T", "synonymous_variant"), absent("NC_000001.11:g.2C>G")],
         hgvs_cols=["mapped_hgvs_g"],
     )
-    assert out["vep.most_severe_mutational_consequence"] == "missense_variant|"
+    assert out["vep.most_severe_mutational_consequence"] == "synonymous_variant|synonymous_variant"
+    assert out["vep.error"] == "|"
+
+
+@pytest.mark.unit
+def test_an_errored_candidate_is_filled_but_keeps_its_error():
+    row = {"mapped_hgvs_c": "NM_007194.4:c.1259_1260insAAG|NM_007194.4:c.1259_1260insAAT"}
+    out = annotate(
+        row,
+        [
+            errored("NM_007194.4:c.1259_1260insAAG", "VEP rejected the input: Start must be <= end+1"),
+            resolved(
+                "NM_007194.4:c.1259_1260insAAT",
+                "inframe_insertion",
+                source=ConsequenceSource.TRANSCRIPT,
+                transcript="NM_007194.4",
+            ),
+        ],
+        hgvs_cols=["mapped_hgvs_c"],
+    )
+    most_severe = out["vep.most_severe_mutational_consequence"].split("|")
+    source = out["vep.consequence_source"].split("|")
+    error = out["vep.error"].split("|")
+
+    assert most_severe == ["inframe_insertion", "inframe_insertion"]
+    assert source == ["transcript", "transcript"]
+    assert error[0].startswith("VEP rejected the input")
+    assert error[1] == ""
+
+
+@pytest.mark.unit
+def test_sibling_fill_uses_the_most_common_answer():
+    row = {"mapped_hgvs_g": "A|B|C|D"}
+    out = annotate(
+        row,
+        [
+            errored("A"),
+            resolved("B", "synonymous_variant"),
+            resolved("C", "inframe_insertion"),
+            resolved("D", "inframe_insertion"),
+        ],
+        hgvs_cols=["mapped_hgvs_g"],
+    )
+    assert out["vep.most_severe_mutational_consequence"].split("|")[0] == "inframe_insertion"
+
+
+@pytest.mark.unit
+def test_sibling_fill_breaks_ties_alphabetically():
+    row = {"mapped_hgvs_g": "A|B|C"}
+    out = annotate(
+        row,
+        [errored("A"), resolved("B", "synonymous_variant"), resolved("C", "missense_variant")],
+        hgvs_cols=["mapped_hgvs_g"],
+    )
+    assert out["vep.most_severe_mutational_consequence"] == "missense_variant|synonymous_variant|missense_variant"
+
+
+@pytest.mark.unit
+def test_sibling_fill_skips_blank_candidate_slots():
+    row = {"mapped_hgvs_g": "A||C"}
+    out = annotate(row, [resolved("A", "missense_variant"), absent("C")], hgvs_cols=["mapped_hgvs_g"])
+    assert out["vep.most_severe_mutational_consequence"] == "missense_variant||missense_variant"
+    assert out["vep.access_date"] == "2026-04-30||2026-04-30"
 
 
 @pytest.mark.unit
@@ -301,6 +374,101 @@ def test_cache_key_distinguishes_ensembl_releases():
     release must not be served under another — the key carries the release, not just the resolver rule."""
     vep_input = VepInput("NM_000049.4:c.256A>G")
     assert mod._vep_cache_key(vep_input, "116") != mod._vep_cache_key(vep_input, "117")
+
+
+# --- file cache ---
+
+
+def write_file_cache(path, rows):
+    fieldnames = [
+        "hgvs",
+        "vep.mutational_consequences",
+        "vep.most_severe_mutational_consequence",
+        "vep.consequence_source",
+        "vep.access_date",
+        "vep.error",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t", lineterminator="\n", restval="")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+@pytest.mark.unit
+def test_file_cache_loads_each_outcome(tmp_path):
+    path = tmp_path / "cache.tsv"
+    write_file_cache(
+        path,
+        [
+            {
+                "hgvs": "NM_000049.4:c.256A>G",
+                "vep.mutational_consequences": "splice_region_variant^synonymous_variant",
+                "vep.most_severe_mutational_consequence": "splice_region_variant",
+                "vep.consequence_source": "transcript",
+                "vep.access_date": "2026-01-02",
+            },
+            {"hgvs": "NC_000001.11:g.1A>T"},
+            {"hgvs": "NC_000001.11:g.2C>G", "vep.error": "VEP request failed: boom"},
+            {
+                "hgvs": "NM_000049.4:c.12_14delinsGCT",
+                "vep.most_severe_mutational_consequence": NO_CHANGE_TERM,
+                "vep.consequence_source": "no_change",
+            },
+            {"hgvs": ""},
+        ],
+    )
+
+    resolutions, access_dates = mod._load_vep_file_cache(str(path), "vep")
+
+    hit = resolutions["NM_000049.4:c.256A>G"]
+    assert hit.outcome is ConsequenceOutcome.RESOLVED
+    assert hit.consequence_terms == ["splice_region_variant", "synonymous_variant"]
+    assert hit.source is ConsequenceSource.TRANSCRIPT
+    assert resolutions["NC_000001.11:g.1A>T"].outcome is ConsequenceOutcome.ABSENT
+    assert resolutions["NC_000001.11:g.2C>G"].outcome is ConsequenceOutcome.ERRORED
+    assert resolutions["NM_000049.4:c.12_14delinsGCT"].source is ConsequenceSource.REFERENCE_IDENTICAL
+    assert len(resolutions) == 4
+    assert access_dates == {"NM_000049.4:c.256A>G": "2026-01-02"}
+
+
+@pytest.mark.integration
+def test_main_serves_file_cache_entries_without_resolving_them(tmp_path, monkeypatch):
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+    cache_path = tmp_path / "cache.tsv"
+    in_path.write_text(
+        "variant_urn\tmapped_hgvs_g\nv1\tNC_000001.11:g.1A>T\nv2\tNC_000001.11:g.2C>G\n", encoding="utf-8"
+    )
+    write_file_cache(
+        cache_path,
+        [
+            {
+                "hgvs": "NC_000001.11:g.1A>T",
+                "vep.most_severe_mutational_consequence": "intron_variant",
+                "vep.consequence_source": "most_severe",
+                "vep.access_date": "2026-01-02",
+            }
+        ],
+    )
+
+    looked_up: list[str] = []
+    monkeypatch.setenv("VEP_CACHE_ENABLED", "0")
+    monkeypatch.setattr(
+        mod,
+        "resolve_consequences",
+        fake_resolver({"NC_000001.11:g.2C>G": "missense_variant"}, record=looked_up),
+    )
+
+    mod.main([str(in_path), str(out_path), "--vep-file-cache", str(cache_path)])
+
+    with out_path.open("r", encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh, delimiter="\t"))
+
+    assert looked_up == ["NC_000001.11:g.2C>G"]
+    assert rows[0]["vep.most_severe_mutational_consequence"] == "intron_variant"
+    assert rows[0]["vep.access_date"] == "2026-01-02"
+    assert rows[1]["vep.most_severe_mutational_consequence"] == "missense_variant"
+    assert rows[1]["vep.access_date"] == date.today().isoformat()
 
 
 # --- CLI end to end ---

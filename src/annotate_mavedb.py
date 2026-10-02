@@ -13,6 +13,17 @@ For each variant row, the script:
    - **Investigator-provided calibration** – the calibration whose
      ``investigatorProvided`` flag is ``True``.
 
+   If ``--requested-calibrations-file`` is given, a third calibration of
+   interest is added:
+
+   - **Requested calibration** – the calibration whose URN is given for this
+     score set in the requested-calibrations file (see below), looked up by
+     URN within the same calibration list already fetched for the primary
+     and investigator-provided calibrations. This guarantees it actually
+     belongs to the row's score set; a URN not found in that list (e.g. a
+     stale or mistyped entry in the requested-calibrations file) is logged
+     as a warning and left blank rather than misapplied.
+
 4. Classifies the variant against each applicable calibration:
 
    - *Range-based*: finds the functional classification whose numeric range
@@ -22,7 +33,8 @@ For each variant row, the script:
      calibration (``GET /api/v1/score-calibrations/{urn}/variants``) and
      looks up the current variant by URN.
 
-5. Writes six annotation columns per row.
+5. Writes eight annotation columns per row (thirteen when
+   ``--requested-calibrations-file`` is given).
 
 Output columns
 --------------
@@ -33,9 +45,15 @@ Output columns
   ``mavedb.primary_calibration.name``
       Title of the primary calibration (empty if none).
 
-  ``mavedb.primary_calibration.functional_class``
+  ``mavedb.primary_calibration.functional_class_label``
       Label of the functional classification that matches the variant's score
       under the primary calibration (empty when unclassified or no calibration).
+
+  ``mavedb.primary_calibration.functional_classification``
+      The ``functionalClassification`` value (e.g. ``normal``, ``abnormal``,
+      ``not_specified``) reported by the MaveDB API for the matching
+      classification under the primary calibration (empty when unclassified
+      or no calibration).
 
   ``mavedb.investigator_provided_calibration.urn``
       URN of the investigator-provided calibration (empty if none).
@@ -43,13 +61,62 @@ Output columns
   ``mavedb.investigator_provided_calibration.name``
       Title of the investigator-provided calibration (empty if none).
 
-  ``mavedb.investigator_provided_calibration.functional_class``
+  ``mavedb.investigator_provided_calibration.functional_class_label``
       Label of the matching classification under the investigator-provided
       calibration (empty when unclassified or no calibration).
+
+  ``mavedb.investigator_provided_calibration.functional_classification``
+      The ``functionalClassification`` value reported by the MaveDB API for
+      the matching classification under the investigator-provided calibration
+      (empty when unclassified or no calibration).
+
+When ``--requested-calibrations-file`` is given, five more columns are
+written (empty for score sets absent from the file, or with a blank
+``requested_calibration_urn``):
+
+  ``mavedb.requested_calibration.urn``
+      URN of the requested calibration, as given in the requested-calibrations
+      file for this score set (empty if none).
+
+  ``mavedb.requested_calibration.name``
+      Title of the requested calibration (empty if none).
+
+  ``mavedb.requested_calibration.url``
+      URL to the score set page on MaveDB (empty if none).
+
+  ``mavedb.requested_calibration.functional_class_label``
+      Label of the matching classification under the requested calibration
+      (empty when unclassified, no calibration, or the requested calibration
+      URN is not among this score set's calibrations).
+
+  ``mavedb.requested_calibration.functional_classification``
+      The ``functionalClassification`` value reported by the MaveDB API for
+      the matching classification under the requested calibration (empty
+      when unclassified, no calibration, or the requested calibration URN is
+      not among this score set's calibrations).
 
 When no calibration is explicitly marked ``primary``, the script falls back
 first to the investigator-provided calibration, then to the first
 non-research-use-only calibration available for the score set.
+
+Requested-calibrations file
+----------------------------
+
+A CSV/TSV file (e.g. ``data/cvfg/score_sets.tsv`` with a
+``requested_calibration_urn`` column added) with two columns:
+
+  ``score_set_urn``
+      MaveDB score set URN.
+
+  ``requested_calibration_urn``
+      URN of the specific calibration to fetch and classify against for that
+      score set. Rows with an empty value are treated as "no requested
+      calibration" for that score set.
+
+Passed via ``--requested-calibrations-file PATH``. The requested calibration
+need not be the primary or investigator-provided calibration — it can be any
+calibration returned for the score set, matched by URN. If the option is
+omitted, no requested-calibration columns are produced at all.
 
 The ``*.url`` columns point to the score set page on the MaveDB website
 (``https://mavedb.org/score-sets/{score_set_urn}``), where calibrations are
@@ -79,6 +146,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
@@ -93,11 +162,22 @@ OUTPUT_COLS = [
     "mavedb.primary_calibration.urn",
     "mavedb.primary_calibration.name",
     "mavedb.primary_calibration.url",
-    "mavedb.primary_calibration.functional_class",
+    "mavedb.primary_calibration.functional_class_label",
+    "mavedb.primary_calibration.functional_classification",
     "mavedb.investigator_provided_calibration.urn",
     "mavedb.investigator_provided_calibration.name",
     "mavedb.investigator_provided_calibration.url",
-    "mavedb.investigator_provided_calibration.functional_class",
+    "mavedb.investigator_provided_calibration.functional_class_label",
+    "mavedb.investigator_provided_calibration.functional_classification",
+]
+
+# Only included in the output when --requested-calibrations-file is given.
+REQUESTED_CALIBRATION_COLS = [
+    "mavedb.requested_calibration.urn",
+    "mavedb.requested_calibration.name",
+    "mavedb.requested_calibration.url",
+    "mavedb.requested_calibration.functional_class_label",
+    "mavedb.requested_calibration.functional_classification",
 ]
 
 
@@ -118,9 +198,58 @@ def score_set_urn_from_variant_urn(variant_urn: str) -> Optional[str]:
     return variant_urn[:idx]
 
 
+def load_requested_calibration_map(path: Path) -> dict[str, str]:
+    """Load a ``{score_set_urn: requested_calibration_urn}`` mapping from a
+    CSV/TSV file with ``score_set_urn`` and ``requested_calibration_urn``
+    columns (e.g. ``data/cvfg/score_sets.tsv`` with a
+    ``requested_calibration_urn`` column added).
+
+    Rows with a blank ``score_set_urn`` or ``requested_calibration_urn`` are
+    skipped (no requested calibration for that score set). The input
+    delimiter is auto-detected from the file extension (``.tsv``/``.txt`` →
+    tab; otherwise comma).
+    """
+    delim = "\t" if path.suffix.lower() in (".tsv", ".txt") else ","
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter=delim)
+        if reader.fieldnames is None:
+            raise ValueError(f"Requested-calibrations file is empty: {path}")
+        missing = [
+            c for c in ("score_set_urn", "requested_calibration_urn") if c not in reader.fieldnames
+        ]
+        if missing:
+            raise ValueError(
+                f"Requested-calibrations file {path} is missing column(s): {', '.join(missing)}"
+            )
+
+        mapping: dict[str, str] = {}
+        for row in reader:
+            ss_urn = (row.get("score_set_urn") or "").strip()
+            req_urn = (row.get("requested_calibration_urn") or "").strip()
+            if ss_urn and req_urn:
+                mapping[ss_urn] = req_urn
+    return mapping
+
+
 # ---------------------------------------------------------------------------
 # MaveDB API fetchers
 # ---------------------------------------------------------------------------
+
+
+def build_session(retries=8, backoff_factor=2.0):
+    """Build a `requests.Session` that retries the transient 5xx errors this API returns often."""
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=("GET",),
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.headers.update({"User-Agent": "variant-annotation/annotate_mavedb"})
+    return session
 
 
 def fetch_calibrations(
@@ -176,9 +305,14 @@ def fetch_calibration_variant_class_ids(
 def classify_score_range(
     score: float,
     functional_classifications: list[dict[str, Any]],
-) -> str:
-    """Return the label of the first range-based functional classification that
-    contains *score*, or an empty string if no range matches.
+) -> tuple[str, str]:
+    """Return ``(label, functional_classification)`` of the first range-based
+    functional classification that contains *score*, or ``("", "")`` if no
+    range matches.
+
+    ``functional_classification`` is the ``functionalClassification`` value
+    reported by the MaveDB API (e.g. ``normal``, ``abnormal``,
+    ``not_specified``), distinct from the free-text ``label``.
 
     Bounds are evaluated using the per-entry ``inclusiveLowerBound`` and
     ``inclusiveUpperBound`` flags (defaulting to ``True`` and ``False``
@@ -199,8 +333,8 @@ def classify_score_range(
         upper_ok = (score <= hi) if inc_upper else (score < hi)
 
         if lower_ok and upper_ok:
-            return fc.get("label", "")
-    return ""
+            return fc.get("label", ""), fc.get("functionalClassification", "")
+    return "", ""
 
 
 def classify_variant(
@@ -210,9 +344,13 @@ def classify_variant(
     api_url: str,
     session: requests.Session,
     class_id_cache: dict[str, dict[str, int]],
-) -> tuple[str, str, str]:
-    """Return ``(calibration_urn, calibration_name, functional_class_label)``
-    for *variant_urn* under *calibration*.
+) -> tuple[str, str, str, str]:
+    """Return ``(calibration_urn, calibration_name, functional_class_label,
+    functional_classification)`` for *variant_urn* under *calibration*.
+
+    ``functional_classification`` is the ``functionalClassification`` value
+    reported by the MaveDB API (e.g. ``normal``, ``abnormal``,
+    ``not_specified``), distinct from the free-text ``functional_class_label``.
 
     For range-based calibrations the classification is computed locally using
     *score_str*.  For class-based calibrations the variant-to-class mapping is
@@ -223,22 +361,22 @@ def classify_variant(
     fcs: list[dict[str, Any]] = calibration.get("functionalClassifications") or []
 
     if not fcs:
-        return cal_urn, cal_name, ""
+        return cal_urn, cal_name, "", ""
 
     first_fc = fcs[0]
     if first_fc.get("range") is not None:
         # Range-based calibration – classify locally.
         if not score_str:
-            return cal_urn, cal_name, ""
+            return cal_urn, cal_name, "", ""
         try:
             score = float(score_str)
         except ValueError:
             logger.warning(
                 "Non-numeric score %r for variant %s; cannot classify.", score_str, variant_urn
             )
-            return cal_urn, cal_name, ""
-        label = classify_score_range(score, fcs)
-        return cal_urn, cal_name, label
+            return cal_urn, cal_name, "", ""
+        label, classification = classify_score_range(score, fcs)
+        return cal_urn, cal_name, label, classification
     else:
         # Class-based calibration – look up variant assignment from API.
         if cal_urn not in class_id_cache:
@@ -254,11 +392,11 @@ def classify_variant(
 
         fc_id = class_id_cache[cal_urn].get(variant_urn)
         if fc_id is None:
-            return cal_urn, cal_name, ""
+            return cal_urn, cal_name, "", ""
         for fc in fcs:
             if fc.get("id") == fc_id:
-                return cal_urn, cal_name, fc.get("label", "")
-        return cal_urn, cal_name, ""
+                return cal_urn, cal_name, fc.get("label", ""), fc.get("functionalClassification", "")
+        return cal_urn, cal_name, "", ""
 
 
 # ---------------------------------------------------------------------------
@@ -275,15 +413,29 @@ def annotate_row(
     session: requests.Session,
     calibration_cache: dict[str, list[dict[str, Any]]],
     class_id_cache: dict[str, dict[str, int]],
+    requested_calibration_urn_by_score_set: Optional[dict[str, str]] = None,
 ) -> dict[str, str]:
-    """Return the six MaveDB annotation columns for one input *row*.
+    """Return the MaveDB annotation columns for one input *row*.
+
+    Eight columns are always returned (primary + investigator-provided
+    calibrations). When *requested_calibration_urn_by_score_set* is not
+    ``None``, five more ``mavedb.requested_calibration.*`` columns are
+    included, populated by looking up the calibration URN given for this
+    row's score set (if any) within the same calibration list already
+    fetched for the primary/investigator-provided calibrations. A requested
+    URN not found in that list (e.g. a stale or mistyped entry in the
+    requested-calibrations file) is logged as a warning and left blank.
 
     All output values default to empty strings.  Caches calibration lists in
     *calibration_cache* (keyed by score set URN) and class-based variant
     assignments in *class_id_cache* (keyed by calibration URN) so each
     distinct score set or calibration is fetched at most once.
     """
+    include_requested = requested_calibration_urn_by_score_set is not None
+
     out: dict[str, str] = {col: "" for col in OUTPUT_COLS}
+    if include_requested:
+        out.update({col: "" for col in REQUESTED_CALIBRATION_COLS})
 
     variant_urn = row.get(variant_urn_col, "").strip()
     score_str = row.get(score_col, "").strip()
@@ -317,22 +469,44 @@ def annotate_row(
     cal_url = f"{MAVEDB_FRONTEND_URL}/score-sets/{ss_urn}"
 
     if primary_cal is not None:
-        urn, name, fc_label = classify_variant(
+        urn, name, fc_label, fc_classification = classify_variant(
             variant_urn, score_str, primary_cal, api_url, session, class_id_cache
         )
         out["mavedb.primary_calibration.urn"] = urn
         out["mavedb.primary_calibration.name"] = name
         out["mavedb.primary_calibration.url"] = cal_url
-        out["mavedb.primary_calibration.functional_class"] = fc_label
+        out["mavedb.primary_calibration.functional_class_label"] = fc_label
+        out["mavedb.primary_calibration.functional_classification"] = fc_classification
 
     if inv_cal is not None:
-        urn, name, fc_label = classify_variant(
+        urn, name, fc_label, fc_classification = classify_variant(
             variant_urn, score_str, inv_cal, api_url, session, class_id_cache
         )
         out["mavedb.investigator_provided_calibration.urn"] = urn
         out["mavedb.investigator_provided_calibration.name"] = name
         out["mavedb.investigator_provided_calibration.url"] = cal_url
-        out["mavedb.investigator_provided_calibration.functional_class"] = fc_label
+        out["mavedb.investigator_provided_calibration.functional_class_label"] = fc_label
+        out["mavedb.investigator_provided_calibration.functional_classification"] = fc_classification
+
+    if include_requested:
+        req_cal_urn = requested_calibration_urn_by_score_set.get(ss_urn)
+        if req_cal_urn:
+            req_cal = next((c for c in calibrations if c.get("urn") == req_cal_urn), None)
+            if req_cal is None:
+                logger.warning(
+                    "Requested calibration %s not found among calibrations for score set %s.",
+                    req_cal_urn,
+                    ss_urn,
+                )
+            else:
+                urn, name, fc_label, fc_classification = classify_variant(
+                    variant_urn, score_str, req_cal, api_url, session, class_id_cache
+                )
+                out["mavedb.requested_calibration.urn"] = urn
+                out["mavedb.requested_calibration.name"] = name
+                out["mavedb.requested_calibration.url"] = cal_url
+                out["mavedb.requested_calibration.functional_class_label"] = fc_label
+                out["mavedb.requested_calibration.functional_classification"] = fc_classification
 
     return out
 
@@ -368,6 +542,20 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default="score",
         metavar="COLUMN",
         help="Input column containing the numeric variant score (default: score)",
+    )
+    p.add_argument(
+        "--requested-calibrations-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "CSV/TSV file with score_set_urn and requested_calibration_urn columns "
+            "(e.g. data/cvfg/score_sets.tsv with a requested_calibration_urn column "
+            "added). For score sets present with a non-empty requested_calibration_urn, "
+            "that calibration is looked up by URN among the score set's calibrations and "
+            "classified as the mavedb.requested_calibration.* columns, in addition to the "
+            "primary and investigator-provided calibrations. If omitted, no "
+            "requested-calibration columns are produced."
+        ),
     )
     p.add_argument(
         "--skip",
@@ -411,9 +599,26 @@ def main(argv: Optional[list[str]] = None) -> None:
     out_delim = "\t" if output_path.suffix.lower() in (".tsv", ".txt") else ","
 
     api_url = args.mavedb_api_url.rstrip("/")
-    session = requests.Session()
+    session = build_session()
     calibration_cache: dict[str, list[dict[str, Any]]] = {}
     class_id_cache: dict[str, dict[str, int]] = {}
+
+    requested_calibration_urn_by_score_set: Optional[dict[str, str]] = None
+    if args.requested_calibrations_file:
+        req_path = Path(args.requested_calibrations_file)
+        if not req_path.exists():
+            logger.error("Requested-calibrations file not found: %s", req_path)
+            raise SystemExit(1)
+        requested_calibration_urn_by_score_set = load_requested_calibration_map(req_path)
+        logger.info(
+            "Loaded %d requested calibration mapping(s) from %s",
+            len(requested_calibration_urn_by_score_set),
+            req_path,
+        )
+
+    output_cols = list(OUTPUT_COLS)
+    if requested_calibration_urn_by_score_set is not None:
+        output_cols += REQUESTED_CALIBRATION_COLS
 
     rows_written = 0
     rows_skipped = 0
@@ -424,7 +629,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             logger.error("Input file appears to be empty.")
             raise SystemExit(1)
 
-        output_fieldnames = list(reader.fieldnames) + OUTPUT_COLS
+        output_fieldnames = list(reader.fieldnames) + output_cols
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(output_path, "w", newline="", encoding="utf-8") as outf:
@@ -446,6 +651,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                     session=session,
                     calibration_cache=calibration_cache,
                     class_id_cache=class_id_cache,
+                    requested_calibration_urn_by_score_set=requested_calibration_urn_by_score_set,
                 )
                 row.update(annotations)
                 writer.writerow(row)

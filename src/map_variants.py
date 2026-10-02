@@ -25,6 +25,13 @@ Variant rows fall into three categories, detected automatically:
    genomic HGVS on GRCh38, then queries the ClinGen Allele Registry to populate
    ``mapped_hgvs_g``, ``mapped_hgvs_c``, and ``mapped_hgvs_p``.
 
+   This category also covers fully qualified **genomic** HGVS (e.g.
+   ``NC_000023.11:g.41334227_41334230delinsC``), which is already assay-level and
+   is queried directly. Because the row's own accession is genomic (not a
+   transcript), it cannot be used to select the ClinGen transcript allele;
+   ``--preferred-transcript``/``--preferred-transcript-col`` is used instead if
+   given, falling back to ClinGen's MANE transcript otherwise.
+
 2. **Sequence-based nucleotide** – ``raw_hgvs_nt`` is present but lacks a transcript
    prefix (e.g. ``c.1218G>A``). The ``target_sequence`` column is required. Rows that
    share the same ``--group-by`` column value are aligned together to GRCh38 via
@@ -266,6 +273,14 @@ _CASE1_RAW_HGVS_NT_RE = re.compile(
 # Matches bare c.-haplotype expressions for case-2 rows, for example
 # ``c.[1A>G;3G>T]``.
 _CASE2_C_HAPLOTYPE_RE = re.compile(r"^c\.\[(?P<body>[^\]]+)\]$")
+
+# Matches the non-standard identity expression dcd_mapping (and, on occasion,
+# ClinGen's own Allele Registry response) emits for no-change alleles, e.g.
+# "NC_000007.14:g.144548593CCT=" (genomic) or "NM_022445.4:c.612C=" (transcript).
+# Groups: (1) prefix through "g."/"c."/"n.", (2) start position, (3) reference bases.
+_VRS_IDENTITY_RE = re.compile(
+    r"^((?:NC_|NG_|NT_|NW_|NM_|NR_|XM_|XR_)[^:]+:[gcn]\.)(\d+)([ACGTacgt]+)=$"
+)
 _CASE2_C_SUB_RE = re.compile(r"^(?P<coord>\d+)(?P<ref>[ACGTN])>(?P<alt>[ACGTN])$")
 _MAPPED_C_SUB_RE = re.compile(
     r"^(?:(?P<accession>[^:]+):)?c\.(?P<coord>\d+)(?P<ref>[ACGTN])>(?P<alt>[ACGTN])$"
@@ -433,6 +448,19 @@ def _is_valid_case1_raw_hgvs_nt(hgvs: str) -> bool:
     accession = m.group("accession")
     # Require a reference-sequence-like accession token (for example NM_/NC_/ENST).
     return bool(re.match(r"^(?:[A-Z]{2}_[0-9]+(?:\.[0-9]+)?|ENST[0-9]+(?:\.[0-9]+)?)$", accession))
+
+
+def _is_case1_genomic(raw_hgvs_nt: str) -> bool:
+    """Return True if a case-1 ``raw_hgvs_nt`` string's body is genomic (``g.``).
+
+    Case 1 covers any fully qualified ``accession:body`` HGVS string, which
+    includes both reference-based c./n. HGVS (``NM_000277.3:c.1218G>A``) and
+    genomic HGVS (``NC_000023.11:g.100A>T``). Only the former self-references
+    a transcript accession usable for extracting mapped_hgvs_c/p from ClinGen;
+    genomic rows need a MANE or explicit preferred-transcript lookup instead.
+    """
+    m = _CASE1_RAW_HGVS_NT_RE.match((raw_hgvs_nt or "").strip())
+    return bool(m) and m.group("body")[0].lower() == "g"
 
 
 def _detect_case(raw_nt: Optional[str], raw_pro: Optional[str]) -> Optional[int]:
@@ -747,9 +775,16 @@ def _clingen_allele_type(data: dict) -> str:
     """Return 'CA', 'PA', or 'unknown' for the allele type encoded in *data*."""
     at_id: str = data.get("@id", "") or ""
     fragment = at_id.rstrip("/").rsplit("/", 1)[-1]
-    if fragment.startswith("CA"):
+    # Real alleles have a fragment like "CA3057219219" or "PA3074801526".
+    # Blank-node alleles (e.g. @id="_:CA" or "@id="_:PA") appear when ClinGen
+    # recognises a variant but has not yet assigned a permanent allele ID — for
+    # example when a protein-level change maps to multiple possible codon
+    # encodings.  Detect blank-node CA/PA alleles by checking for the
+    # authoritative payload key ("genomicAlleles" or "aminoAcidAlleles") rather
+    # than relying on the @id fragment alone.
+    if fragment.startswith("CA") or "genomicAlleles" in data:
         return "CA"
-    if fragment.startswith("PA"):
+    if fragment.startswith("PA") or "aminoAcidAlleles" in data:
         return "PA"
     return "unknown"
 
@@ -804,6 +839,7 @@ def _extract_hgvs_ca(
     hgvs_g: Optional[str] = None
     hgvs_c: Optional[str] = None
     hgvs_p: Optional[str] = None
+    genomic_allele: Optional[dict] = None
 
     # Genomic – prefer GRCh38 NC_ accession.
     for allele in data.get("genomicAlleles", []):
@@ -811,6 +847,7 @@ def _extract_hgvs_ca(
             for h in allele.get("hgvs", []):
                 if h.startswith("NC_"):
                     hgvs_g = h
+                    genomic_allele = allele
                     break
         if hgvs_g:
             break
@@ -838,6 +875,26 @@ def _extract_hgvs_ca(
                 if _is_protein_hgvs(candidate_p):
                     hgvs_p = candidate_p
                 break
+
+    # ClinGen's own canonical rendering of a reference-identical allele uses
+    # the same non-standard identity form (embedded reference bases
+    # immediately before "=") that dcd_mapping emits for its (occasionally
+    # wrong) identity claims -- confirmed directly against the live API, this
+    # is not an echo of a malformed query. Rebuild it as an explicit delins
+    # (ref == alt == bases) so add_vcf_identifiers.py's parser (which has no
+    # branch for this non-standard form) doesn't corrupt hg38_start/hg38_end
+    # (or transcript_pos) downstream -- but only once the *genomic* allele's
+    # own structured coordinates confirm this is a real identity allele
+    # (ClinGen validates those against the actual reference genome), not
+    # merely because a string happens to end in "=". A transcript's own "c."
+    # coordinates share no coordinate space with the genomic ones, so this
+    # can't be confirmed independently per-string; it relies on hgvs_g and
+    # hgvs_c describing the same underlying (confirmed-identity) allele.
+    if _is_confirmed_identity_allele(genomic_allele.get("coordinates") if genomic_allele else None):
+        if hgvs_g:
+            hgvs_g = _reformat_confirmed_identity_hgvs(hgvs_g) or hgvs_g
+        if hgvs_c:
+            hgvs_c = _reformat_confirmed_identity_hgvs(hgvs_c) or hgvs_c
 
     return hgvs_g, hgvs_c, hgvs_p
 
@@ -907,13 +964,21 @@ def _normalize_transcript_accession(accession: str) -> str:
 def _process_case1(
     raw_hgvs_nt: str,
     dcd: Optional[dict],
+    preferred_transcript_nm: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
-    """Handle a reference-based c./n. HGVS variant (case 1).
+    """Handle a reference-based c./n. HGVS variant, or a genomic (g.) HGVS
+    variant with an explicit accession (case 1).
 
     Returns ``(mapped_hgvs_c, mapped_hgvs_g, mapped_hgvs_p, error, clingen_allele_id)``.
 
     This path intentionally mirrors MaveDB's dcd_mapping-based handling for
     accession-referenced variants, even when no sequence alignment is required.
+
+    Genomic rows (``NC_...:g...``) are already assay-level, so the
+    dcd_mapping normalization step is skipped, and the row's own accession
+    (which is genomic, not a transcript) is not used to select the ClinGen
+    transcript allele. Instead *preferred_transcript_nm* is used if given,
+    falling back to ClinGen's MANE transcript otherwise.
     """
     raw = raw_hgvs_nt.strip()
     colon_pos = raw.find(":")
@@ -921,7 +986,10 @@ def _process_case1(
         return raw, None, None, f"Expected 'accession:variant' format; got: {raw!r}", None
 
     original_accession = raw[:colon_pos]
-    if dcd is not None:
+    is_genomic = _is_case1_genomic(raw)
+    if is_genomic:
+        assay_level_hgvs = raw
+    elif dcd is not None:
         fetch_clingen_genomic_hgvs = dcd["fetch_clingen_genomic_hgvs"]
         try:
             assay_level_hgvs = fetch_clingen_genomic_hgvs(raw)
@@ -937,7 +1005,8 @@ def _process_case1(
     if data is None:
         return raw, None, None, f"ClinGen returned no data for {assay_level_hgvs!r}", None
 
-    hgvs_g, hgvs_c_from_clingen, hgvs_p = _extract_hgvs_from_clingen(data, original_accession)
+    transcript_accession = preferred_transcript_nm if is_genomic else original_accession
+    hgvs_g, hgvs_c_from_clingen, hgvs_p = _extract_hgvs_from_clingen(data, transcript_accession)
     clingen_allele_id = _extract_clingen_allele_id(data)
     final_hgvs_c = hgvs_c_from_clingen or raw
     if hgvs_g is None and assay_level_hgvs.startswith("NC_"):
@@ -949,47 +1018,60 @@ def _process_case1_batch(
     raw_hgvs_nt_values: list[str],
     dcd: Optional[dict],
     max_concurrency: int,
+    preferred_transcript_nms: Optional[list[Optional[str]]] = None,
 ) -> list[
     tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]
 ]:
     """Process a batch of class-1 HGVS values, querying ClinGen concurrently.
 
+    *preferred_transcript_nms*, if given, must be the same length as
+    *raw_hgvs_nt_values*; each entry is used as the ClinGen transcript
+    selector for genomic (``g.``) rows only (see :func:`_process_case1`).
+
     Returns one ``(mapped_hgvs_c, mapped_hgvs_g, mapped_hgvs_p, error,
     clingen_allele_id)`` tuple per input string in the same order.
     """
+    if preferred_transcript_nms is None:
+        preferred_transcript_nms = [None] * len(raw_hgvs_nt_values)
+
     fetch_clingen_genomic_hgvs = dcd["fetch_clingen_genomic_hgvs"] if dcd is not None else None
     prepared: list[dict] = []
     assays_to_query: list[str] = []
     assays_seen: set[str] = set()
 
-    for raw_hgvs_nt in raw_hgvs_nt_values:
+    for raw_hgvs_nt, preferred_transcript_nm in zip(raw_hgvs_nt_values, preferred_transcript_nms):
         raw = raw_hgvs_nt.strip()
         colon_pos = raw.find(":")
         if colon_pos <= 0:
             prepared.append(
                 {
                     "raw": raw,
-                    "original_accession": None,
+                    "transcript_accession": None,
                     "assay_level_hgvs": None,
                     "error": f"Expected 'accession:variant' format; got: {raw!r}",
                 }
             )
             continue
 
-        assay_level_hgvs = raw
-        if fetch_clingen_genomic_hgvs is not None:
-            # fetch_clingen_genomic_hgvs is a synchronous dcd_mapping call that
-            # itself hits ClinGen internally.  We don't control its concurrency,
-            # so these normalization calls are sequential.  The subsequent
-            # ClinGen Allele Registry lookups (for hgvs_g/c/p and allele ID) are
-            # batched concurrently below via _query_clingen_by_hgvs_batch.
-            assay_level_hgvs = fetch_clingen_genomic_hgvs(raw)
+        original_accession = raw[:colon_pos]
+        is_genomic = _is_case1_genomic(raw)
+        if is_genomic:
+            assay_level_hgvs = raw
+        else:
+            assay_level_hgvs = raw
+            if fetch_clingen_genomic_hgvs is not None:
+                # fetch_clingen_genomic_hgvs is a synchronous dcd_mapping call that
+                # itself hits ClinGen internally.  We don't control its concurrency,
+                # so these normalization calls are sequential.  The subsequent
+                # ClinGen Allele Registry lookups (for hgvs_g/c/p and allele ID) are
+                # batched concurrently below via _query_clingen_by_hgvs_batch.
+                assay_level_hgvs = fetch_clingen_genomic_hgvs(raw)
 
         if assay_level_hgvs is None:
             prepared.append(
                 {
                     "raw": raw,
-                    "original_accession": raw[:colon_pos],
+                    "transcript_accession": preferred_transcript_nm if is_genomic else original_accession,
                     "assay_level_hgvs": None,
                     "error": f"ClinGen returned no data for {raw!r}",
                 }
@@ -999,7 +1081,7 @@ def _process_case1_batch(
         prepared.append(
             {
                 "raw": raw,
-                "original_accession": raw[:colon_pos],
+                "transcript_accession": preferred_transcript_nm if is_genomic else original_accession,
                 "assay_level_hgvs": assay_level_hgvs,
                 "error": None,
             }
@@ -1031,14 +1113,14 @@ def _process_case1_batch(
             continue
 
         raw = item["raw"]
-        original_accession = item["original_accession"]
+        transcript_accession = item["transcript_accession"]
         assay_level_hgvs = item["assay_level_hgvs"]
         data = clingen_results.get(assay_level_hgvs)
         if data is None:
             results.append((raw, None, None, f"ClinGen returned no data for {assay_level_hgvs!r}", None))
             continue
 
-        hgvs_g, hgvs_c_from_clingen, hgvs_p = _extract_hgvs_from_clingen(data, original_accession)
+        hgvs_g, hgvs_c_from_clingen, hgvs_p = _extract_hgvs_from_clingen(data, transcript_accession)
         clingen_allele_id = _extract_clingen_allele_id(data)
         final_hgvs_c = hgvs_c_from_clingen or raw
         if hgvs_g is None and assay_level_hgvs.startswith("NC_"):
@@ -1304,7 +1386,7 @@ def _try_import_dcd_mapping() -> dict:
             VrsVersion,
         )
         from dcd_mapping.transcripts import TxSelectError, select_transcripts  # noqa: PLC0415
-        from dcd_mapping.vrs_map import fetch_clingen_genomic_hgvs, vrs_map  # noqa: PLC0415
+        import dcd_mapping.vrs_map as _dcd_vrs_map  # noqa: PLC0415
     except ImportError as exc:
         raise ImportError(
             "dcd_mapping (and cool_seq_tool) are required for sequence-based mapping "
@@ -1316,6 +1398,8 @@ def _try_import_dcd_mapping() -> dict:
     _patch_seqrepo_chr_lookup()
     _patch_dcd_clingen_fetch()
 
+    # Read fetch_clingen_genomic_hgvs from the module *after* patching so callers
+    # get the cached wrapper, not the original function captured before the patch.
     return {
         "AnnotationLayer": AnnotationLayer,
         "build_alignment_result": build_alignment_result,
@@ -1328,9 +1412,62 @@ def _try_import_dcd_mapping() -> dict:
         "VrsVersion": VrsVersion,
         "TxSelectError": TxSelectError,
         "select_transcripts": select_transcripts,
-        "fetch_clingen_genomic_hgvs": fetch_clingen_genomic_hgvs,
-        "vrs_map": vrs_map,
+        "fetch_clingen_genomic_hgvs": _dcd_vrs_map.fetch_clingen_genomic_hgvs,
+        "vrs_map": _dcd_vrs_map.vrs_map,
     }
+
+
+async def _build_tx_select_from_nm(nm: str, target_sequence: str):
+    """Build a TxSelectResult from a caller-specified NM_ accession.
+
+    Resolves the protein accession by checking the MANE table first, then falling
+    back to a UTA query.  Retrieves the reference protein sequence from seqrepo.
+    Raises ``ValueError`` if the NM_ accession cannot be resolved.
+    """
+    from Bio.Seq import Seq  # noqa: PLC0415
+    from cool_seq_tool.schemas import TranscriptPriority  # noqa: PLC0415
+    from dcd_mapping.lookup import get_mane_transcripts, get_protein_accession, get_sequence  # noqa: PLC0415
+    from dcd_mapping.schemas import TxSelectResult  # noqa: PLC0415
+
+    # Prefer the MANE table to avoid UTA version mismatches.
+    np: Optional[str] = None
+    mane_hits = get_mane_transcripts([nm])
+    if mane_hits:
+        np = mane_hits[0].refseq_prot
+        logger.debug("Resolved %r → %r via MANE table.", nm, np)
+    else:
+        np = await get_protein_accession(nm)
+        if np:
+            logger.debug("Resolved %r → %r via UTA.", nm, np)
+
+    if not np:
+        raise ValueError(
+            f"Could not resolve protein accession for preferred transcript {nm!r}. "
+            "Check that the accession is in the MANE table or UTA "
+            "(include the version suffix, e.g. NM_007194.4)."
+        )
+    ref_seq = get_sequence(np)
+
+    # Translate DNA target to protein when necessary (mirrors dcd_mapping logic).
+    if len(set(target_sequence)) <= 4:
+        protein_seq = str(Seq(target_sequence).translate(table="1")).replace("*", "")
+    else:
+        protein_seq = target_sequence
+
+    is_full_match = bool(protein_seq) and protein_seq in ref_seq
+    start = ref_seq.find(protein_seq[:10]) if protein_seq else 0
+    if start < 0:
+        start = 0
+
+    return TxSelectResult(
+        nm=nm,
+        np=np,
+        start=start,
+        is_full_match=is_full_match,
+        sequence=ref_seq,
+        transcript_mode=TranscriptPriority.MANE_SELECT,
+        hgnc_symbol=None,
+    )
 
 
 def _is_dna_sequence(sequence: str) -> bool:
@@ -1400,6 +1537,89 @@ def _hgvs_from_annotation(annotation) -> Optional[str]:
     return None
 
 
+def _reformat_identity_hgvs_as_delins(hgvs: str) -> Optional[str]:
+    """Reformat a VRS identity expression as an equivalent bare delins.
+
+    dcd_mapping emits non-standard strings like ``NC_000007.14:g.144548593CCT=``
+    for alleles it (sometimes incorrectly -- see below) considers identical to
+    the reference. This function converts them to a proper HGVS delins, e.g.
+    ``NC_000007.14:g.144548593_144548595delinsCCT``, which is valid HGVS and
+    parseable by ClinGen.
+
+    This is deliberately the *bare* ``delins<bases>`` form (not
+    ``del<bases>ins<bases>``), and is only safe to use for the *outbound*
+    query sent to ClinGen, never for a string taken at face value downstream:
+    dcd_mapping's embedded reference-base claim is occasionally wrong (its
+    own alignment miscalculates which bases are actually at that genomic
+    position), and a bare delins lets ClinGen independently re-derive the
+    true reference/alt from the genome and self-correct, where an explicit
+    ``del<bases>ins<bases>`` would instead have ClinGen validate the (wrong)
+    claimed bases and reject the query outright with "Given allele from
+    reference sequence is incorrect". For ClinGen's own *response* HGVS,
+    which is already validated against the real genome, use
+    :func:`_reformat_confirmed_identity_hgvs` instead, gated on
+    :func:`_is_confirmed_identity_allele`.
+
+    Returns ``None`` when the string does not match the expected pattern (e.g.
+    no embedded bases before ``=``).
+    """
+    m = _VRS_IDENTITY_RE.match(hgvs.rstrip())
+    if not m:
+        return None
+    prefix, pos_str, bases = m.group(1), m.group(2), m.group(3)
+    start = int(pos_str)
+    end = start + len(bases) - 1
+    if start == end:
+        return f"{prefix}{start}delins{bases}"
+    return f"{prefix}{start}_{end}delins{bases}"
+
+
+def _is_confirmed_identity_allele(coordinates: Optional[list[dict]]) -> bool:
+    """Return True if ClinGen's structured *coordinates* confirm reference identity.
+
+    *coordinates* is a ``genomicAlleles[i]["coordinates"]`` entry from a
+    ClinGen Allele Registry response, already validated by ClinGen against
+    the real reference genome -- so ``referenceAllele == allele`` there is a
+    trustworthy confirmation of a reference-identical allele, unlike the
+    embedded bases in dcd_mapping's own identity claim (see
+    :func:`_reformat_identity_hgvs_as_delins`), which are occasionally wrong.
+    """
+    if not coordinates:
+        return False
+    coord = coordinates[0]
+    ref = coord.get("referenceAllele")
+    alt = coord.get("allele")
+    return ref is not None and ref == alt
+
+
+def _reformat_confirmed_identity_hgvs(hgvs: str) -> Optional[str]:
+    """Reformat a *confirmed* identity expression as an explicit delins.
+
+    Only call this once :func:`_is_confirmed_identity_allele` has verified
+    (via ClinGen's structured coordinates) that the allele really is
+    reference-identical -- at that point the embedded bases in *hgvs* itself
+    can be trusted (they're ClinGen's own rendering of the same validated
+    allele, just projected onto a different reference sequence -- e.g. a
+    transcript's own "c." numbering, which doesn't share a coordinate space
+    with the genomic "g." coordinates used for the confirmation, so those
+    coordinates can't be used directly to rebuild this string; the position
+    embedded in *hgvs* is already correct for its own coordinate system).
+
+    Returns an explicit ``del<bases>ins<bases>`` HGVS string (ref == alt ==
+    bases), or ``None`` when *hgvs* doesn't match the expected identity
+    pattern.
+    """
+    m = _VRS_IDENTITY_RE.match(hgvs.rstrip())
+    if not m:
+        return None
+    prefix, pos_str, bases = m.group(1), m.group(2), m.group(3)
+    start = int(pos_str)
+    end = start + len(bases) - 1
+    if start == end:
+        return f"{prefix}{start}del{bases}ins{bases}"
+    return f"{prefix}{start}_{end}del{bases}ins{bases}"
+
+
 async def _run_dcd_mapping_pipeline(
     group_name: str,
     target_sequence: str,
@@ -1408,6 +1628,7 @@ async def _run_dcd_mapping_pipeline(
     allow_row_fallback: bool = True,
     precomputed_align_result=None,
     precomputed_transcript=None,
+    preferred_transcript_nm: Optional[str] = None,
 ) -> tuple[list[tuple[int, Optional[str], str]], Optional[str], Optional[int]]:
     """Run the full dcd_mapping pipeline for one group of rows sharing a target sequence.
 
@@ -1490,58 +1711,80 @@ async def _run_dcd_mapping_pipeline(
             logger.debug("BLAT alignment failure details:", exc_info=True)
             return _fail_all(f"BLAT alignment failed: {_format_exc(exc)}")
 
-        logger.info("Selecting transcripts for group %r.", group_name)
-        try:
-            transcripts = await select_transcripts(metadata, records, alignment_results)
-        except Exception as exc:
-            logger.error(
-                "Transcript selection failed for group %r: %s",
+        if preferred_transcript_nm is not None:
+            logger.info(
+                "Using preferred transcript %r for group %r (skipping automatic selection).",
+                preferred_transcript_nm,
                 group_name,
-                _format_exc(exc),
             )
-            logger.debug("Transcript selection full-group failure details:", exc_info=True)
-
-            # Retry transcript selection with a single representative row. Some
-            # dcd_mapping paths can fail on large record sets even when one-row
-            # selection succeeds and can be reused for the full group.
             try:
-                representative_records = {group_name: score_rows[:1]}
-                transcripts = await select_transcripts(metadata, representative_records, alignment_results)
-                logger.info(
-                    "Transcript selection retry (single representative row) succeeded for group %r.",
+                preferred_tx = await _build_tx_select_from_nm(
+                    preferred_transcript_nm, target_sequence
+                )
+                transcripts = {group_name: preferred_tx}
+            except Exception as exc:
+                logger.warning(
+                    "Could not build TxSelectResult for preferred transcript %r (%s); "
+                    "falling back to automatic transcript selection for group %r.",
+                    preferred_transcript_nm,
+                    _format_exc(exc),
                     group_name,
                 )
-            except Exception as retry_exc:
+                preferred_transcript_nm = None  # clear so fall-through uses normal path
+
+        if preferred_transcript_nm is None:
+            logger.info("Selecting transcripts for group %r.", group_name)
+            try:
+                transcripts = await select_transcripts(metadata, records, alignment_results)
+            except Exception as exc:
                 logger.error(
-                    "Transcript selection retry failed for group %r: %s",
+                    "Transcript selection failed for group %r: %s",
                     group_name,
-                    _format_exc(retry_exc),
+                    _format_exc(exc),
                 )
-                logger.debug("Transcript selection retry failure details:", exc_info=True)
-                if allow_row_fallback and len(row_entries) > 1:
-                    logger.warning(
-                        "Falling back to per-row mapping for group %r after transcript selection failure.",
+                logger.debug("Transcript selection full-group failure details:", exc_info=True)
+
+                # Retry transcript selection with a single representative row. Some
+                # dcd_mapping paths can fail on large record sets even when one-row
+                # selection succeeds and can be reused for the full group.
+                try:
+                    representative_records = {group_name: score_rows[:1]}
+                    transcripts = await select_transcripts(metadata, representative_records, alignment_results)
+                    logger.info(
+                        "Transcript selection retry (single representative row) succeeded for group %r.",
                         group_name,
                     )
-                    merged_results: list[tuple[int, Optional[str], str, Optional[str], Optional[str]]] = []
-                    selected_transcript_nm: Optional[str] = None
-                    selected_strand: Optional[int] = None
-                    for orig_idx, hgvs_nt, hgvs_pro, case in row_entries:
-                        one_row_results, one_tx_nm, one_strand = await _run_dcd_mapping_pipeline(
-                            group_name=f"{group_name}#row{orig_idx}",
-                            target_sequence=target_sequence,
-                            row_entries=[(orig_idx, hgvs_nt, hgvs_pro, case)],
-                            dcd=dcd,
-                            allow_row_fallback=False,
+                except Exception as retry_exc:
+                    logger.error(
+                        "Transcript selection retry failed for group %r: %s",
+                        group_name,
+                        _format_exc(retry_exc),
+                    )
+                    logger.debug("Transcript selection retry failure details:", exc_info=True)
+                    if allow_row_fallback and len(row_entries) > 1:
+                        logger.warning(
+                            "Falling back to per-row mapping for group %r after transcript selection failure.",
+                            group_name,
                         )
-                        merged_results.extend(one_row_results)
-                        if selected_transcript_nm is None and one_tx_nm is not None:
-                            selected_transcript_nm = one_tx_nm
-                        if selected_strand is None and one_strand is not None:
-                            selected_strand = one_strand
-                    return merged_results, selected_transcript_nm, selected_strand
+                        merged_results: list[tuple[int, Optional[str], str, Optional[str], Optional[str]]] = []
+                        selected_transcript_nm: Optional[str] = None
+                        selected_strand: Optional[int] = None
+                        for orig_idx, hgvs_nt, hgvs_pro, case in row_entries:
+                            one_row_results, one_tx_nm, one_strand = await _run_dcd_mapping_pipeline(
+                                group_name=f"{group_name}#row{orig_idx}",
+                                target_sequence=target_sequence,
+                                row_entries=[(orig_idx, hgvs_nt, hgvs_pro, case)],
+                                dcd=dcd,
+                                allow_row_fallback=False,
+                            )
+                            merged_results.extend(one_row_results)
+                            if selected_transcript_nm is None and one_tx_nm is not None:
+                                selected_transcript_nm = one_tx_nm
+                            if selected_strand is None and one_strand is not None:
+                                selected_strand = one_strand
+                        return merged_results, selected_transcript_nm, selected_strand
 
-                return _fail_all(f"Transcript selection failed: {_format_exc(retry_exc)}")
+                    return _fail_all(f"Transcript selection failed: {_format_exc(retry_exc)}")
 
     transcript = transcripts.get(group_name)
     transcript_nm: Optional[str] = None
@@ -1594,6 +1837,26 @@ async def _run_dcd_mapping_pipeline(
             continue
         hgvs_assay = _hgvs_from_annotation(ann)
         dna_digest, protein_digest = _vrs_digest_from_annotation(ann)
+
+        # dcd_mapping emits a non-standard identity expression (e.g.
+        # "NC_000007.14:g.144548593CCT=") when the input allele is identical to
+        # the reference sequence — for example, a reverse-translated no-change
+        # amino acid that encodes only one codon.  The "=" form is not valid
+        # HGVS and ClinGen rejects it.  Reformat it as an equivalent delins
+        # (ref == alt) so the rest of the pipeline can treat it normally.
+        # Normal HGVS identity alleles (e.g. "NP_000518.1:p.Ser65=") also end
+        # with "=" but _reformat_identity_hgvs_as_delins returns None for them
+        # (the regex requires embedded DNA bases), so they pass through unchanged.
+        if hgvs_assay:
+            reformatted = _reformat_identity_hgvs_as_delins(hgvs_assay)
+            if reformatted:
+                logger.debug(
+                    "Row %s: reformatted VRS identity allele %r → %r.",
+                    orig_idx,
+                    hgvs_assay,
+                    reformatted,
+                )
+                hgvs_assay = reformatted
 
         # Fallback for unsupported multi-variant DNA haplotypes: if dcd_mapping
         # produced no assay-level HGVS for a case-2 row, try rewriting supported
@@ -1715,6 +1978,8 @@ def map_variants(
     merge_existing_files: tuple[str, ...] = (),
     merge_match_columns: tuple[str, ...] = (),
     normalize_hgvs: bool = False,
+    preferred_transcript: Optional[str] = None,
+    preferred_transcript_col: Optional[str] = None,
 ) -> None:
     """Map variants in *input_file* to human-genome reference HGVS strings.
 
@@ -1761,6 +2026,18 @@ def map_variants(
         normalize_hgvs: If True, normalize relaxed case-2/3 HGVS inputs before
             case detection and mapping (for example ``A334C`` -> ``p.Ala334Cys``;
             ``123A>G`` -> ``c.123A>G``).
+        preferred_transcript: NM_ accession to use as the reference transcript for all
+            sequence-based groups (cases 2 and 3), overriding automatic MANE/UTA
+            selection.  Must include the version suffix (e.g. ``NM_007194.4``).  If the
+            accession cannot be resolved in UTA the mapper falls back to automatic
+            selection and emits a warning.  Also used to select the ClinGen transcript
+            allele for genomic (``g.``) case-1 rows, overriding the MANE fallback.
+        preferred_transcript_col: Optional column in the input file whose value
+            specifies the preferred NM_ accession for each sequence-based group (or,
+            for genomic case-1 rows, for that row).  Blank values are ignored; the
+            global ``preferred_transcript`` is used as a
+            fallback when the column is blank or absent.  The column value is assumed to
+            be the same for all rows in a group (i.e. rows sharing a target sequence).
         preserve_order: Order guarantee for output rows. Options are:
             'no': Write immediately as results arrive; groups may appear
                 out-of-order. Fastest mode.
@@ -2018,14 +2295,29 @@ def map_variants(
                     )
 
             raw_hgvs_nt_values = [entry[2] for entry in case1_rows]
+            # Per-row preferred transcript (used for genomic case-1 rows only):
+            # column value takes precedence over the global override.
+            preferred_transcript_nms = [
+                (
+                    (entry[1].get(preferred_transcript_col) or "").strip() or preferred_transcript
+                    if preferred_transcript_col
+                    else preferred_transcript
+                )
+                or None
+                for entry in case1_rows
+            ]
             if max_clingen_concurrency > 1 and len(raw_hgvs_nt_values) > 1:
                 batch_results = _process_case1_batch(
                     raw_hgvs_nt_values,
                     dcd_for_case1,
                     max_concurrency=max_clingen_concurrency,
+                    preferred_transcript_nms=preferred_transcript_nms,
                 )
             else:
-                batch_results = [_process_case1(raw_nt, dcd_for_case1) for raw_nt in raw_hgvs_nt_values]
+                batch_results = [
+                    _process_case1(raw_nt, dcd_for_case1, preferred_transcript_nm=ptx)
+                    for raw_nt, ptx in zip(raw_hgvs_nt_values, preferred_transcript_nms)
+                ]
 
             for (idx, row, _), (hgvs_c, hgvs_g, hgvs_p, err, clingen_allele_id) in zip(case1_rows, batch_results):
                 # For case-1 variants the strand can be looked up from UTA using the
@@ -2073,6 +2365,15 @@ def map_variants(
             group_rows_by_idx = {r[0]: r[1] for r in group_rows}
             row_entries = [(r[0], r[2], r[3], r[4]) for r in group_rows]
 
+            # Per-group preferred transcript: column value takes precedence over global.
+            effective_preferred_transcript = preferred_transcript
+            if preferred_transcript_col:
+                for r in group_rows:
+                    col_val = (r[1].get(preferred_transcript_col) or "").strip()
+                    if col_val:
+                        effective_preferred_transcript = col_val
+                        break
+
             per_row = None
             transcript_nm = None
             strand: Optional[int] = None
@@ -2083,7 +2384,8 @@ def map_variants(
                 for attempt in range(1, dcd_max_retry_attempts + 1):
                     try:
                         per_row, transcript_nm, strand = sequence_loop.run_until_complete(
-                            _run_dcd_mapping_pipeline(group_name, target_seq, row_entries, dcd_for_groups)
+                            _run_dcd_mapping_pipeline(group_name, target_seq, row_entries, dcd_for_groups,
+                                                      preferred_transcript_nm=effective_preferred_transcript)
                         )
                         break
                     except Exception as exc:
@@ -2104,7 +2406,8 @@ def map_variants(
                                 chunk_name = f"{group_name}#retry{attempt}_chunk{start_idx // chunk_sz + 1}"
                                 try:
                                     chunk_per_row, chunk_tx, chunk_strand = sequence_loop.run_until_complete(
-                                        _run_dcd_mapping_pipeline(chunk_name, target_seq, chunk_entries, dcd_for_groups)
+                                        _run_dcd_mapping_pipeline(chunk_name, target_seq, chunk_entries, dcd_for_groups,
+                                                                  preferred_transcript_nm=effective_preferred_transcript)
                                     )
                                     per_row.extend(chunk_per_row)
                                     if transcript_nm is None:
@@ -2170,11 +2473,12 @@ def map_variants(
                             _assay_is_protein = (
                                 hgvs_assay.startswith("p.") or ":p." in hgvs_assay
                             )
+                            _assay_is_identity = hgvs_assay.rstrip().endswith("=")
                             _record_result(
                                 orig_idx,
                                 row,
                                 None,
-                                None if _assay_is_protein else hgvs_assay,
+                                None if (_assay_is_protein or _assay_is_identity) else hgvs_assay,
                                 hgvs_assay if _assay_is_protein else None,
                                 f"ClinGen returned no data for {hgvs_assay!r}",
                                 dna_vrs_digest=dna_digest,
@@ -2185,7 +2489,7 @@ def map_variants(
                             continue
 
                         hgvs_g, hgvs_c, hgvs_p = _extract_hgvs_from_clingen(data, transcript_nm)
-                        if _clingen_allele_type(data) == "PA" and hgvs_p is None:
+                        if _clingen_allele_type(data) == "PA" and hgvs_p is None and _is_protein_hgvs(hgvs_assay):
                             hgvs_p = hgvs_assay
 
                         _record_result(
@@ -2413,6 +2717,15 @@ def map_variants(
                     group_rows_by_idx = {r[0]: r[1] for r in group_rows}
                     row_entries = [(r[0], r[2], r[3], r[4]) for r in group_rows]
 
+                    # Per-group preferred transcript: column value takes precedence over global.
+                    effective_preferred_transcript = preferred_transcript
+                    if preferred_transcript_col:
+                        for r in group_rows:
+                            col_val = (r[1].get(preferred_transcript_col) or "").strip()
+                            if col_val:
+                                effective_preferred_transcript = col_val
+                                break
+
                     # Try to process the full group; retry with chunking on BLAT error 137
                     per_row = None
                     transcript_nm = None
@@ -2422,7 +2735,8 @@ def map_variants(
                     for attempt in range(1, dcd_max_retry_attempts + 1):
                         try:
                             per_row, transcript_nm, strand = loop.run_until_complete(
-                                _run_dcd_mapping_pipeline(group_name, target_seq, row_entries, dcd)
+                                _run_dcd_mapping_pipeline(group_name, target_seq, row_entries, dcd,
+                                                          preferred_transcript_nm=effective_preferred_transcript)
                             )
                             break  # Success; exit retry loop
                         except Exception as exc:
@@ -2445,7 +2759,8 @@ def map_variants(
                                     chunk_name = f"{group_name}#retry{attempt}_chunk{start_idx // chunk_sz + 1}"
                                     try:
                                         chunk_per_row, chunk_tx, chunk_strand = loop.run_until_complete(
-                                            _run_dcd_mapping_pipeline(chunk_name, target_seq, chunk_entries, dcd)
+                                            _run_dcd_mapping_pipeline(chunk_name, target_seq, chunk_entries, dcd,
+                                                                      preferred_transcript_nm=effective_preferred_transcript)
                                         )
                                         per_row.extend(chunk_per_row)
                                         if transcript_nm is None:
@@ -2540,7 +2855,7 @@ def map_variants(
                             # For protein-layer variants where ClinGen returns a PA allele, the
                             # assay-level p. string is the best available protein HGVS if ClinGen
                             # did not populate hgvs_p from aminoAcidAlleles.
-                            if _clingen_allele_type(data) == "PA" and hgvs_p is None:
+                            if _clingen_allele_type(data) == "PA" and hgvs_p is None and _is_protein_hgvs(hgvs_assay):
                                 hgvs_p = hgvs_assay
 
                             _record_result(
@@ -2864,6 +3179,29 @@ def map_variants(
     ),
 )
 @click.option(
+    "--preferred-transcript",
+    "preferred_transcript",
+    default=None,
+    metavar="NM_ACCESSION",
+    help=(
+        "NM_ accession (with version, e.g. NM_007194.4) to use as the reference "
+        "transcript for all sequence-based groups, overriding automatic MANE/UTA "
+        "selection.  Falls back to automatic selection if the accession cannot be "
+        "resolved in UTA."
+    ),
+)
+@click.option(
+    "--preferred-transcript-col",
+    "preferred_transcript_col",
+    default=None,
+    metavar="COLUMN",
+    help=(
+        "Column in the input file whose value specifies the preferred NM_ accession "
+        "for each sequence-based group.  Blank values are ignored.  "
+        "--preferred-transcript is used as a fallback when the column is blank."
+    ),
+)
+@click.option(
     "--verbose",
     "-v",
     is_flag=True,
@@ -2906,6 +3244,8 @@ def main(
     targets_file: Optional[str],
     target_name_col: str,
     normalize_hgvs: bool,
+    preferred_transcript: Optional[str],
+    preferred_transcript_col: Optional[str],
     verbose: bool,
     csv_field_size_limit: int,
 ) -> None:
@@ -2957,6 +3297,8 @@ def main(
         targets_file=targets_file,
         target_name_col=target_name_col,
         normalize_hgvs=normalize_hgvs,
+        preferred_transcript=preferred_transcript,
+        preferred_transcript_col=preferred_transcript_col,
     )
 
 

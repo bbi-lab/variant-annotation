@@ -25,6 +25,21 @@ Default output columns:
   - <namespace>.<version>.faf95_max
   - <namespace>.<version>.faf95_max_ancestry
 
+Redis caching (optional):
+  Results from Hail/Athena lookups can be cached in Redis to speed up repeated
+  runs over overlapping variant sets.
+
+  GNOMAD_CACHE_REDIS_ENABLED
+      Set to ``0`` / ``false`` to disable Redis caching entirely (default: enabled).
+  GNOMAD_CACHE_REDIS_URL
+      Redis connection URL (default: ``redis://redis:6379/0``; also falls back to
+      the generic ``REDIS_URL`` variable).
+  GNOMAD_CACHE_REDIS_PREFIX
+      Key namespace prefix (default: ``gnomad:v1``).  Bump to invalidate all
+      cached entries after a significant gnomAD release.
+  GNOMAD_CACHE_REDIS_TTL_SECONDS
+      TTL for cached entries, in seconds (default: 604800 — 7 days).
+
 Usage:
     python -m src.annotate_gnomad input.tsv output.tsv [OPTIONS]
 """
@@ -34,13 +49,14 @@ from __future__ import annotations
 import argparse
 import csv
 from itertools import islice
+import json
 import logging
 import os
 import re
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -64,6 +80,47 @@ GNOMAD_ATHENA_ROW_BATCH_SIZE_DEFAULT = int(os.environ.get("GNOMAD_ATHENA_ROW_BAT
 
 
 @dataclass
+class HistogramData:
+    bin_edges: list[float]
+    bin_freq: list[int]
+    n_smaller: int
+    n_larger: int
+
+
+# Maps callset key → list of (cache_field_name, source_ht_path_parts).
+# Used to select histogram fields into the local cache and to populate GnomadRecord.histograms.
+_AGE_HIST_SPECS: dict[str, list[tuple[str, list[str]]]] = {
+    "exome": [
+        ("age_hist_exome_het", ["exome", "age_distribution", "het"]),
+        ("age_hist_exome_hom", ["exome", "age_distribution", "hom"]),
+    ],
+    "genome": [
+        ("age_hist_genome_het", ["genome", "age_distribution", "het"]),
+        ("age_hist_genome_hom", ["genome", "age_distribution", "hom"]),
+    ],
+    "joint": [
+        ("age_hist_joint_het", ["joint", "histograms", "age_hists", "age_hist_het"]),
+        ("age_hist_joint_hom", ["joint", "histograms", "age_hists", "age_hist_hom"]),
+    ],
+}
+
+_AB_HIST_SPECS: dict[str, list[tuple[str, list[str]]]] = {
+    "exome": [
+        ("ab_hist_exome_adj", ["exome", "quality_metrics", "allele_balance", "alt_adj"]),
+        ("ab_hist_exome_raw", ["exome", "quality_metrics", "allele_balance", "alt_raw"]),
+    ],
+    "genome": [
+        ("ab_hist_genome_adj", ["genome", "quality_metrics", "allele_balance", "alt_adj"]),
+        ("ab_hist_genome_raw", ["genome", "quality_metrics", "allele_balance", "alt_raw"]),
+    ],
+    "joint": [
+        ("ab_hist_joint_adj", ["joint", "histograms", "qual_hists", "ab_hist_alt"]),
+        ("ab_hist_joint_raw", ["joint", "histograms", "raw_qual_hists", "ab_hist_alt"]),
+    ],
+}
+
+
+@dataclass
 class GnomadRecord:
     caid: str
     allele_count: int
@@ -76,6 +133,202 @@ class GnomadRecord:
     exome_filters: str = ""
     genome_filters: str = ""
     gene_symbols: str = ""
+    histograms: dict = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Redis cache for gnomAD lookups
+# ---------------------------------------------------------------------------
+
+GNOMAD_CACHE_REDIS_URL_DEFAULT = "redis://redis:6379/0"
+GNOMAD_CACHE_REDIS_PREFIX_DEFAULT = "gnomad:v1"
+GNOMAD_CACHE_REDIS_TTL_SECONDS_DEFAULT = 7 * 86400  # 7 days
+
+_GNOMAD_REDIS_CLIENT: Any = None
+_GNOMAD_REDIS_INIT_ATTEMPTED = False
+_GNOMAD_REDIS_UNAVAILABLE_LOGGED = False
+_GNOMAD_MISS_SENTINEL = "__MISS__"
+
+
+def _gnomad_env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def _gnomad_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; using default=%d", name, raw, default)
+        return default
+
+
+def _gnomad_cache_enabled() -> bool:
+    return _gnomad_env_bool("GNOMAD_CACHE_REDIS_ENABLED", True)
+
+
+def _gnomad_cache_redis_url() -> str:
+    return (
+        os.environ.get("GNOMAD_CACHE_REDIS_URL")
+        or os.environ.get("REDIS_URL")
+        or GNOMAD_CACHE_REDIS_URL_DEFAULT
+    )
+
+
+def _gnomad_cache_prefix() -> str:
+    return (os.environ.get("GNOMAD_CACHE_REDIS_PREFIX") or GNOMAD_CACHE_REDIS_PREFIX_DEFAULT).strip()
+
+
+def _gnomad_cache_ttl() -> int:
+    return max(1, _gnomad_env_int("GNOMAD_CACHE_REDIS_TTL_SECONDS", GNOMAD_CACHE_REDIS_TTL_SECONDS_DEFAULT))
+
+
+def _gnomad_redis_cache_key(lookup_key: str) -> str:
+    return f"{_gnomad_cache_prefix()}:{lookup_key}"
+
+
+def _gnomad_get_redis_client(*, force: bool = False):
+    """Return a Redis client for gnomAD caching, or None if unavailable/disabled."""
+    global _GNOMAD_REDIS_CLIENT
+    global _GNOMAD_REDIS_INIT_ATTEMPTED
+    global _GNOMAD_REDIS_UNAVAILABLE_LOGGED
+
+    if not force and not _gnomad_cache_enabled():
+        return None
+    if _GNOMAD_REDIS_CLIENT is not None:
+        return _GNOMAD_REDIS_CLIENT
+    if _GNOMAD_REDIS_INIT_ATTEMPTED:
+        return None
+
+    _GNOMAD_REDIS_INIT_ATTEMPTED = True
+    try:
+        import redis  # type: ignore[import-not-found]
+
+        client = redis.Redis.from_url(_gnomad_cache_redis_url(), decode_responses=True)
+        client.ping()
+        _GNOMAD_REDIS_CLIENT = client
+        logger.info("gnomAD Redis cache connected: %s", _gnomad_cache_redis_url())
+        return _GNOMAD_REDIS_CLIENT
+    except Exception as exc:
+        if not _GNOMAD_REDIS_UNAVAILABLE_LOGGED:
+            logger.warning("gnomAD Redis cache unavailable; continuing without cache: %s", exc)
+            _GNOMAD_REDIS_UNAVAILABLE_LOGGED = True
+        return None
+
+
+def _gnomad_record_to_dict(record: GnomadRecord) -> dict:
+    hist_data: dict = {}
+    for field_name, hist in record.histograms.items():
+        if hist is None:
+            hist_data[field_name] = None
+        else:
+            hist_data[field_name] = {
+                "bin_edges": hist.bin_edges,
+                "bin_freq": hist.bin_freq,
+                "n_smaller": hist.n_smaller,
+                "n_larger": hist.n_larger,
+            }
+    return {
+        "caid": record.caid,
+        "allele_count": record.allele_count,
+        "allele_number": record.allele_number,
+        "allele_frequency": record.allele_frequency,
+        "minor_allele_frequency": record.minor_allele_frequency,
+        "faf95_max": record.faf95_max,
+        "faf95_max_ancestry": record.faf95_max_ancestry,
+        "filters": record.filters,
+        "exome_filters": record.exome_filters,
+        "genome_filters": record.genome_filters,
+        "gene_symbols": record.gene_symbols,
+        "histograms": hist_data,
+    }
+
+
+def _gnomad_record_from_dict(data: dict) -> GnomadRecord:
+    hist_raw = data.get("histograms") or {}
+    histograms: dict = {}
+    for field_name, h in hist_raw.items():
+        if h is None:
+            histograms[field_name] = None
+        else:
+            histograms[field_name] = HistogramData(
+                bin_edges=[float(e) for e in h.get("bin_edges", [])],
+                bin_freq=[int(f) for f in h.get("bin_freq", [])],
+                n_smaller=int(h.get("n_smaller", 0)),
+                n_larger=int(h.get("n_larger", 0)),
+            )
+    return GnomadRecord(
+        caid=str(data.get("caid", "")),
+        allele_count=int(data.get("allele_count", 0)),
+        allele_number=int(data.get("allele_number", 0)),
+        allele_frequency=float(data.get("allele_frequency", 0.0)),
+        minor_allele_frequency=float(data.get("minor_allele_frequency", 0.0)),
+        faf95_max=float(data["faf95_max"]) if data.get("faf95_max") is not None else None,
+        faf95_max_ancestry=str(data.get("faf95_max_ancestry", "")),
+        filters=str(data.get("filters", "")),
+        exome_filters=str(data.get("exome_filters", "")),
+        genome_filters=str(data.get("genome_filters", "")),
+        gene_symbols=str(data.get("gene_symbols", "")),
+        histograms=histograms,
+    )
+
+
+def _gnomad_cache_get_many(keys: list[str]) -> dict[str, Optional[GnomadRecord]]:
+    """Batch-fetch gnomAD records from Redis.
+
+    Returns a dict covering only keys that were found in the cache:
+    - GnomadRecord value → confirmed hit from a previous run.
+    - None value → confirmed miss; the variant is absent from gnomAD.
+    Keys absent from the returned dict were not cached and must be looked up.
+    """
+    client = _gnomad_get_redis_client()
+    if client is None or not keys:
+        return {}
+    redis_keys = [_gnomad_redis_cache_key(k) for k in keys]
+    try:
+        values = client.mget(redis_keys)
+    except Exception:
+        return {}
+    result: dict[str, Optional[GnomadRecord]] = {}
+    for lookup_key, value in zip(keys, values):
+        if value is None:
+            continue
+        if value == _GNOMAD_MISS_SENTINEL:
+            result[lookup_key] = None
+            continue
+        try:
+            result[lookup_key] = _gnomad_record_from_dict(json.loads(value))
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+            continue
+    return result
+
+
+def _gnomad_cache_set_many(records: dict[str, Optional[GnomadRecord]]) -> None:
+    """Store a batch of lookup_key → GnomadRecord mappings in Redis.
+
+    Pass None as the value to store a miss sentinel — a confirmed absence that
+    prevents re-querying the same key in future runs.
+    """
+    client = _gnomad_get_redis_client()
+    if client is None or not records:
+        return
+    try:
+        pipe = client.pipeline(transaction=False)
+        ttl = _gnomad_cache_ttl()
+        for lookup_key, record in records.items():
+            key = _gnomad_redis_cache_key(lookup_key)
+            if record is None:
+                pipe.set(key, _GNOMAD_MISS_SENTINEL, ex=ttl)
+            else:
+                pipe.set(key, json.dumps(_gnomad_record_to_dict(record)), ex=ttl)
+        pipe.execute()
+    except Exception as exc:
+        logger.debug("gnomAD Redis cache write failed: %s", exc)
 
 
 def _import_hail():
@@ -123,10 +376,19 @@ def _hail_init_kwargs(tmp_dir: Path, source_uri: str) -> dict[str, Any]:
     # even though no work is being done.  600s is generous enough not to fire
     # during normal GCS latency spikes.
     network_timeout = os.environ.get("SPARK_NETWORK_TIMEOUT", "600s").strip()
+    # GNOMAD_CACHE_PARTITIONS controls the sort output partition count for the
+    # key_by shuffle during cache writes.  Without this, Hail picks a count
+    # based on core count or data size heuristics (~500 for gnomAD v4.1),
+    # leaving the sort output larger than the naive_coalesced read phase.
+    # Setting spark.default.parallelism and spark.sql.shuffle.partitions to
+    # the same target aligns all three phases (read, sort, write) at 200.
+    cache_partitions = os.environ.get("GNOMAD_CACHE_PARTITIONS", "200").strip()
     base_spark_conf: dict[str, Any] = {
         "spark.local.dir": spark_local_dir,
         "spark.network.timeout": network_timeout,
         "spark.executor.heartbeatInterval": "60s",
+        "spark.default.parallelism": cache_partitions,
+        "spark.sql.shuffle.partitions": cache_partitions,
     }
     if not _is_gs_uri(source_uri):
         kwargs["spark_conf"] = base_spark_conf
@@ -776,6 +1038,117 @@ def _choose_expr(ht: Any, candidates: list[list[Any]]) -> Optional[Any]:
     return None
 
 
+def _collect_histogram_specs(
+    age_histograms: Optional[str],
+    ab_histograms: Optional[str],
+) -> list[tuple[str, list[str]]]:
+    """Parse CLI histogram args into a flat list of (field_name, ht_path) tuples."""
+    specs: list[tuple[str, list[str]]] = []
+    if age_histograms:
+        for callset in age_histograms.split(","):
+            callset = callset.strip().lower()
+            if callset in _AGE_HIST_SPECS:
+                specs.extend(_AGE_HIST_SPECS[callset])
+            elif callset:
+                logger.warning("Unknown --age-histograms value %r; valid: exome, genome, joint", callset)
+    if ab_histograms:
+        for callset in ab_histograms.split(","):
+            callset = callset.strip().lower()
+            if callset in _AB_HIST_SPECS:
+                specs.extend(_AB_HIST_SPECS[callset])
+            elif callset:
+                logger.warning("Unknown --allele-balance-histograms value %r; valid: exome, genome, joint", callset)
+    return specs
+
+
+def _format_bin_edge(v: float) -> str:
+    return f"{v:g}"
+
+
+def _histogram_col_names(col_prefix: str, field_name: str, bin_edges: list[float]) -> list[str]:
+    """Return ordered output column names for one histogram (n_smaller, bins, n_larger)."""
+    cols = [f"{col_prefix}.{field_name}.n_smaller"]
+    for i, (lo, hi) in enumerate(zip(bin_edges[:-1], bin_edges[1:]), 1):
+        cols.append(f"{col_prefix}.{field_name}.bin_{i}_{_format_bin_edge(lo)}_{_format_bin_edge(hi)}")
+    cols.append(f"{col_prefix}.{field_name}.n_larger")
+    return cols
+
+
+def _check_and_collect_bin_edges(
+    records: dict[str, GnomadRecord],
+    field_names: list[str],
+) -> dict[str, list[float]]:
+    """Scan records for first-seen bin edges per histogram field; raise on inconsistency."""
+    bin_edges_map: dict[str, list[float]] = {}
+    for key, rec in records.items():
+        for field_name in field_names:
+            hist = rec.histograms.get(field_name)
+            if hist is None:
+                continue
+            if field_name not in bin_edges_map:
+                bin_edges_map[field_name] = hist.bin_edges
+            elif hist.bin_edges != bin_edges_map[field_name]:
+                raise ValueError(
+                    f"Inconsistent bin edges for histogram '{field_name}' at key {key!r}: "
+                    f"expected {bin_edges_map[field_name]}, got {hist.bin_edges}"
+                )
+    return bin_edges_map
+
+
+def _extract_histogram(row: Any, field_name: str) -> Optional[HistogramData]:
+    """Extract one HistogramData from a Hail row object, or None if missing."""
+    bin_edges = getattr(row, f"{field_name}_bin_edges", None)
+    bin_freq = getattr(row, f"{field_name}_bin_freq", None)
+    if bin_edges is None or bin_freq is None:
+        return None
+    n_smaller = getattr(row, f"{field_name}_n_smaller", None)
+    n_larger = getattr(row, f"{field_name}_n_larger", None)
+    return HistogramData(
+        bin_edges=[float(e) for e in bin_edges],
+        bin_freq=[int(f) for f in bin_freq],
+        n_smaller=int(n_smaller) if n_smaller is not None else 0,
+        n_larger=int(n_larger) if n_larger is not None else 0,
+    )
+
+
+def _annotate_histogram_row(
+    keys: list[str],
+    records: dict[str, GnomadRecord],
+    col_prefix: str,
+    bin_edges_map: dict[str, list[float]],
+) -> dict[str, str]:
+    """Produce histogram output columns for one row given its lookup keys (pipe-aligned)."""
+    out: dict[str, str] = {}
+    for field_name, bin_edges in bin_edges_map.items():
+        col_names = _histogram_col_names(col_prefix, field_name, bin_edges)
+        per_col: dict[str, list[str]] = {c: [] for c in col_names}
+        n_smaller_col = f"{col_prefix}.{field_name}.n_smaller"
+        n_larger_col = f"{col_prefix}.{field_name}.n_larger"
+
+        for key in keys:
+            if not key:
+                for c in col_names:
+                    per_col[c].append("")
+                continue
+            rec = records.get(key)
+            hist = rec.histograms.get(field_name) if rec is not None else None
+            if hist is None:
+                for c in col_names:
+                    per_col[c].append("")
+                continue
+            per_col[n_smaller_col].append(str(hist.n_smaller))
+            for i, freq in enumerate(hist.bin_freq, 1):
+                lo = bin_edges[i - 1]
+                hi = bin_edges[i]
+                col = f"{col_prefix}.{field_name}.bin_{i}_{_format_bin_edge(lo)}_{_format_bin_edge(hi)}"
+                per_col[col].append(str(freq))
+            per_col[n_larger_col].append(str(hist.n_larger))
+
+        for c, values in per_col.items():
+            out[c] = "|".join(values)
+    return out
+
+
 def ensure_local_gnomad_ht(
     cache_dir: Path,
     *,
@@ -784,6 +1157,7 @@ def ensure_local_gnomad_ht(
     overwrite: bool = False,
     progress_every_seconds: int = 300,
     gene_symbols: Optional[set[str]] = None,
+    histogram_specs: Optional[list[tuple[str, list[str]]]] = None,
 ) -> Path:
     """Download and cache a local gnomAD Hail table.
 
@@ -852,6 +1226,21 @@ def ensure_local_gnomad_ht(
                     "--genes specified but vep.worst_csq_by_gene_canonical not found "
                     "in the source table; gene filter skipped"
                 )
+
+        # Coalesce to reduce the number of Spark tasks for the write.
+        # The gnomAD joint v4.1 HT has ~9,800 partitions; naive_coalesce groups
+        # adjacent partitions without a shuffle so the write + key_by sort work on
+        # far fewer tasks. This also speeds up the subsequent filter().collect()
+        # lookup proportionally. Override via GNOMAD_CACHE_PARTITIONS env var.
+        _target_partitions = int(os.environ.get("GNOMAD_CACHE_PARTITIONS", "200"))
+        _source_n = source_ht.n_partitions()
+        if _source_n > _target_partitions:
+            logger.info(
+                "Coalescing source table from %d to %d partitions before cache write",
+                _source_n,
+                _target_partitions,
+            )
+            source_ht = source_ht.naive_coalesce(_target_partitions)
 
         progress_logger.set_stage("preparing local cache projection")
 
@@ -959,6 +1348,30 @@ def ensure_local_gnomad_ht(
             vep_gene_symbols=vep_gene_symbols_expr if vep_gene_symbols_expr is not None else hl.str(""),
         )
 
+        if histogram_specs:
+            for hist_field, ht_path_parts in histogram_specs:
+                if _has_path(source_ht.row.dtype, ht_path_parts):
+                    hist_expr = _get_path(source_ht, ht_path_parts)
+                    defined = hl.is_defined(hist_expr)
+                    common_select[f"{hist_field}_bin_edges"] = hl.if_else(
+                        defined, hist_expr.bin_edges, hl.missing(hl.tarray(hl.tfloat64))
+                    )
+                    common_select[f"{hist_field}_bin_freq"] = hl.if_else(
+                        defined, hist_expr.bin_freq, hl.missing(hl.tarray(hl.tint64))
+                    )
+                    common_select[f"{hist_field}_n_smaller"] = hl.if_else(
+                        defined, hl.int64(hist_expr.n_smaller), hl.missing(hl.tint64)
+                    )
+                    common_select[f"{hist_field}_n_larger"] = hl.if_else(
+                        defined, hl.int64(hist_expr.n_larger), hl.missing(hl.tint64)
+                    )
+                else:
+                    logger.warning(
+                        "Histogram field %r not found in source table at path %s; skipping",
+                        hist_field,
+                        ".".join(str(p) for p in ht_path_parts),
+                    )
+
         caid_expr = _choose_expr(source_ht, [["caid"], ["CAID"]])
         if caid_expr is not None:
             # Case 1: source table has a caid field — build a caid-keyed local cache.
@@ -985,7 +1398,11 @@ def ensure_local_gnomad_ht(
                 + source_ht.alleles[1]
             )
             prepared = source_ht.select(gnomad_key=gnomad_key_expr, **common_select)
-            prepared = prepared.key_by(prepared.gnomad_key)
+            # key_by() with no arguments declares the table unkeyed, avoiding the
+            # sort/shuffle that key_by(gnomad_key) would require.  The sort index
+            # is never used — lookups do filter(literal.contains(gnomad_key)).collect()
+            # (a full scan), so the sort buys nothing and costs ~9,800 tasks.
+            prepared = prepared.key_by()
 
         logger.info("Writing local gnomAD cache table: %s", ht_path)
         progress_logger.set_stage("writing local cache table")
@@ -1039,6 +1456,7 @@ def load_gnomad_records_for_caids(
     cache_dir: Path,
     *,
     caid_to_gnomad_key: Optional[dict[str, str]] = None,
+    histogram_field_names: Optional[list[str]] = None,
 ) -> dict[str, GnomadRecord]:
     """Load gnomAD records for requested CAIDs from local Hail table.
 
@@ -1057,6 +1475,17 @@ def load_gnomad_records_for_caids(
     if not caids:
         return {}
 
+    redis_result = _gnomad_cache_get_many(list(caids))
+    redis_hits = {k: v for k, v in redis_result.items() if v is not None}
+    if redis_result:
+        logger.debug(
+            "gnomAD Redis cache: %d hits, %d known misses (of %d CAIDs)",
+            len(redis_hits), len(redis_result) - len(redis_hits), len(caids),
+        )
+    caids_to_fetch = caids - set(redis_result.keys())
+    if not caids_to_fetch:
+        return redis_hits
+
     hl = _import_hail()
     hail_tmp = cache_dir / "hail-tmp"
     hail_tmp.mkdir(parents=True, exist_ok=True)
@@ -1074,9 +1503,9 @@ def load_gnomad_records_for_caids(
             logger.info(
                 "gnomAD lookup strategy: caid-indexed local cache (case 1) — "
                 "filtering %d CAIDs directly",
-                len(caids),
+                len(caids_to_fetch),
             )
-            caid_literal = hl.literal(caids)
+            caid_literal = hl.literal(caids_to_fetch)
             key_expr = getattr(ht, key_field)
             filtered = ht.filter(caid_literal.contains(key_expr))
             rows = filtered.collect()
@@ -1086,21 +1515,21 @@ def load_gnomad_records_for_caids(
                 logger.info(
                     "gnomAD lookup strategy: pre-computed coordinate columns (case 2) — "
                     "resolved %d/%d CAIDs to gnomad_key",
-                    sum(1 for c in caids if c in caid_to_gnomad_key),
-                    len(caids),
+                    sum(1 for c in caids_to_fetch if c in caid_to_gnomad_key),
+                    len(caids_to_fetch),
                 )
-                resolved = {k: v for k, v in caid_to_gnomad_key.items() if k in caids}
+                resolved = {k: v for k, v in caid_to_gnomad_key.items() if k in caids_to_fetch}
             else:
                 logger.info(
                     "gnomAD lookup strategy: ClinGen Allele Registry API lookups (case 3) — "
                     "resolving %d CAIDs to GRCh38 coordinates",
-                    len(caids),
+                    len(caids_to_fetch),
                 )
                 from variant_annotation.lib.clingen import resolve_grch38_coordinates  # local import to keep Hail optional
 
                 coord_cache: dict[str, Optional[tuple[str, int, str, str]]] = {}
                 resolved = {}
-                for caid in caids:
+                for caid in caids_to_fetch:
                     coords = resolve_grch38_coordinates(caid, coord_cache)
                     if coords is not None:
                         chrom, pos, ref, alt = coords
@@ -1122,6 +1551,18 @@ def load_gnomad_records_for_caids(
     finally:
         hl.stop()
 
+    hist_fields = histogram_field_names or []
+    if hist_fields:
+        cached_fields = set(rows[0]._fields if rows and hasattr(rows[0], "_fields") else [])
+        missing = [f for f in hist_fields if f"{f}_bin_edges" not in cached_fields]
+        if missing and rows:
+            logger.warning(
+                "Histogram field(s) %s not found in gnomAD cache; "
+                "use --refresh-cache to rebuild with histogram support",
+                ", ".join(missing),
+            )
+            hist_fields = [f for f in hist_fields if f not in missing]
+
     out: dict[str, GnomadRecord] = {}
     for row in rows:
         if key_field == "caid":
@@ -1140,6 +1581,7 @@ def load_gnomad_records_for_caids(
         maf = min(af, 1.0 - af)
         faf95_max = float(row.faf95_max) if row.faf95_max is not None else None
         faf95_max_ancestry = str(row.faf95_max_ancestry or "")
+        histograms = {f: _extract_histogram(row, f) for f in hist_fields}
         out[caid] = GnomadRecord(
             caid=caid,
             allele_count=ac,
@@ -1152,7 +1594,13 @@ def load_gnomad_records_for_caids(
             exome_filters=str(getattr(row, "exome_filters", "") or ""),
             genome_filters=str(getattr(row, "genome_filters", "") or ""),
             gene_symbols=str(getattr(row, "vep_gene_symbols", "") or ""),
+            histograms=histograms,
         )
+    to_cache: dict[str, Optional[GnomadRecord]] = dict(out)
+    for miss_key in caids_to_fetch - set(out.keys()):
+        to_cache[miss_key] = None
+    _gnomad_cache_set_many(to_cache)
+    out.update(redis_hits)
     return out
 
 
@@ -1170,8 +1618,19 @@ def load_gnomad_records_for_caids_athena(
     if not caids:
         return {}
 
+    redis_result = _gnomad_cache_get_many(list(caids))
+    redis_hits = {k: v for k, v in redis_result.items() if v is not None}
+    if redis_result:
+        logger.debug(
+            "gnomAD Redis cache: %d hits, %d known misses (of %d CAIDs) (Athena)",
+            len(redis_hits), len(redis_result) - len(redis_hits), len(caids),
+        )
+    caids_to_fetch = caids - set(redis_result.keys())
+    if not caids_to_fetch:
+        return redis_hits
+
     rows = _load_athena_rows_for_caids(
-        sorted(caids),
+        sorted(caids_to_fetch),
         database=database,
         table=table,
         output_location=output_location,
@@ -1219,6 +1678,11 @@ def load_gnomad_records_for_caids_athena(
             faf95_max_ancestry=faf95_max_ancestry,
         )
 
+    to_cache: dict[str, Optional[GnomadRecord]] = dict(out)
+    for miss_key in caids_to_fetch - set(out.keys()):
+        to_cache[miss_key] = None
+    _gnomad_cache_set_many(to_cache)
+    out.update(redis_hits)
     return out
 
 
@@ -1248,9 +1712,20 @@ def load_gnomad_records_by_gnomad_keys_athena(
     if not gnomad_keys:
         return {}
 
+    redis_result = _gnomad_cache_get_many(list(gnomad_keys))
+    redis_hits = {k: v for k, v in redis_result.items() if v is not None}
+    if redis_result:
+        logger.debug(
+            "gnomAD Redis cache: %d hits, %d known misses (of %d coordinate keys) (Athena)",
+            len(redis_hits), len(redis_result) - len(redis_hits), len(gnomad_keys),
+        )
+    keys_to_fetch = gnomad_keys - set(redis_result.keys())
+    if not keys_to_fetch:
+        return redis_hits
+
     if query_strategy == "by-chromosome":
         rows = _load_athena_rows_for_coords_by_chrom(
-            sorted(gnomad_keys),
+            sorted(keys_to_fetch),
             database=database,
             table=table,
             output_location=output_location,
@@ -1261,10 +1736,10 @@ def load_gnomad_records_by_gnomad_keys_athena(
             max_allele_length=max_allele_length,
         )
         # Post-filter: keep only rows whose (contig, pos, ref, alt) match a requested key.
-        wanted_keys = gnomad_keys
+        wanted_keys = keys_to_fetch
     else:
         rows = _load_athena_rows_for_coords(
-            sorted(gnomad_keys),
+            sorted(keys_to_fetch),
             database=database,
             table=table,
             output_location=output_location,
@@ -1274,7 +1749,7 @@ def load_gnomad_records_by_gnomad_keys_athena(
             poll_seconds=poll_seconds,
             max_allele_length=max_allele_length,
         )
-        wanted_keys = gnomad_keys
+        wanted_keys = keys_to_fetch
 
     out: dict[str, GnomadRecord] = {}
     for row in rows:
@@ -1320,6 +1795,11 @@ def load_gnomad_records_by_gnomad_keys_athena(
             faf95_max_ancestry=faf95_max_ancestry,
         )
 
+    to_cache: dict[str, Optional[GnomadRecord]] = dict(out)
+    for miss_key in keys_to_fetch - set(out.keys()):
+        to_cache[miss_key] = None
+    _gnomad_cache_set_many(to_cache)
+    out.update(redis_hits)
     return out
 
 
@@ -1503,6 +1983,8 @@ def load_gnomad_records_by_gnomad_keys(
     local_ht_path: Path,
     gnomad_keys: set[str],
     cache_dir: Path,
+    *,
+    histogram_field_names: Optional[list[str]] = None,
 ) -> dict[str, GnomadRecord]:
     """Load gnomAD records keyed by ``"chrN:pos:ref:alt"`` from the local Hail table.
 
@@ -1513,6 +1995,17 @@ def load_gnomad_records_by_gnomad_keys(
     """
     if not gnomad_keys:
         return {}
+
+    redis_result = _gnomad_cache_get_many(list(gnomad_keys))
+    redis_hits = {k: v for k, v in redis_result.items() if v is not None}
+    if redis_result:
+        logger.debug(
+            "gnomAD Redis cache: %d hits, %d known misses (of %d coordinate keys)",
+            len(redis_hits), len(redis_result) - len(redis_hits), len(gnomad_keys),
+        )
+    keys_to_fetch = gnomad_keys - set(redis_result.keys())
+    if not keys_to_fetch:
+        return redis_hits
 
     hl = _import_hail()
     hail_tmp = cache_dir / "hail-tmp"
@@ -1525,12 +2018,24 @@ def load_gnomad_records_by_gnomad_keys(
         except Exception:
             key_field = "gnomad_key"
 
-        key_literal = hl.literal(gnomad_keys)
+        key_literal = hl.literal(keys_to_fetch)
+
+        hist_fields = histogram_field_names or []
 
         if key_field == "gnomad_key":
             key_expr = getattr(ht, key_field)
             filtered = ht.filter(key_literal.contains(key_expr))
             rows = filtered.collect()
+            if hist_fields and rows:
+                cached_fields = set(getattr(rows[0], "_fields", []))
+                missing = [f for f in hist_fields if f"{f}_bin_edges" not in cached_fields]
+                if missing:
+                    logger.warning(
+                        "Histogram field(s) %s not found in gnomAD cache; "
+                        "use --refresh-cache to rebuild with histogram support",
+                        ", ".join(missing),
+                    )
+                    hist_fields = [f for f in hist_fields if f not in missing]
             out: dict[str, GnomadRecord] = {}
             for row in rows:
                 gk = str(getattr(row, key_field))
@@ -1542,6 +2047,7 @@ def load_gnomad_records_by_gnomad_keys(
                 maf = min(af, 1.0 - af)
                 faf95_max = float(row.faf95_max) if row.faf95_max is not None else None
                 faf95_max_ancestry = str(row.faf95_max_ancestry or "")
+                histograms = {f: _extract_histogram(row, f) for f in hist_fields}
                 out[gk] = GnomadRecord(
                     caid=gk,
                     allele_count=ac,
@@ -1554,6 +2060,7 @@ def load_gnomad_records_by_gnomad_keys(
                     exome_filters=str(getattr(row, "exome_filters", "") or ""),
                     genome_filters=str(getattr(row, "genome_filters", "") or ""),
                     gene_symbols=str(getattr(row, "vep_gene_symbols", "") or ""),
+                    histograms=histograms,
                 )
         else:
             # Cache is caid-keyed; scan all rows and build gnomad_keys on the fly.
@@ -1592,6 +2099,11 @@ def load_gnomad_records_by_gnomad_keys(
     finally:
         hl.stop()
 
+    to_cache: dict[str, Optional[GnomadRecord]] = dict(out)
+    for miss_key in keys_to_fetch - set(out.keys()):
+        to_cache[miss_key] = None
+    _gnomad_cache_set_many(to_cache)
+    out.update(redis_hits)
     return out
 
 
@@ -1672,10 +2184,10 @@ def annotate_row_by_coords(
         an_values.append(str(rec.allele_number))
         faf95_values.append("" if rec.faf95_max is None else str(rec.faf95_max))
         faf95_anc_values.append(rec.faf95_max_ancestry)
-        filters_values.append(rec.filters)
-        exome_filters_values.append(rec.exome_filters)
-        genome_filters_values.append(rec.genome_filters)
-        gene_symbols_values.append(rec.gene_symbols)
+        filters_values.append(rec.filters.replace('|', '^'))
+        exome_filters_values.append(rec.exome_filters.replace('|', '^'))
+        genome_filters_values.append(rec.genome_filters.replace('|', '^'))
+        gene_symbols_values.append(rec.gene_symbols.replace('|', '^'))
 
     out[f"{col_prefix}.minor_allele_frequency"] = "|".join(minor_af_values)
     out[f"{col_prefix}.allele_frequency"] = "|".join(af_values)
@@ -1878,6 +2390,30 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "retained, significantly reducing cache size for targeted analyses."
         ),
     )
+    p.add_argument(
+        "--age-histograms",
+        default=None,
+        metavar="CALLSET[,CALLSET...]",
+        help=(
+            "Include age distribution histogram columns (Hail mode only).  "
+            "Comma-separated list of callsets: exome, genome, joint.  "
+            "Each callset adds het and hom columns "
+            "(e.g. --age-histograms exome,genome).  "
+            "Requires --refresh-cache if the local cache was built without this option."
+        ),
+    )
+    p.add_argument(
+        "--allele-balance-histograms",
+        default=None,
+        metavar="CALLSET[,CALLSET...]",
+        help=(
+            "Include allele balance histogram columns (Hail mode only).  "
+            "Comma-separated list of callsets: exome, genome, joint.  "
+            "Each callset adds adj and raw columns "
+            "(e.g. --allele-balance-histograms genome,joint).  "
+            "Requires --refresh-cache if the local cache was built without this option."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -1901,15 +2437,34 @@ def main(argv: Optional[list[str]] = None) -> None:
     gene_symbols: Optional[set[str]] = None
     if getattr(args, "genes", None):
         gene_symbols = {g.strip() for g in args.genes.split(",") if g.strip()}
+
+    histogram_specs = _collect_histogram_specs(
+        getattr(args, "age_histograms", None),
+        getattr(args, "allele_balance_histograms", None),
+    )
+    hist_field_names = [field_name for field_name, _ in histogram_specs]
+
+    if histogram_specs and args.execution_mode != "hail":
+        logger.warning("--age-histograms / --allele-balance-histograms are only supported in --execution-mode hail; ignoring")
+        histogram_specs = []
+        hist_field_names = []
+
     if args.execution_mode == "hail":
-        if gene_symbols and not args.refresh_cache:
+        if (gene_symbols or histogram_specs) and not args.refresh_cache:
             ht_path_check = _local_ht_path(cache_dir, args.gnomad_version)
             if ht_path_check.exists():
-                logger.warning(
-                    "--genes was specified but the gnomAD cache already exists at %s. "
-                    "Add --refresh-cache to rebuild it with the gene filter applied.",
-                    ht_path_check,
-                )
+                if gene_symbols:
+                    logger.warning(
+                        "--genes was specified but the gnomAD cache already exists at %s. "
+                        "Add --refresh-cache to rebuild it with the gene filter applied.",
+                        ht_path_check,
+                    )
+                if histogram_specs:
+                    logger.warning(
+                        "--age-histograms/--allele-balance-histograms specified but the gnomAD cache "
+                        "already exists at %s. Add --refresh-cache to rebuild with histogram fields.",
+                        ht_path_check,
+                    )
         local_ht = ensure_local_gnomad_ht(
             cache_dir,
             version=args.gnomad_version,
@@ -1917,6 +2472,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             overwrite=args.refresh_cache,
             progress_every_seconds=args.cache_progress_every_seconds,
             gene_symbols=gene_symbols,
+            histogram_specs=histogram_specs if histogram_specs else None,
         )
 
         if args.download_only:
@@ -2186,9 +2742,18 @@ def main(argv: Optional[list[str]] = None) -> None:
             "Coordinate lookup: loading gnomAD records for %d unique coordinate keys",
             len(gnomad_keys),
         )
-        records_by_key = load_gnomad_records_by_gnomad_keys(local_ht, gnomad_keys, cache_dir)
+        records_by_key = load_gnomad_records_by_gnomad_keys(
+            local_ht, gnomad_keys, cache_dir,
+            histogram_field_names=hist_field_names if hist_field_names else None,
+        )
         logger.info("Loaded %d gnomAD records", len(records_by_key))
         _validate_callset_pass_filter(records_by_key, args.callset_pass_filter)
+
+        bin_edges_map: dict[str, list[float]] = {}
+        if hist_field_names:
+            bin_edges_map = _check_and_collect_bin_edges(records_by_key, hist_field_names)
+            for hist_field, bin_edges in bin_edges_map.items():
+                ann_cols.extend(_histogram_col_names(prefix, hist_field, bin_edges))
 
         out_fieldnames = fieldnames + [c for c in ann_cols if c not in fieldnames]
         annotated = 0
@@ -2213,6 +2778,15 @@ def main(argv: Optional[list[str]] = None) -> None:
                     require_pass=args.require_pass,
                     callset_pass_filter=args.callset_pass_filter,
                 )
+                if bin_edges_map:
+                    keys = _row_gnomad_keys(
+                        row,
+                        args.coord_chromosome_col,
+                        args.coord_pos_col,
+                        args.coord_ref_col,
+                        args.coord_alt_col,
+                    )
+                    ann.update(_annotate_histogram_row(keys, records_by_key, prefix, bin_edges_map))
                 row.update(ann)
                 writer.writerow(row)
                 if ann[f"{prefix}.minor_allele_frequency"].replace("|", "").strip():
@@ -2253,6 +2827,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             caids,
             cache_dir,
             caid_to_gnomad_key=coord_mapping,
+            histogram_field_names=hist_field_names if hist_field_names else None,
         )
     else:
         athena_table = args.athena_table or _athena_table_name_from_version(args.gnomad_version)
@@ -2274,6 +2849,12 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     _validate_callset_pass_filter(records, args.callset_pass_filter)
 
+    bin_edges_map_caid: dict[str, list[float]] = {}
+    if hist_field_names:
+        bin_edges_map_caid = _check_and_collect_bin_edges(records, hist_field_names)
+        for hist_field, bin_edges in bin_edges_map_caid.items():
+            ann_cols.extend(_histogram_col_names(prefix, hist_field, bin_edges))
+
     out_fieldnames = fieldnames + [c for c in ann_cols if c not in fieldnames]
     annotated = 0
     with output_path.open("w", encoding="utf-8", newline="") as out_fh:
@@ -2281,6 +2862,9 @@ def main(argv: Optional[list[str]] = None) -> None:
         writer.writeheader()
         for row in rows:
             ann = annotate_row(row, records, prefix, args.dna_clingen_allele_id_col, require_pass=args.require_pass, callset_pass_filter=args.callset_pass_filter)
+            if bin_edges_map_caid:
+                keys = [_normalize_caid(c) for c in _split_pipe_preserve_positions((row.get(args.dna_clingen_allele_id_col) or "").strip())]
+                ann.update(_annotate_histogram_row(keys, records, prefix, bin_edges_map_caid))
             row.update(ann)
             writer.writerow(row)
             if ann[f"{prefix}.minor_allele_frequency"].replace("|", "").strip():

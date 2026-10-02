@@ -68,7 +68,7 @@ def test_map_variants_default_preserves_input_order(tmp_path, monkeypatch):
     ]
     _write_tsv(input_path, rows)
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
         per_row = []
         for orig_idx, _, raw_pro, _ in row_entries:
             per_row.append((orig_idx, f"NC_000001.11:g.{orig_idx + 100}A>G", None, None, None))
@@ -108,7 +108,7 @@ def test_map_variants_groups_mode_uses_contiguous_blocks(tmp_path, monkeypatch):
 
     calls = []
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
         calls.append((group_name, [orig_idx for orig_idx, *_ in row_entries]))
         per_row = []
         for orig_idx, *_ in row_entries:
@@ -150,7 +150,7 @@ def test_map_variants_retries_on_137_with_chunking(tmp_path, monkeypatch):
 
     calls = []
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
         calls.append((group_name, len(row_entries)))
         if "#retry" not in group_name:
             raise RuntimeError("BLAT process returned error code 137")
@@ -194,7 +194,7 @@ def test_map_variants_no_retry_when_137_retry_disabled(tmp_path, monkeypatch):
     ]
     _write_tsv(input_path, rows)
 
-    async def always_137(group_name, target_seq, row_entries, dcd):
+    async def always_137(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
         raise RuntimeError("BLAT process returned error code 137")
 
     monkeypatch.setattr(mv, "_try_import_dcd_mapping", lambda: object())
@@ -267,7 +267,7 @@ def test_map_variants_with_targets_file_populates_sequence(tmp_path, monkeypatch
 
     output_path = tmp_path / "out.tsv"
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
         assert target_seq == "SEQ_A", "target_sequence was not merged from targets file"
         return [(orig_idx, f"NC_000001.11:g.{orig_idx}A>G", None, None, None) for orig_idx, *_ in row_entries], "NM_000001.1", None
 
@@ -316,7 +316,7 @@ def test_map_variants_with_targets_file_extra_cols_in_output(tmp_path, monkeypat
 
     output_path = tmp_path / "out.tsv"
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
         return [(orig_idx, f"NC_000001.11:g.{orig_idx}A>G", None, None, None) for orig_idx, *_ in row_entries], "NM_000001.1", None
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
@@ -378,6 +378,7 @@ def test_map_variants_targets_file_unknown_name_logs_warning(tmp_path, monkeypat
     [
         ("NM_000001.1:c.123A>G", "", 1),
         ("ENST00000316054.9:c.1142G>A", "", 1),
+        ("NC_000023.11:g.41334227_41334230delinsC", "", 1),
         ("c.123A>G", "", 2),
         ("not_an_accession:c.123A>G", "", 2),
         ("", "p.Ala1Val", 3),
@@ -388,6 +389,21 @@ def test_map_variants_targets_file_unknown_name_logs_warning(tmp_path, monkeypat
 @pytest.mark.unit
 def test_detect_case_variants(raw_nt, raw_pro, expected):
     assert mv._detect_case(raw_nt, raw_pro) == expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "raw_nt,expected",
+    [
+        ("NC_000023.11:g.41334227_41334230delinsC", True),
+        ("NM_000001.1:c.123A>G", False),
+        ("NM_000001.1:n.123A>G", False),
+        ("not_an_accession:c.123A>G", False),
+        ("", False),
+    ],
+)
+def test_is_case1_genomic(raw_nt, expected):
+    assert mv._is_case1_genomic(raw_nt) is expected
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +494,7 @@ def test_map_variants_normalizes_raw_hgvs_pro_in_output(tmp_path, monkeypatch):
             {"variant_urn": "v0", "raw_hgvs_nt": "", "raw_hgvs_pro": "p.A300T", "target_sequence": "SEQ_A"}
         )
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
         return [(orig_idx, f"NC_000001.11:g.{orig_idx}A>G", None, None, None) for orig_idx, *_ in row_entries], "NM_1", None
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
@@ -518,7 +534,7 @@ def test_map_variants_normalize_hgvs_accepts_no_prefix_protein_and_nt(tmp_path, 
 
     seen_entries = []
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
         seen_entries.extend(row_entries)
         return [
             (orig_idx, f"NC_000001.11:g.{orig_idx + 1}A>G", None, None, None)
@@ -573,6 +589,158 @@ def test_extract_clingen_allele_id(data, expected):
     assert mv._extract_clingen_allele_id(data) == expected
 
 
+# ---------------------------------------------------------------------------
+# Identity-form HGVS reformatting (_reformat_identity_hgvs_as_delins,
+# _is_confirmed_identity_allele, _reformat_confirmed_identity_hgvs,
+# _extract_hgvs_ca)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_reformat_identity_hgvs_as_delins_single_base():
+    assert (
+        mv._reformat_identity_hgvs_as_delins("NC_000007.14:g.144548492G=")
+        == "NC_000007.14:g.144548492delinsG"
+    )
+
+
+@pytest.mark.unit
+def test_reformat_identity_hgvs_as_delins_multi_base():
+    assert (
+        mv._reformat_identity_hgvs_as_delins("NC_000007.14:g.144548593CCT=")
+        == "NC_000007.14:g.144548593_144548595delinsCCT"
+    )
+
+
+@pytest.mark.unit
+def test_reformat_identity_hgvs_as_delins_non_identity_returns_none():
+    # No embedded bases before "=" (an ordinary protein identity allele, for
+    # example) must not match.
+    assert mv._reformat_identity_hgvs_as_delins("NP_000518.1:p.Ser65=") is None
+
+
+@pytest.mark.parametrize(
+    "coordinates,expected",
+    [
+        ([{"referenceAllele": "G", "allele": "G", "start": 144548491, "end": 144548492}], True),
+        ([{"referenceAllele": "TG", "allele": "CC", "start": 144548592, "end": 144548594}], False),
+        ([{"referenceAllele": "G", "allele": None, "start": 1, "end": 2}], False),
+        ([], False),
+        (None, False),
+    ],
+)
+@pytest.mark.unit
+def test_is_confirmed_identity_allele(coordinates, expected):
+    assert mv._is_confirmed_identity_allele(coordinates) is expected
+
+
+@pytest.mark.unit
+def test_reformat_confirmed_identity_hgvs_explicit_both_sides():
+    assert (
+        mv._reformat_confirmed_identity_hgvs("NM_022445.4:c.612C=")
+        == "NM_022445.4:c.612delCinsC"
+    )
+
+
+def _genomic_allele(hgvs_list, ref_genome="GRCh38", coordinates=None):
+    return {
+        "referenceGenome": ref_genome,
+        "hgvs": hgvs_list,
+        "coordinates": coordinates or [],
+    }
+
+
+def _transcript_allele(hgvs_list, coordinates=None, protein_hgvs=None):
+    allele = {"hgvs": hgvs_list, "coordinates": coordinates or []}
+    if protein_hgvs is not None:
+        allele["proteinEffect"] = {"hgvs": protein_hgvs}
+    return allele
+
+
+@pytest.mark.unit
+def test_extract_hgvs_ca_confirmed_identity_reformats_both_g_and_c():
+    """A real ClinGen identity allele (genomic coordinates confirm ref==alt)
+    must be rewritten to an explicit delins for both hgvs_g and hgvs_c, e.g.
+    the TPK1 urn:mavedb:00001251-a-1#2 case from the live API."""
+    data = {
+        "genomicAlleles": [
+            _genomic_allele(
+                ["NC_000007.14:g.144548492G="],
+                coordinates=[
+                    {"referenceAllele": "G", "allele": "G", "start": 144548491, "end": 144548492}
+                ],
+            )
+        ],
+        "transcriptAlleles": [
+            _transcript_allele(
+                ["NM_022445.4:c.612C="],
+                protein_hgvs="NP_071890.2:p.Leu204=",
+            )
+        ],
+    }
+
+    hgvs_g, hgvs_c, hgvs_p = mv._extract_hgvs_ca(data, "NM_022445.4")
+
+    assert hgvs_g == "NC_000007.14:g.144548492delGinsG"
+    assert hgvs_c == "NM_022445.4:c.612delCinsC"
+    assert hgvs_p == "NP_071890.2:p.Leu204="
+
+
+@pytest.mark.unit
+def test_extract_hgvs_ca_unconfirmed_identity_left_unreformatted():
+    """A genuinely wrong dcd_mapping identity claim that ClinGen itself
+    rejected/never returned as identity (real regression case: TPK1
+    urn:mavedb:00001251-a-1#7778, a true His170_Arg171delinsGlnGly missense
+    variant) must never be reformatted into a fabricated identity allele --
+    the genomic coordinates here show a real substitution (TG -> CC), so
+    hgvs_g/hgvs_c pass through exactly as ClinGen returned them, "=" or not.
+    """
+    data = {
+        "genomicAlleles": [
+            _genomic_allele(
+                ["NC_000007.14:g.144548593_144548594delinsCC"],
+                coordinates=[
+                    {
+                        "referenceAllele": "TG",
+                        "allele": "CC",
+                        "start": 144548592,
+                        "end": 144548594,
+                    }
+                ],
+            )
+        ],
+        "transcriptAlleles": [
+            _transcript_allele(
+                ["NM_022445.4:c.510_511delinsGG"],
+                protein_hgvs="NP_071890.2:p.His170_Arg171delinsGlnGly",
+            )
+        ],
+    }
+
+    hgvs_g, hgvs_c, hgvs_p = mv._extract_hgvs_ca(data, "NM_022445.4")
+
+    assert hgvs_g == "NC_000007.14:g.144548593_144548594delinsCC"
+    assert hgvs_c == "NM_022445.4:c.510_511delinsGG"
+    assert hgvs_p == "NP_071890.2:p.His170_Arg171delinsGlnGly"
+
+
+@pytest.mark.unit
+def test_extract_hgvs_ca_no_genomic_allele_leaves_transcript_c_untouched():
+    """No genomic allele at all (so identity can't be confirmed either way)
+    must not touch a transcript-level "=" string, even if present."""
+    data = {
+        "genomicAlleles": [],
+        "transcriptAlleles": [
+            _transcript_allele(["NM_022445.4:c.612C="], protein_hgvs="NP_071890.2:p.Leu204=")
+        ],
+    }
+
+    hgvs_g, hgvs_c, hgvs_p = mv._extract_hgvs_ca(data, "NM_022445.4")
+
+    assert hgvs_g is None
+    assert hgvs_c == "NM_022445.4:c.612C="
+
+
 @pytest.mark.integration
 def test_map_variants_clingen_no_data_preserves_protein_hgvs(tmp_path, monkeypatch):
     """When ClinGen returns no data, the dcd_mapping p. result is kept in mapped_hgvs_p."""
@@ -590,7 +758,7 @@ def test_map_variants_clingen_no_data_preserves_protein_hgvs(tmp_path, monkeypat
             {"variant_urn": "v0", "raw_hgvs_nt": "", "raw_hgvs_pro": "p.Q2Ter", "target_sequence": "SEQ_A"}
         )
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
         return [(orig_idx, "NP_005624.2:p.Gln2Ter", None, None, None) for orig_idx, *_ in row_entries], "NM_005633.4", None
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
@@ -627,7 +795,7 @@ def test_map_variants_clingen_no_data_preserves_genomic_hgvs(tmp_path, monkeypat
 
     genomic = "NC_000002.12:g.12345A>T"
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
         return [(orig_idx, genomic, None, None, None) for orig_idx, *_ in row_entries], "NM_005633.4", None
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
@@ -674,7 +842,7 @@ def test_map_variants_routes_class1_class2_class3(tmp_path, monkeypatch):
     called_case1 = []
     pipeline_calls = []
 
-    def fake_case1(raw_hgvs_nt, dcd):
+    def fake_case1(raw_hgvs_nt, dcd, preferred_transcript_nm=None):
         called_case1.append(raw_hgvs_nt)
         return (
             "NM_000001.1:c.10A>G",
@@ -684,7 +852,7 @@ def test_map_variants_routes_class1_class2_class3(tmp_path, monkeypatch):
             "CA001",
         )
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
         pipeline_calls.append((group_name, target_seq, row_entries))
         per_row = []
         for orig_idx, hgvs_nt, hgvs_pro, case in row_entries:
@@ -834,3 +1002,172 @@ def test_process_case1_batch_reports_invalid_and_missing_clingen(monkeypatch):
 
     assert "Expected 'accession:variant' format" in (results[0][3] or "")
     assert "ClinGen returned no data" in (results[1][3] or "")
+
+
+@pytest.mark.unit
+def test_process_case1_genomic_falls_back_to_mane_transcript(monkeypatch):
+    """A genomic raw_hgvs_nt must not be used as its own transcript selector.
+
+    Passing the genomic accession itself into ``_extract_hgvs_from_clingen``
+    would never match a transcript allele, silently leaving mapped_hgvs_c as
+    the raw genomic string and mapped_hgvs_p unset. The fix requires passing
+    None (MANE fallback) instead when no preferred transcript is given.
+    """
+    seen_transcript_accessions = []
+
+    def fake_extract(data, transcript_accession):
+        seen_transcript_accessions.append(transcript_accession)
+        if transcript_accession is None:
+            return "NC_000023.11:g.100_103delinsC", "NM_001356.5:c.-25_-23del", "NP_001347.3:p.="
+        return None, None, None
+
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs", lambda hgvs: {"hgvs": hgvs})
+    monkeypatch.setattr(mv, "_extract_hgvs_from_clingen", fake_extract)
+    monkeypatch.setattr(mv, "_extract_clingen_allele_id", lambda data: "CA001")
+
+    raw = "NC_000023.11:g.100_103delinsC"
+    hgvs_c, hgvs_g, hgvs_p, error, allele_id = mv._process_case1(raw, dcd=None)
+
+    assert seen_transcript_accessions == [None]
+    assert hgvs_c == "NM_001356.5:c.-25_-23del"
+    assert hgvs_p == "NP_001347.3:p.="
+    assert error is None
+    assert allele_id == "CA001"
+
+
+@pytest.mark.unit
+def test_process_case1_genomic_honors_preferred_transcript(monkeypatch):
+    seen_transcript_accessions = []
+
+    def fake_extract(data, transcript_accession):
+        seen_transcript_accessions.append(transcript_accession)
+        return "NC_000023.11:g.100_103delinsC", f"{transcript_accession}:c.1A>G", "NP_1:p.Ala1Val"
+
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs", lambda hgvs: {"hgvs": hgvs})
+    monkeypatch.setattr(mv, "_extract_hgvs_from_clingen", fake_extract)
+    monkeypatch.setattr(mv, "_extract_clingen_allele_id", lambda data: "CA002")
+
+    raw = "NC_000023.11:g.100_103delinsC"
+    hgvs_c, hgvs_g, hgvs_p, error, allele_id = mv._process_case1(
+        raw, dcd=None, preferred_transcript_nm="NM_001356.5"
+    )
+
+    assert seen_transcript_accessions == ["NM_001356.5"]
+    assert hgvs_c == "NM_001356.5:c.1A>G"
+
+
+@pytest.mark.unit
+def test_process_case1_transcript_referenced_ignores_preferred_transcript(monkeypatch):
+    """Non-genomic case-1 rows must keep using their own accession, unaffected
+    by preferred_transcript_nm (that override only applies to genomic rows)."""
+    seen_transcript_accessions = []
+
+    def fake_extract(data, transcript_accession):
+        seen_transcript_accessions.append(transcript_accession)
+        return None, f"{transcript_accession}:c.10A>G", "NP_1:p.Lys4Arg"
+
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs", lambda hgvs: {"hgvs": hgvs})
+    monkeypatch.setattr(mv, "_extract_hgvs_from_clingen", fake_extract)
+    monkeypatch.setattr(mv, "_extract_clingen_allele_id", lambda data: "CA003")
+
+    raw = "NM_000001.1:c.10A>G"
+    hgvs_c, hgvs_g, hgvs_p, error, allele_id = mv._process_case1(
+        raw, dcd=None, preferred_transcript_nm="NM_999999.9"
+    )
+
+    assert seen_transcript_accessions == ["NM_000001.1"]
+    assert hgvs_c == "NM_000001.1:c.10A>G"
+
+
+@pytest.mark.unit
+def test_process_case1_batch_genomic_and_transcript_rows_select_correct_accession(monkeypatch):
+    seen_transcript_accessions = []
+
+    async def fake_query_batch(assays, max_concurrency=5):
+        return {assay: {"assay": assay} for assay in assays}
+
+    def fake_extract(data, transcript_accession):
+        seen_transcript_accessions.append(transcript_accession)
+        hgvs_c = f"{transcript_accession}:c.1A>G" if transcript_accession else None
+        return data["assay"], hgvs_c, None
+
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs_batch", fake_query_batch)
+    monkeypatch.setattr(mv, "_extract_hgvs_from_clingen", fake_extract)
+    monkeypatch.setattr(mv, "_extract_clingen_allele_id", lambda data: None)
+
+    raws = [
+        "NC_000023.11:g.100_103delinsC",  # genomic, explicit preferred transcript
+        "NM_000001.1:c.10A>G",  # transcript-referenced, self accession
+        "NC_000001.11:g.200A>T",  # genomic, no preferred transcript -> MANE (None)
+    ]
+    preferred = ["NM_001356.5", None, None]
+
+    results = mv._process_case1_batch(raws, dcd=None, max_concurrency=3, preferred_transcript_nms=preferred)
+
+    assert seen_transcript_accessions == ["NM_001356.5", "NM_000001.1", None]
+    assert results[0][0] == "NM_001356.5:c.1A>G"
+    assert results[1][0] == "NM_000001.1:c.1A>G"
+    # MANE fallback found nothing in this fake, so it degrades to the raw genomic string.
+    assert results[2][0] == raws[2]
+
+
+@pytest.mark.unit
+def test_map_variants_case1_genomic_rows_honor_preferred_transcript_col(tmp_path, monkeypatch):
+    input_path = tmp_path / "in.tsv"
+    output_path = tmp_path / "out.tsv"
+
+    rows = [
+        {
+            "variant_urn": "v1",
+            "raw_hgvs_nt": "NC_000001.11:g.100A>G",
+            "raw_hgvs_pro": "",
+            "target_sequence": "",
+            "preferred_transcript": "NM_AAA.1",
+        },
+        {
+            "variant_urn": "v2",
+            "raw_hgvs_nt": "NC_000001.11:g.200A>T",
+            "raw_hgvs_pro": "",
+            "target_sequence": "",
+            "preferred_transcript": "NM_BBB.1",
+        },
+    ]
+    with open(input_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=["variant_urn", "raw_hgvs_nt", "raw_hgvs_pro", "target_sequence", "preferred_transcript"],
+            delimiter="\t",
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    seen_transcript_accessions = []
+
+    def fake_extract(data, transcript_accession):
+        seen_transcript_accessions.append(transcript_accession)
+        hgvs_p = transcript_accession.replace("NM_", "NP_") + ":p.Ala1Val"
+        return data["assay"], f"{transcript_accession}:c.1A>G", hgvs_p
+
+    async def fake_query_batch(assays, max_concurrency=5):
+        return {assay: {"assay": assay} for assay in assays}
+
+    monkeypatch.setattr(
+        mv, "_try_import_dcd_mapping", lambda: {"fetch_clingen_genomic_hgvs": lambda raw: raw}
+    )
+    monkeypatch.setattr(mv, "_query_clingen_by_hgvs_batch", fake_query_batch)
+    monkeypatch.setattr(mv, "_extract_hgvs_from_clingen", fake_extract)
+    monkeypatch.setattr(mv, "_extract_clingen_allele_id", lambda data: None)
+
+    mv.map_variants(
+        str(input_path),
+        str(output_path),
+        preferred_transcript_col="preferred_transcript",
+    )
+
+    assert seen_transcript_accessions == ["NM_AAA.1", "NM_BBB.1"]
+
+    out_rows = _read_tsv(output_path)
+    assert out_rows[0]["mapped_hgvs_c"] == "NM_AAA.1:c.1A>G"
+    assert out_rows[1]["mapped_hgvs_c"] == "NM_BBB.1:c.1A>G"
+    assert out_rows[0]["mapped_hgvs_c"] != out_rows[0]["raw_hgvs_nt"]
+    assert out_rows[0]["mapped_hgvs_p"] == "NP_AAA.1:p.Ala1Val"

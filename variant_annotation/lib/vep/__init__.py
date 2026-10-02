@@ -43,7 +43,7 @@ from .types import (
 #:
 #: Not tied to the package version: a packaging or CLI change must not invalidate stored answers, and a
 #: resolution-rule change must invalidate them even in a patch release.
-RESOLVER_VERSION = "1"
+RESOLVER_VERSION = "2"
 
 __all__ = [
     "NO_CHANGE_TERM",

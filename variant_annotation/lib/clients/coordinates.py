@@ -18,6 +18,12 @@ class HgvsMapper:
             assembly_name=assembly,
             alt_aln_method="splign",
         )
+        self._literal_mapper = hgvs.assemblymapper.AssemblyMapper(
+            hdp,
+            assembly_name=assembly,
+            alt_aln_method="splign",
+            normalize=False,
+        )
 
     @classmethod
     def from_url(cls, uta_url: str, *, assembly: str = "GRCh38") -> "HgvsMapper":
@@ -37,3 +43,7 @@ class HgvsMapper:
     def c_to_g(self, c_hgvs: str) -> str:
         var = self._parser.parse(c_hgvs)
         return str(self._mapper.c_to_g(var))
+
+    def c_to_g_literal(self, c_hgvs: str) -> str:
+        var = self._parser.parse(c_hgvs)
+        return str(self._literal_mapper.c_to_g(var))

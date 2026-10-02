@@ -136,6 +136,10 @@ def resolve_entry(vep_input: VepInput, entry: Mapping[str, Any]) -> ConsequenceR
     2. Otherwise fall back to the top-level ``most_severe_consequence``, source ``MOST_SEVERE``.
     3. With neither, the outcome is ``ABSENT`` — VEP answered and had nothing for this input.
 
+    An entry carrying VEP's per-variant ``error`` field (an input VEP parsed but rejected, such as an
+    insertion whose coordinates fall outside the transcript) resolves to ``ERRORED`` before any of the
+    above: VEP reported a failure, not a confirmed empty, so it must not be stored as a negative.
+
     A matched transcript entry carrying an empty ``consequence_terms`` falls through to step 2 rather
     than resolving to ``ABSENT``: the match proves the transcript is in VEP's set, so an empty term list
     is a gap in that entry, not a statement that the variant has no consequence anywhere.
@@ -145,6 +149,14 @@ def resolve_entry(vep_input: VepInput, entry: Mapping[str, Any]) -> ConsequenceR
     carried two versions of the same transcript, taking the first is deterministic given VEP's stable
     response order.
     """
+    vep_error = entry.get("error")
+    if vep_error:
+        return ConsequenceResolution(
+            input=vep_input,
+            outcome=ConsequenceOutcome.ERRORED,
+            error=_truncate_error(f"VEP rejected the input: {vep_error}"),
+        )
+
     wanted = requested_transcript(vep_input)
 
     if wanted:
@@ -305,7 +317,10 @@ def resolve_consequences(
 
     An input whose request failed is reported ``ERRORED`` and is never recoded: the answer is unknown,
     so spending a Recoder round trip on it would be attributing a fallback to a question that was never
-    asked. Callers must retry those rather than storing the outcome.
+    asked. Callers must retry those rather than storing the outcome. An input VEP itself rejected (its
+    entry carries ``error``) is likewise ``ERRORED`` and not recoded, but still gets the step-3 check: a
+    reference-identical ``delins`` is a typical thing for VEP to reject, and its answer does not depend
+    on VEP.
 
     ``reference`` is consulted only for inputs that reached step 3, so the no-change check costs nothing
     for the overwhelming majority of inputs that VEP resolves normally.
@@ -322,6 +337,7 @@ def resolve_consequences(
 
     resolutions: dict[int, ConsequenceResolution] = {}
     unanswered: list[tuple[int, VepInput]] = []
+    rejected: list[tuple[int, ConsequenceResolution]] = []
 
     for index, vep_input in enumerate(inputs):
         key = (vep_input.hgvs, needs_refseq_transcripts(vep_input))
@@ -330,6 +346,9 @@ def resolve_consequences(
             resolution = resolve_entry(vep_input, entry)
             if resolution.outcome is ConsequenceOutcome.RESOLVED:
                 resolutions[index] = resolution
+                continue
+            if resolution.outcome is ConsequenceOutcome.ERRORED:
+                rejected.append((index, resolution))
                 continue
             # VEP answered but classified nothing: still a miss worth recoding.
             unanswered.append((index, vep_input))
@@ -352,6 +371,12 @@ def resolve_consequences(
             resolutions[index] = reference_identical_resolution(vep_input)
         else:
             resolutions[index] = ConsequenceResolution(input=vep_input, outcome=ConsequenceOutcome.ABSENT)
+
+    for index, resolution in rejected:
+        if reference is not None and _is_reference_identical(resolution.input, reference):
+            resolutions[index] = reference_identical_resolution(resolution.input)
+        else:
+            resolutions[index] = resolution
 
     return [resolutions[index] for index in range(len(inputs))]
 

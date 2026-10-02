@@ -274,6 +274,17 @@ def test_a_vep_entry_with_no_consequence_is_still_recoded():
     assert results[0].most_severe_consequence == "intron_variant"
 
 
+def test_an_input_vep_rejected_is_errored_and_never_recoded():
+    recoder = StubRecoder({"NM_1.1:c.1_2insA": ["NC_1:g.5_6insA"]})
+    vep = StubVep({"NM_1.1:c.1_2insA": {"error": "Start must be <= end+1"}})
+
+    results = resolve_consequences([VepInput("NM_1.1:c.1_2insA")], vep=vep, recoder=recoder)
+
+    assert recoder.calls == []
+    assert results[0].outcome is ConsequenceOutcome.ERRORED
+    assert "Start must be" in results[0].error
+
+
 def test_the_recoder_call_is_batched_by_batch_size():
     """The Recoder POST is chunked like VEP, so a large miss set cannot exceed Ensembl's per-POST limit."""
     recoder = StubRecoder(
@@ -385,6 +396,17 @@ def test_an_errored_input_is_not_relabelled_as_no_change():
     results = resolve_consequences([VepInput("NM_1.1:c.12_14delinsGCT")], vep=vep, reference=reference)
 
     assert results[0].outcome is ConsequenceOutcome.ERRORED
+
+
+def test_a_reference_identical_input_vep_rejected_is_labelled_no_change():
+    """Unlike a failed request, a rejection is an answer from VEP, and no-change does not depend on VEP."""
+    vep = StubVep({"NM_1.1:c.12_14delinsGCT": {"error": "Reference allele matches alternate"}})
+    reference = StubReference({("NM_1.1", 12, 14): "GCT"})
+
+    results = resolve_consequences([VepInput("NM_1.1:c.12_14delinsGCT")], vep=vep, reference=reference)
+
+    assert results[0].most_severe_consequence == NO_CHANGE_TERM
+    assert results[0].source is ConsequenceSource.REFERENCE_IDENTICAL
 
 
 def test_concurrent_batches_produce_the_same_answers_as_serial_ones():

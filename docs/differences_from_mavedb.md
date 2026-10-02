@@ -23,7 +23,22 @@ This is the most significant semantic difference.
 
 **MaveDB:** One transcript accession is determined per *score set*, not per row. `get_target_coding_info()` checks the score set's `target_accession` (for accession-based targets) or the `cdna.sequence_accessions` field in `post_mapped_metadata` (for sequence-based targets). All variants in the score set use that single accession when extracting `hgvs_c` from ClinGen. If `post_mapped_metadata` contains more than one cDNA accession, the job raises `ValueError`. Multi-target score sets are explicitly not supported (`NotImplementedError`) — `populate_hgvs_for_score_set` skips them entirely.
 
-**This pipeline:** The transcript accession is extracted per row from `raw_hgvs_nt` (e.g. `NM_000277.3` from `NM_000277.3:c.1218G>A`). Different rows may use different transcripts. Multi-target inputs (multiple gene groups with different sequences/accessions) are naturally supported.
+**This pipeline:** The transcript accession is extracted per row from `raw_hgvs_nt` (e.g. `NM_000277.3` from `NM_000277.3:c.1218G>A`). Different rows may use different transcripts. Multi-target inputs (multiple gene groups with different sequences/accessions) are naturally supported. This self-referencing extraction only works when `raw_hgvs_nt` is itself transcript-referenced; when it is a fully-qualified genomic HGVS (`NC_...:g...`), there is no transcript accession to extract, so the mapper instead uses ClinGen's MANE-designated transcript, or `--preferred-transcript`/`--preferred-transcript-col` if supplied — see [map_variants.md — Genomic case-1 rows](map_variants.md#genomic-case-1-rows).
+
+#### Preferred-transcript overrides (this pipeline only)
+
+Automatic transcript selection can fail when the local UTA database and the bundled MANE summary file record different NM_ versions for the same gene (e.g. UTA has `NM_007194.3` but the MANE table has `NM_007194.4`). Because the MANE filter uses exact version matching, the mismatch causes it to fall through to a longest-transcript fallback that may select a different isoform and therefore a wrong NP_ protein reference.
+
+MaveDB has no mechanism to override transcript selection at run time. In the worker model, the transcript accession is determined from fields already stored in the database (`target_accession` or `cdna.sequence_accessions` in `post_mapped_metadata`); a bad automatic selection would require re-running the full mapping job with a corrected database.
+
+This pipeline adds two override options for sequence-based groups (and, per row, for genomic case-1 rows — see above):
+
+- **`--preferred-transcript NM_ACCESSION`** — applies a single NM_ accession to all sequence-based groups in the run (or to every genomic case-1 row, if no column override is given).
+- **`--preferred-transcript-col COLUMN`** — reads the preferred NM_ from a column in the input file, allowing different groups (or, for genomic case-1 rows, different rows) to specify different transcripts. Blank values fall back to `--preferred-transcript` (if set) or automatic selection.
+
+When an override is supplied, the mapper skips `select_transcripts` (steps 3–5 of the automatic pipeline) and resolves the NP_ protein accession by checking the MANE table first, then UTA. This means a MANE-listed accession such as `NM_007194.4` resolves correctly even if UTA only has `NM_007194.3`. BLAT alignment is still performed (it is required for VRS coordinate mapping). If the accession cannot be resolved in either source, automatic selection is used and a warning is emitted.
+
+See [map_variants.md — Transcript selection](map_variants.md#transcript-selection) for the full algorithm description and known pitfalls.
 
 ### VRS metadata persisted
 
@@ -48,6 +63,16 @@ This is the most significant semantic difference.
 **MaveDB:** No special handling in the mapping or HGVS population jobs. Intra-codon c.-haplotypes (e.g. `c.[1A>G;3G>T]`) would be passed as-is to dcd_mapping.
 
 **This pipeline:** Intra-codon c.-haplotypes are detected and normalized to a `delins` expression (e.g. `c.1_3delinsGA`) before VRS mapping. The normalization is attempted only when all component substitutions fall within the same codon.
+
+### VRS identity alleles (no-change variants)
+
+**MaveDB:** No special handling. If dcd_mapping returns a non-standard identity expression (e.g. `NC_000007.14:g.144548593CCT=`) for a variant that is identical to the reference sequence, it is stored as-is in the `hgvs_assay_level` field of `MappedVariant`. The separate `populate_hgvs_for_score_set` job then queries ClinGen by allele ID rather than by HGVS string; an identity expression that ClinGen rejected would simply leave the variant with no allele ID and no populated HGVS columns — effectively silently dropped.
+
+MaveDB does not perform reverse translation, so it does not encounter no-change variants generated from single-codon amino acids.
+
+**This pipeline:** Any assay-level HGVS ending in `=` is detected and reformatted as a `delins` where the inserted sequence equals the deleted reference (e.g. `NC_000007.14:g.144548593_144548595delinsCCT`). This produces valid HGVS for `mapped_hgvs_g`. ClinGen is queried with the reformatted string but has no record for reference alleles, so `mapped_hgvs_c` and `mapped_hgvs_p` will be empty and `mapping_error` will contain `ClinGen returned no data`. No-change variants arise intentionally when `reverse_translate_protein_variants` is run with `--wt-codon-mode unambiguous` (always for Met and Trp, which have only one codon) or `--wt-codon-mode all`.
+
+See [map_variants.md — No-change alleles](map_variants.md#no-change-alleles) for full details.
 
 ### Protein HGVS normalization
 
@@ -137,7 +162,7 @@ Hail mode supports `--genes BRCA1,BRCA2` to restrict the local cache to specific
 
 **MaveDB:** ClinGen Evidence Repository annotation has not been implemented in MaveDB.
 
-**This pipeline:** `annotate_erepo` downloads the full ClinGen erepo expert-panel classification TSV and joins it against each variant candidate using up to three keys: HGVS expression, ClinVar Variation ID, and CAID. Sixteen classification columns are added per candidate (prefixed `clingen_evidence_repository.`), including `Assertion`, `Expert Panel`, `Disease Mondo Id`, `Mode of Inheritance`, applied ACMG evidence codes, and supporting metadata. A `warnings` column records cross-key discrepancies.
+**This pipeline:** `annotate_erepo` downloads the full ClinGen erepo expert-panel classification TSV and joins it against each variant candidate using up to three keys: HGVS expression, ClinVar Variation ID, and CAID. Seventeen classification columns are added per candidate (prefixed `clingen_evidence_repository.`), including `Assertion`, `Expert Panel`, `Disease`, `Mondo Id`, `Mode of Inheritance`, applied ACMG evidence codes, and supporting metadata. A `warnings` column records cross-key discrepancies.
 
 ---
 

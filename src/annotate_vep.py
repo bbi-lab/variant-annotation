@@ -18,6 +18,13 @@ matched transcript when ``source == "transcript"``, or just the single term when
 ``most_severe_consequence`` was used. ``vep.most_severe_mutational_consequence`` always contains the
 single most-severe term, or is empty when no consequence was determined.
 
+Sibling fill-in
+~~~~~~~~~~~~~~~
+Candidates in one row are alternative spellings of the same variant, so a candidate VEP returned
+nothing for (an error or a silent miss) takes the most common ``(consequences, most_severe)`` pair
+among its resolved siblings, ties broken alphabetically. Its source and access date come from that
+sibling; its ``vep.error`` value is kept so the fill stays visible.
+
 Transcript selection
 --------------------
 Ensembl VEP annotates every transcript that overlaps a variant's genomic position, not just the
@@ -77,10 +84,11 @@ import json
 import logging
 import os
 import sys
+from collections import Counter
 from datetime import date
 from itertools import islice
 from pathlib import Path
-from typing import Any, Optional, TextIO
+from typing import Any, Mapping, Optional, TextIO
 
 from variant_annotation.lib.clients.ensembl import (
     ENSEMBL_API_URL_DEFAULT,
@@ -245,12 +253,14 @@ def _resolution_to_cache_value(resolution: ConsequenceResolution) -> Optional[st
         return None
     if resolution.outcome is ConsequenceOutcome.ABSENT:
         return _VEP_MISS_SENTINEL
-    return json.dumps({
-        "c": resolution.most_severe_consequence,
-        "cs": resolution.consequence_terms,
-        "s": resolution.source.value if resolution.source else None,
-        "t": resolution.matched_transcript,
-    })
+    return json.dumps(
+        {
+            "c": resolution.most_severe_consequence,
+            "cs": resolution.consequence_terms,
+            "s": resolution.source.value if resolution.source else None,
+            "t": resolution.matched_transcript,
+        }
+    )
 
 
 def _cache_value_to_resolution(vep_input: VepInput, value: str) -> Optional[ConsequenceResolution]:
@@ -311,6 +321,67 @@ def _vep_cache_set_many(resolutions: list[ConsequenceResolution], ensembl_releas
 
 
 # ---------------------------------------------------------------------------
+# File-based consequence cache
+# ---------------------------------------------------------------------------
+
+#: Source label written by versions of this script that predate the library.
+_LEGACY_NO_CHANGE_SOURCE = "no_change"
+
+
+def _parse_cached_source(value: str) -> Optional[ConsequenceSource]:
+    if value == _LEGACY_NO_CHANGE_SOURCE:
+        return ConsequenceSource.REFERENCE_IDENTICAL
+    try:
+        return ConsequenceSource(value)
+    except ValueError:
+        return None
+
+
+def _load_vep_file_cache(path: str, col_prefix: str) -> tuple[dict[str, ConsequenceResolution], dict[str, str]]:
+    """Load a TSV of pre-computed consequences as ``(resolutions, access_dates)``, both keyed by HGVS.
+
+    Expects an ``hgvs`` column plus the ``{col_prefix}.*`` columns this script writes, one HGVS per
+    row. A row with an error and no consequence loads as ``ERRORED``; one with neither loads as
+    ``ABSENT``. File entries take precedence over Redis and VEP, so they are never re-queried.
+    """
+    resolutions: dict[str, ConsequenceResolution] = {}
+    access_dates: dict[str, str] = {}
+    p = col_prefix
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        for row in reader:
+            hgvs = (row.get("hgvs") or "").strip()
+            if not hgvs:
+                continue
+            vep_input = VepInput(hgvs=hgvs)
+            most_severe = (row.get(f"{p}.most_severe_mutational_consequence") or "").strip()
+            terms = [t.strip() for t in (row.get(f"{p}.mutational_consequences") or "").split("^") if t.strip()]
+            error = (row.get(f"{p}.error") or "").strip()
+
+            if most_severe:
+                resolutions[hgvs] = ConsequenceResolution(
+                    input=vep_input,
+                    outcome=ConsequenceOutcome.RESOLVED,
+                    consequence_terms=terms or [most_severe],
+                    most_severe_consequence=most_severe,
+                    source=_parse_cached_source((row.get(f"{p}.consequence_source") or "").strip()),
+                )
+            elif error:
+                resolutions[hgvs] = ConsequenceResolution(
+                    input=vep_input, outcome=ConsequenceOutcome.ERRORED, error=error
+                )
+            else:
+                resolutions[hgvs] = ConsequenceResolution(input=vep_input, outcome=ConsequenceOutcome.ABSENT)
+
+            access_date = (row.get(f"{p}.access_date") or "").strip()
+            if access_date:
+                access_dates[hgvs] = access_date
+
+    logger.info("Loaded %d VEP file-cache entries from %s", len(resolutions), path)
+    return resolutions, access_dates
+
+
+# ---------------------------------------------------------------------------
 # Row annotation
 # ---------------------------------------------------------------------------
 
@@ -331,11 +402,14 @@ def annotate_row(
     col_prefix: str,
     hgvs_cols: list[str],
     access_date: str,
+    access_dates: Optional[Mapping[str, str]] = None,
 ) -> dict[str, str]:
     """Build the annotation columns for one row from already-resolved consequences.
 
     Output columns are pipe-delimited and position-aligned to the row's HGVS candidates, so a blank
-    candidate yields a blank in every column rather than shifting the alignment.
+    candidate yields a blank in every column rather than shifting the alignment. ``access_dates``
+    overrides ``access_date`` per HGVS, for answers loaded from a file cache. Candidates left without a
+    consequence are filled from their siblings (see the module docstring).
     """
     consequences_col = f"{col_prefix}.mutational_consequences"
     most_severe_col = f"{col_prefix}.most_severe_mutational_consequence"
@@ -372,7 +446,7 @@ def annotate_row(
         resolution = resolutions.get(hgvs)
         # Every non-blank candidate was submitted for resolution, so a lookup was attempted and the
         # access date applies even when the answer is empty or unknown.
-        columns[access_col].append(access_date)
+        columns[access_col].append((access_dates or {}).get(hgvs) or access_date)
 
         if resolution is None or resolution.outcome is ConsequenceOutcome.ABSENT:
             columns[consequences_col].append("")
@@ -393,7 +467,37 @@ def annotate_row(
         columns[source_col].append(resolution.source.value if resolution.source else "")
         columns[error_col].append("")
 
+    _fill_from_siblings(
+        candidates,
+        consequences=columns[consequences_col],
+        most_severe=columns[most_severe_col],
+        access=columns[access_col],
+        source=columns[source_col],
+    )
     return {column: "|".join(values) for column, values in columns.items()}
+
+
+def _fill_from_siblings(
+    candidates: list[str],
+    *,
+    consequences: list[str],
+    most_severe: list[str],
+    access: list[str],
+    source: list[str],
+) -> None:
+    """Fill unresolved candidate slots in place from the most common resolved sibling."""
+    unresolved = [i for i, hgvs in enumerate(candidates) if hgvs and not most_severe[i]]
+    resolved = [i for i in range(len(candidates)) if most_severe[i]]
+    if not unresolved or not resolved:
+        return
+
+    counts = Counter((consequences[i], most_severe[i]) for i in resolved)
+    chosen = min(counts, key=lambda pair: (-counts[pair], pair))
+    donor = next(i for i in resolved if (consequences[i], most_severe[i]) == chosen)
+    for i in unresolved:
+        consequences[i], most_severe[i] = chosen
+        access[i] = access[donor]
+        source[i] = source[donor]
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +585,15 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         default=csv.field_size_limit(),
         metavar="BYTES",
         help="Maximum per-field character length for CSV/TSV parsing (default: %(default)s).",
+    )
+    p.add_argument(
+        "--vep-file-cache",
+        default=None,
+        metavar="FILE",
+        help=(
+            "TSV of pre-computed consequences: an 'hgvs' column plus this script's namespaced output "
+            "columns, one HGVS per row. Entries take precedence over Redis and the VEP API."
+        ),
     )
     p.add_argument(
         "--keep-existing",
@@ -595,6 +708,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     # Resolutions accumulate across row batches: the same HGVS recurs constantly in reverse-translated
     # data, and one answer per distinct string is enough for the whole run.
     resolutions: dict[str, ConsequenceResolution] = {}
+    access_dates: dict[str, str] = {}
+    if args.vep_file_cache:
+        resolutions, access_dates = _load_vep_file_cache(args.vep_file_cache, prefix)
     total_rows = 0
     kept_rows = 0
     newly_resolved_rows = 0
@@ -636,6 +752,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 hgvs_cols=hgvs_cols,
                 col_prefix=prefix,
                 access_date=access_date,
+                access_dates=access_dates,
                 ensembl=ensembl,
                 reference=reference,
                 config=config,
@@ -681,6 +798,7 @@ def _process_batch(
     config: VepConfig,
     ensembl_release: str,
     keep_existing: bool = False,
+    access_dates: Optional[Mapping[str, str]] = None,
 ) -> tuple[int, int, int, int]:
     """Resolve this batch's unseen HGVS candidates, then write every row.
 
@@ -733,6 +851,7 @@ def _process_batch(
             col_prefix=col_prefix,
             hgvs_cols=hgvs_cols,
             access_date=access_date,
+            access_dates=access_dates,
         )
         row.update(ann)
         writer.writerow(row)

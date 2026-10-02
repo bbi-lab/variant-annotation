@@ -254,6 +254,16 @@ def test_an_entry_with_nothing_at_all_is_absent():
     assert resolution.error is None
 
 
+def test_an_entry_vep_rejected_is_errored_not_absent():
+    entry = {"input": "NM_007194.4:c.1259_1260insAAG", "error": "Start (28695710) must be <= end+1 (28695243)"}
+
+    resolution = resolve_entry(VepInput("NM_007194.4:c.1259_1260insAAG"), entry)
+
+    assert resolution.outcome is ConsequenceOutcome.ERRORED
+    assert "28695710" in resolution.error
+    assert resolution.most_severe_consequence is None
+
+
 def test_unrankable_upstream_terms_still_resolve():
     """A term Ensembl adds after this library's ranking was refreshed must not become a missing answer."""
     entry = vep_entry(

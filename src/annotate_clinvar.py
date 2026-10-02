@@ -56,6 +56,7 @@ from itertools import islice
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -123,11 +124,27 @@ def _normalise_clinvar_field(value: str) -> str:
     return "" if normalised == "-" else normalised
 
 
-def fetch_clinvar_tsv(year: int, month: int, cache_dir: Path) -> Path:
+def fetch_clinvar_tsv(
+    year: int,
+    month: int,
+    cache_dir: Path,
+    *,
+    max_attempts: int = 4,
+    backoff_factor: float = 2.0,
+) -> Path:
     """Download (or return cached) the ClinVar variant-summary TSV for *year*-*month*.
 
     The file is stored as a ``.gz`` in *cache_dir* and reused on subsequent calls.
     These archive files are immutable, so no TTL is applied.
+
+    These are large (hundreds of MB) downloads streamed over a real network
+    connection, so a mid-stream drop (``ChunkedEncodingError``/``IncompleteRead``)
+    is retried up to *max_attempts* times per URL, with exponential backoff,
+    before falling through to the next candidate URL -- NCBI's FTP mirror
+    intermittently truncates these transfers. This is separate from HTTP-level
+    errors (``requests.HTTPError``, e.g. a 404 for a URL that doesn't exist),
+    which move on to the next candidate URL immediately without retrying, since
+    retrying those wouldn't help.
 
     Args:
         year: Four-digit year (e.g. 2026).
@@ -148,20 +165,35 @@ def fetch_clinvar_tsv(year: int, month: int, cache_dir: Path) -> Path:
         return dest
 
     urls = _tsv_url(year, month)
+    tmp = dest.with_suffix(".tmp")
     for url in urls:
-        logger.info("Downloading ClinVar TSV from %s", url)
-        try:
-            response = requests.get(url, stream=True, timeout=120)
-            response.raise_for_status()
-            tmp = dest.with_suffix(".tmp")
-            with tmp.open("wb") as fh:
-                for chunk in response.iter_content(chunk_size=1 << 16):
-                    fh.write(chunk)
-            tmp.rename(dest)
-            logger.info("Saved ClinVar TSV to %s", dest)
-            return dest
-        except requests.HTTPError as exc:
-            logger.warning("Failed to download %s: %s", url, exc)
+        for attempt in range(1, max_attempts + 1):
+            logger.info(
+                "Downloading ClinVar TSV from %s (attempt %d/%d)", url, attempt, max_attempts
+            )
+            try:
+                response = requests.get(url, stream=True, timeout=120)
+                response.raise_for_status()
+                with tmp.open("wb") as fh:
+                    for chunk in response.iter_content(chunk_size=1 << 16):
+                        fh.write(chunk)
+                tmp.rename(dest)
+                logger.info("Saved ClinVar TSV to %s", dest)
+                return dest
+            except requests.HTTPError as exc:
+                logger.warning("Failed to download %s: %s", url, exc)
+                break
+            except requests.exceptions.RequestException as exc:
+                logger.warning(
+                    "Transient error downloading %s (attempt %d/%d): %s",
+                    url,
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+                tmp.unlink(missing_ok=True)
+                if attempt < max_attempts:
+                    time.sleep(backoff_factor**attempt)
 
     raise RuntimeError(
         f"Could not download ClinVar variant summary for {year}-{month:02d}. "

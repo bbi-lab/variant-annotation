@@ -46,8 +46,8 @@ class ConsequenceOutcome(str, Enum):
     - ``RESOLVED`` — a consequence was determined. ``most_severe_consequence`` is set.
     - ``ABSENT`` — VEP was queried successfully and returned no consequence for this input. A settled
       negative; re-querying under the same source version will return the same nothing.
-    - ``ERRORED`` — the VEP or Recoder *request* failed (transport error, non-200 after retries). The
-      answer is **unknown**, not negative. Callers must retry rather than storing a null, and must not
+    - ``ERRORED`` — the VEP or Recoder *request* failed (transport error, non-200 after retries), or
+      VEP returned a per-variant ``error`` for the input. The answer is **unknown**, not negative. Callers must retry rather than storing a null, and must not
       let this overwrite a previously held consequence.
     """
 

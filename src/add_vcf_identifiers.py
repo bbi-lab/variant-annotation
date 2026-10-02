@@ -733,6 +733,7 @@ def _parse_hgvs(
                 start_int = int(start)
                 stop_int = int(stop)
                 if start_int >= 1 and stop_int >= start_int:
+                    resolved_ref = None
                     if coord_type == "c":
                         cds_start_i = _get_cds_start_i(accession)
                         if cds_start_i is not None:

@@ -231,7 +231,7 @@ src/scripts/run_map_variants.sh input.tsv output.tsv \
 
 **Notes:**
 - Three variant cases are detected automatically from the input columns — see [docs/map_variants.md](docs/map_variants.md) for full details:
-  - **Case 1** (`raw_hgvs_nt` with a transcript accession prefix, e.g. `NM_000277.3:c.1218G>A`): normalised through `dcd_mapping` and ClinGen; no target sequence needed
+  - **Case 1** (`raw_hgvs_nt` with an accession prefix, e.g. `NM_000277.3:c.1218G>A` or a fully-qualified genomic `NC_000012.12:g.102917016C>A`): normalised through `dcd_mapping` and ClinGen; no target sequence needed. For genomic input, the transcript for `mapped_hgvs_c`/`mapped_hgvs_p` comes from ClinGen's MANE annotation, or from `--preferred-transcript`/`--preferred-transcript-col` if given
   - **Case 2** (`raw_hgvs_nt` without an accession prefix, e.g. `c.1218G>A`): BLAT-aligned from `target_sequence`; all rows sharing the same `--group-by` value are aligned together
   - **Case 3** (protein-only, `raw_hgvs_pro` with no `raw_hgvs_nt`): BLAT-aligned at the protein annotation layer
 - `--drop-columns target_sequence` removes the large sequence column from the output (recommended)
@@ -239,6 +239,8 @@ src/scripts/run_map_variants.sh input.tsv output.tsv \
 - Use `--max-clingen-concurrency 3` to reduce the chance of rate-limit errors from the ClinGen API for large inputs (default: 5)
 - Use `--skip N` to resume an interrupted run from row N
 - Use `--merge-existing prior_output.tsv` to reuse results from a previous partial run without re-processing matched rows
+- Use `--preferred-transcript NM_ACCESSION` (e.g. `--preferred-transcript NM_007194.4`) to force a specific MANE Select transcript for all groups when automatic selection picks the wrong one
+- Use `--preferred-transcript-col COLUMN` to specify the preferred transcript per row from a column in the input file; blank values fall back to automatic selection (or `--preferred-transcript` if also provided)
 - See [docs/map_variants.md](docs/map_variants.md) for all options, dependency setup, and troubleshooting
 - See [BLAT Error 137 Retry Strategy](#blat-error-137-retry-strategy) for handling memory issues
 
@@ -345,21 +347,36 @@ See [docs/annotate_gnomad.md](docs/annotate_gnomad.md) for full reference docume
 
 **Input columns:** `dna_clingen_allele_id` (from step 3)
 
-**Output columns:** `gnomad.<VERSION>.minor_allele_frequency`, `.allele_frequency`, `.allele_count`, `.allele_number`, `.faf95_max`, `.faf95_max_ancestry`, `.filters`, `.exome_filters`, `.genome_filters`, `.gene_symbols`
+**Output columns (standard):** `gnomad.<VERSION>.minor_allele_frequency`, `.allele_frequency`, `.allele_count`, `.allele_number`, `.faf95_max`, `.faf95_max_ancestry`, `.filters`, `.exome_filters`, `.genome_filters`, `.gene_symbols`
 
-**Command:**
+**Optional histogram columns (Hail mode):** When `--age-histograms` or `--allele-balance-histograms` is passed, per-bin frequency columns are added with names like `gnomad.<V>.age_hist_exome_het.bin_1_17.5_25`, `gnomad.<V>.ab_hist_genome_adj.bin_1_0_0.05`, etc. See [docs/annotate_gnomad.md](docs/annotate_gnomad.md) for full column naming details.
+
+**Command (standard annotation):**
 ```bash
 src/scripts/run_annotate_gnomad.sh output_clinvar.tsv output_final.tsv \
     --gnomad-version v4.1 \
     --cache-dir ./gnomad_cache
 ```
 
-**First-time setup (downloads and caches gnomAD Hail table):**
+**First-time setup — build cache with all histogram columns included:**
+```bash
+src/scripts/run_annotate_gnomad.sh /dev/null /dev/null \
+    --gnomad-version v4.1 \
+    --cache-dir ./gnomad_cache \
+    --download-only \
+    --refresh-cache \
+    --gnomad-ht-uri gs://gcp-public-data--gnomad/release/4.1/ht/joint/gnomad.joint.v4.1.sites.ht \
+    --age-histograms exome,genome,joint \
+    --allele-balance-histograms exome,genome,joint
+```
+
+**Annotate with all histograms enabled:**
 ```bash
 src/scripts/run_annotate_gnomad.sh output_clinvar.tsv output_final.tsv \
     --gnomad-version v4.1 \
     --cache-dir ./gnomad_cache \
-    --download-only
+    --age-histograms exome,genome,joint \
+    --allele-balance-histograms exome,genome,joint
 ```
 
 **QC filtering at annotation time:**
@@ -387,6 +404,8 @@ Both flags treat a missing gnomAD match as "no annotation" (columns left empty) 
 - Output columns are pipe-delimited and candidate-aligned across all annotation fields
 - Supports custom DNA ID column via `--dna-clingen-allele-id-col` if needed
 - Cache refresh: use `--refresh-cache` flag to re-download the source table
+- Histogram columns (`--age-histograms`, `--allele-balance-histograms`) must be requested both when building the cache and when annotating; passing them to an older cache logs a warning and omits those columns
+- Lookup results are also cached in Redis between runs when Redis is available (`GNOMAD_CACHE_REDIS_ENABLED`); useful when annotating overlapping variant sets across multiple runs
 
 #### Athena execution mode (alternative to Hail)
 
@@ -422,6 +441,7 @@ src/scripts/run_annotate_gnomad.sh output_clinvar.tsv output_final.tsv \
 - Requires `boto3` (included in project dependencies via `pyproject.toml`); AWS credentials must be available in the standard boto3 credential chain (environment variables, instance profile, `~/.aws/credentials`, etc.)
 - Input rows are processed in batches; output is written and flushed after each batch, preserving input row order
 - CAID lookups are cached in memory across batches to avoid redundant Athena queries within a single run
+- Results are also persisted to Redis between runs when Redis is available (`GNOMAD_CACHE_REDIS_ENABLED`), avoiding Athena round-trips for variants seen in previous runs
 - `--download-only` and `--refresh-cache` flags are ignored in Athena mode (no local cache involved)
 - All six output columns are pipe-delimited and candidate-aligned (same format as Hail mode)
 
@@ -474,7 +494,7 @@ See [docs/annotate_erepo.md](docs/annotate_erepo.md) for full reference document
 
 **Input columns:** `mapped_hgvs_c` (from step 1 or step 2), optionally `dna_clingen_allele_id` and a ClinVar variation ID column
 
-**Output columns:** `clingen_evidence_repository.Assertion`, `.Expert Panel`, `.Disease Mondo Id`, `.Mode of Inheritance`, `.Applied Evidence Codes (Met)`, `.Applied Evidence Codes (Not Met)`, `.Summary of interpretation`, `.ClinVar Variation Id`, `.Allele Registry Id`, `.PubMed Articles`, `.Guideline`, `.Approval Date`, `.Published Date`, `.Retracted`, `.Evidence Repo Link`, `.Uuid`, `.warnings`
+**Output columns:** `clingen_evidence_repository.Assertion`, `.Expert Panel`, `.Disease`, `.Mondo Id`, `.Mode of Inheritance`, `.Applied Evidence Codes (Met)`, `.Applied Evidence Codes (Not Met)`, `.Summary of interpretation`, `.ClinVar Variation Id`, `.Allele Registry Id`, `.PubMed Articles`, `.Guideline`, `.Approval Date`, `.Published Date`, `.Retracted`, `.Evidence Repo Link`, `.Uuid`, `.warnings`
 
 **Command:**
 ```bash
@@ -548,7 +568,7 @@ See [docs/annotate_mavedb.md](docs/annotate_mavedb.md) for full reference docume
 
 **Input columns:** `variant_urn` (MaveDB variant URN), `score` (numeric variant score)
 
-**Output columns:** `mavedb.primary_calibration.urn`, `.name`, `.url`, `.functional_class`, `mavedb.investigator_provided_calibration.urn`, `.name`, `.url`, `.functional_class`
+**Output columns:** `mavedb.primary_calibration.urn`, `.name`, `.url`, `.functional_class_label`, `.functional_classification`, `mavedb.investigator_provided_calibration.urn`, `.name`, `.url`, `.functional_class_label`, `.functional_classification`
 
 **Command:**
 ```bash
@@ -579,10 +599,10 @@ src/scripts/run_annotate_predictors.sh input.tsv output.tsv \
 ```
 
 **Notes:**
-- At least one of `--revel-file`, `--alphamissense-file`, or `--dbnsfp-file` must be provided.
+- At least one predictor source must be provided: `--revel-file` or `--revel-cache-file` for REVEL, `--alphamissense-file` or `--alphamissense-cache-file` for AlphaMissense, or `--dbnsfp-file` for MutPred2.
 - All currently supported predictors score missense SNVs only; other variant types receive empty annotation columns.
 - REVEL and AlphaMissense scores are pipe-aligned to the input candidates. MutPred2 emits a single maximum score (protein-level model).
-- Requires `tabix` (htslib) on `$PATH`.
+- Requires `tabix` (htslib) on `$PATH` only when a tabix-indexed file (`--revel-file`, `--alphamissense-file`, `--dbnsfp-file`) is configured.
 
 ### Step 12: Flatten DNA Variants (Optional)
 
@@ -695,6 +715,107 @@ services:
 ```
 
 This ensures caches survive container restarts and are shared across runs.
+
+## Redis Caching
+
+Several pipeline scripts use Redis to cache API responses between runs, avoiding redundant network requests when the same variant is processed multiple times (e.g. across incremental runs or overlapping datasets). All caching degrades gracefully: if Redis is unreachable or disabled, scripts continue without caching.
+
+The Redis service is started automatically by Docker Compose and is available at `redis://redis:6379/0` inside the container network.
+
+### ClinGen Allele Registry
+
+**Used by:** `map_variants` (steps 1 & 3 combined), `add_dna_clingen_allele_ids`, `annotate_clinvar`
+**Implementation:** `src/lib/clingen.py`
+
+Two types of ClinGen requests are cached:
+
+| Request type | Endpoint | Redis key | Value stored |
+|---|---|---|---|
+| HGVS lookup | `GET /allele?hgvs=<HGVS>` | `clingen:v1:hgvs:<HGVS>` | Allele ID string (e.g. `CA123456`) |
+| Allele ID lookup | `GET /allele/<CA_ID>` | `clingen:v1:allele:<CA_ID>` | Full JSON response body |
+
+A successful HGVS lookup writes **both** keys: the mapping key (`hgvs:`) pointing at the allele ID, and the allele key (`allele:`) holding the complete response. The full response is cached rather than just the allele ID because multiple callers extract different fields from the same record — `annotate_clinvar` needs `externalRecords.ClinVarVariations` and `externalRecords.ClinVarAlleles`, while coordinate-resolution helpers need `genomicAlleles`. Caching the full body under the allele ID means any caller, whether it arrived via HGVS or directly by allele ID, can be served from a single Redis entry.
+
+The two-key design also handles partial eviction gracefully: if the `hgvs:` key is still present but the `allele:` key was evicted, the code detects this and re-fetches by allele ID without re-querying by HGVS.
+
+`map_variants` additionally caches `dcd_mapping` HGVS normalization results:
+
+| Redis key | Value stored |
+|---|---|
+| `clingen:v1:genomic_hgvs:<HGVS>` | Normalized genomic HGVS string |
+
+This key is populated by a patch applied to `dcd_mapping`'s internal `fetch_clingen_genomic_hgvs()` call, which itself queries ClinGen during variant normalization for accession-referenced inputs.
+
+Both hits and misses (404s, placeholder IDs) are cached. Misses are stored as the sentinel `__MISS__`. Default TTL is 86,400 s (1 day) for both.
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `CLINGEN_CACHE_ENABLED` | `true` | Set to `0`/`false` to disable |
+| `CLINGEN_CACHE_REDIS_URL` | `redis://redis:6379/0` | Falls back to `REDIS_URL` |
+| `CLINGEN_CACHE_PREFIX` | `clingen:v1` | Bump version suffix to invalidate all entries |
+| `CLINGEN_CACHE_TTL_SECONDS` | `86400` | TTL for hit entries |
+| `CLINGEN_CACHE_MISS_TTL_SECONDS` | `86400` | TTL for miss sentinels |
+
+Use `src/scripts/run_clear_clingen_cache.sh` to delete all ClinGen cache keys and force fresh API lookups.
+
+### VEP (Ensembl REST API)
+
+**Used by:** `annotate_vep`
+**Implementation:** `src/annotate_vep.py`
+
+VEP consequences are cached per HGVS string. Each entry stores the full consequence result as a small JSON object:
+
+| Redis key | Value stored |
+|---|---|
+| `vep:v1:<HGVS>` | `{"c": "<most_severe>", "cs": ["<term>", ...], "s": "<source>"}` |
+
+Where `c` is the most-severe consequence, `cs` is the full list of consequences from the matched transcript (or `null` for genomic/protein inputs), and `s` is the source tag (`"transcript"`, `"most_severe"`, etc.). Storing the full consequence list avoids a second API call if downstream code needs it.
+
+Results that failed with a transient API error (`source == "api_error"`) are **not** cached, so they are retried on the next run. All other results — including definitive misses — are cached with the sentinel `__MISS__`.
+
+Reads and writes use Redis pipeline operations (`MGET`/`SET`) to minimise round-trips when processing large batches.
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `VEP_CACHE_ENABLED` | `true` | Set to `0`/`false` to disable |
+| `VEP_CACHE_REDIS_URL` | `redis://redis:6379/0` | Falls back to `REDIS_URL` |
+| `VEP_CACHE_PREFIX` | `vep:v1` | Bump version suffix after a major Ensembl release |
+| `VEP_CACHE_TTL_SECONDS` | `86400` | TTL for hit entries |
+| `VEP_CACHE_MISS_TTL_SECONDS` | `86400` | TTL for miss sentinels |
+
+### gnomAD
+
+**Used by:** `annotate_gnomad` (both Hail and Athena modes)
+**Implementation:** `src/annotate_gnomad.py`
+
+Full gnomAD records are cached per ClinGen allele ID (CAID), or per genomic coordinate string in coordinate-lookup mode:
+
+| Redis key | Value stored |
+|---|---|
+| `gnomad:v1:<CAID>` | JSON-serialized `GnomadRecord` |
+
+Each cached record includes allele counts and frequencies, filtering allele frequencies, per-callset QC filter flags, VEP gene symbols, and any histogram data (age/allele-balance distributions) that was present when the record was fetched. Storing the full record avoids re-querying the Hail table or Athena for any field combination, regardless of which `--age-histograms` / `--allele-balance-histograms` flags the current run uses.
+
+Only successful lookups are cached; variants not found in gnomAD are not stored (no miss sentinel). The default TTL is 604,800 s (7 days), reflecting that gnomAD releases are infrequent.
+
+Reads and writes use Redis pipeline operations for batch efficiency.
+
+| Environment variable | Default | Description |
+|---|---|---|
+| `GNOMAD_CACHE_REDIS_ENABLED` | `true` | Set to `0`/`false` to disable |
+| `GNOMAD_CACHE_REDIS_URL` | `redis://redis:6379/0` | Falls back to `REDIS_URL` |
+| `GNOMAD_CACHE_REDIS_PREFIX` | `gnomad:v1` | Bump version suffix after a gnomAD release |
+| `GNOMAD_CACHE_REDIS_TTL_SECONDS` | `604800` | TTL for all cached entries (7 days) |
+
+### Summary
+
+| Script | Key prefix | Cached value | TTL (hit/miss) |
+|---|---|---|---|
+| ClinGen (HGVS lookup) | `clingen:v1:hgvs:` | Allele ID string | 1 day / 1 day |
+| ClinGen (allele record) | `clingen:v1:allele:` | Full JSON response | 1 day / 1 day |
+| ClinGen (genomic HGVS norm.) | `clingen:v1:genomic_hgvs:` | Normalized HGVS string | 1 day / 1 day |
+| VEP | `vep:v1:` | Consequence + source JSON | 1 day / 1 day |
+| gnomAD | `gnomad:v1:` | Full GnomadRecord JSON | 7 days / not cached |
 
 ## Bundled Utilities
 
@@ -1134,6 +1255,8 @@ TP53	CA123456|CA123457||	Pathogenic	0.00234	0.00234	1547
 
 #### Step 6: annotate_gnomad
 
+Standard columns (always emitted):
+
 | Column | Type | Description |
 |--------|------|-------------|
 | `gnomad.<VERSION>.minor_allele_frequency` | float | MAF = min(AF, 1-AF) |
@@ -1146,6 +1269,16 @@ TP53	CA123456|CA123457||	Pathogenic	0.00234	0.00234	1547
 | `gnomad.<VERSION>.exome_filters` | string | Pipe-delimited exome-callset QC filter flags (empty = PASS or not in exome callset) |
 | `gnomad.<VERSION>.genome_filters` | string | Pipe-delimited genome-callset QC filter flags (empty = PASS or not in genome callset) |
 | `gnomad.<VERSION>.gene_symbols` | string | Pipe-delimited VEP gene symbols overlapping the variant |
+
+Optional histogram columns (Hail mode only, enabled by `--age-histograms` / `--allele-balance-histograms`):
+
+| Column pattern | Type | Description |
+|--------|------|-------------|
+| `gnomad.<V>.<hist_name>.n_smaller` | int | Count of carriers below the lowest bin edge |
+| `gnomad.<V>.<hist_name>.bin_N_<lo>_<hi>` | int | Carrier count in bin N with edges \[lo, hi) |
+| `gnomad.<V>.<hist_name>.n_larger` | int | Count of carriers above the highest bin edge |
+
+Where `<hist_name>` is one of: `age_hist_exome_het`, `age_hist_exome_hom`, `age_hist_genome_het`, `age_hist_genome_hom`, `age_hist_joint_het`, `age_hist_joint_hom` (age histograms) or `ab_hist_exome_adj`, `ab_hist_exome_raw`, `ab_hist_genome_adj`, `ab_hist_genome_raw`, `ab_hist_joint_adj`, `ab_hist_joint_raw` (allele balance histograms). See [docs/annotate_gnomad.md](docs/annotate_gnomad.md) for full details.
 
 (Default version is `v4.1`; customize with `--gnomad-version` flag)
 

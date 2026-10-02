@@ -14,7 +14,8 @@ All output columns are prefixed `clingen_evidence_repository.` and are pipe-deli
 |---|---|
 | `clingen_evidence_repository.ClinVar Variation Id` | ClinVar Variation ID from the erepo record |
 | `clingen_evidence_repository.Allele Registry Id` | ClinGen Allele Registry ID (CAID) from the erepo record |
-| `clingen_evidence_repository.Disease Mondo Id` | Mondo disease ontology ID |
+| `clingen_evidence_repository.Disease` | Disease/condition name associated with the classification |
+| `clingen_evidence_repository.Mondo Id` | Mondo disease ontology ID |
 | `clingen_evidence_repository.Mode of Inheritance` | Inheritance pattern (e.g. `Autosomal dominant`) |
 | `clingen_evidence_repository.Assertion` | ACMG/AMP classification (e.g. `Pathogenic`, `Likely Benign`) |
 | `clingen_evidence_repository.Applied Evidence Codes (Met)` | ACMG evidence codes that were met |

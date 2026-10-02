@@ -499,31 +499,65 @@ def _apply_wt_codon(
 
 
 _SINGLE_CODING_DELINS_RE = re.compile(r":c\.\d+_\d+delins[ACGT]+$")
+_GENOMIC_INVERSION_RE = re.compile(r"^(?P<ac>[^:]+):g\.(?P<start>\d+)_(?P<end>\d+)inv$")
+_GENOMIC_DELINS_RE = re.compile(r"^(?P<ac>[^:]+):g\.(?P<start>\d+)(?:_(?P<end>\d+))?delins(?P<alt>[ACGTN]+)$")
+
+
+def _inversion_as_delins(inversion: str, hgvs_c: str, coordinates: CoordinateTranslator) -> str | None:
+    """Rewrite a genomic ``inv`` as the delins it stands for, or ``None`` if that can't be done exactly.
+
+    HGVS normalization writes a delins whose inserted bases are the reverse complement of the reference
+    as ``inv``, which VRS cannot translate. The normalized ``inv`` carries the trimmed span; the
+    unnormalized projection of the same coding delins carries the inserted bases over a span that may
+    include unchanged flanking bases. Cutting those bases to the trimmed span gives the delins
+    normalization would have written, with no sequence lookup.
+    """
+    inv = _GENOMIC_INVERSION_RE.match(inversion)
+    literal = _GENOMIC_DELINS_RE.match(coordinates.c_to_g_literal(hgvs_c))
+    if inv is None or literal is None or literal["ac"] != inv["ac"]:
+        return None
+
+    start, end = int(inv["start"]), int(inv["end"])
+    literal_start = int(literal["start"])
+    literal_end = int(literal["end"] or literal_start)
+    alt = literal["alt"]
+    if len(alt) != literal_end - literal_start + 1 or not literal_start <= start <= end <= literal_end:
+        return None
+
+    return f"{inv['ac']}:g.{start}_{end}delins{alt[start - literal_start : end - literal_start + 1]}"
 
 
 def _project_coding_delins(pairs: list[ProjectionPair], coordinates: CoordinateTranslator) -> list[ProjectionPair]:
-    """Project each single coding delins to genomic as a single delins, not a cis-phased set.
+    """Project each single coding delins to genomic as a single delins.
 
-    reverse-translate-variants writes a codon change with an unchanged middle base as one coding delins
-    (``c.151_153delinsGCG``) but splits its genomic projection into a cis-phased pair
-    (``g.[1315654A>G;1315656T>G]``). A cis-phased set and a delins are different VRS types with different
-    digests, so the projection never matches the same change mapped as a delins (dcd-mapping's form, and the
-    WT-codon pair's below), and a cis-phased genomic candidate cannot be registered with ClinGen. Projecting
-    the coding delins through ``coordinates.c_to_g`` keeps the pair's two members, and every pathway, in one
-    form. A failed projection is ``hgvs_g=None``, as in :func:`_apply_wt_codon`, never the cis-phased form.
+    reverse-translate-variants writes some coding delins' genomic projections in forms VRS and ClinGen do
+    not share with dcd-mapping and the WT-codon pair below:
+
+    * a codon change with an unchanged middle base as a cis-phased pair (``g.[1315654A>G;1315656T>G]``),
+      a different VRS type, so it never matches the same change mapped as a delins;
+    * a delins whose inserted bases are the reverse complement of the reference as ``inv``, which VRS
+      cannot translate at all.
+
+    Both are re-expressed as one genomic delins. A projection that can't be is ``hgvs_g=None``, as in
+    :func:`_apply_wt_codon`, never the original form.
     """
     projected: list[ProjectionPair] = []
     for pair in pairs:
-        if not (pair.hgvs_g and ":g.[" in pair.hgvs_g and _SINGLE_CODING_DELINS_RE.search(pair.hgvs_c)):
+        hgvs_g = pair.hgvs_g
+        cis_phased = bool(hgvs_g and ":g.[" in hgvs_g)
+        inversion = bool(hgvs_g and _GENOMIC_INVERSION_RE.match(hgvs_g))
+        if not ((cis_phased or inversion) and _SINGLE_CODING_DELINS_RE.search(pair.hgvs_c)):
             projected.append(pair)
             continue
 
         try:
-            hgvs_g = coordinates.c_to_g(pair.hgvs_c)
+            reprojected: str | None = coordinates.c_to_g(pair.hgvs_c) if cis_phased else hgvs_g
+            if reprojected and _GENOMIC_INVERSION_RE.match(reprojected):
+                reprojected = _inversion_as_delins(reprojected, pair.hgvs_c, coordinates)
         except Exception:
             logger.warning("Could not project coding delins %s to genomic", pair.hgvs_c, exc_info=True)
-            hgvs_g = None
-        projected.append(ProjectionPair(hgvs_c=pair.hgvs_c, hgvs_g=hgvs_g or None, variant_type=pair.variant_type))
+            reprojected = None
+        projected.append(ProjectionPair(hgvs_c=pair.hgvs_c, hgvs_g=reprojected or None, variant_type=pair.variant_type))
 
     return projected
 

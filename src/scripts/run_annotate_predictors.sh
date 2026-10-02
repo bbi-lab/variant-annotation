@@ -44,10 +44,18 @@ Data file preparation:
     unzip revel-v1.3_all_chromosomes.zip
     mv revel_with_transcript_ids revel_with_transcript_ids.csv
     tail -n +2 revel_with_transcript_ids.csv \
-      | awk -F',' 'NF>=9 && $3!="" && $3!="." {print $1"\t"$3"\t"$4"\t"$5"\t"$8}' \
-      | (printf '#chr\tpos\tref\talt\trevel_score\n'; sort -k1,1V -k2,2n) \
+      | awk -F',' 'NF>=9 && $3!="" && $3!="." {print $1"\t"$3"\t"$4"\t"$5"\t"$8"\t"$6"\t"$7"\t"$9}' \
+      | (printf '#chr\tpos\tref\talt\trevel_score\taaref\taaalt\tensembl_transcriptid\n'; sort -k1,1V -k2,2n) \
       | bgzip > revel_hg38.tsv.gz
     tabix -s 1 -b 2 -e 2 -S 1 revel_hg38.tsv.gz
+
+    This extended 8-column layout is required for --revel-mode transcript/aa
+    (the annotate_predictors default is "transcript"); --revel-mode coordinate
+    works with either this or the older 5-column (chr/pos/ref/alt/revel_score)
+    layout. --revel-mode transcript also needs a RefSeq -> Ensembl transcript
+    mapping, e.g. the NCBI MANE summary file:
+      wget https://ftp.ncbi.nlm.nih.gov/refseq/MANE/MANE_human/current/MANE.GRCh38.v1.4.summary.txt.gz
+    See docs/annotate_predictors.md ("REVEL disambiguation modes") for details.
 EOF
   exit 1
 fi

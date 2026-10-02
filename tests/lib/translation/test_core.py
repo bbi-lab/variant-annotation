@@ -45,6 +45,9 @@ class _StubCoordinates:
     def c_to_g(self, c):
         raise NotImplementedError
 
+    def c_to_g_literal(self, c):
+        raise NotImplementedError
+
 
 # ---------------------------------------------------------------------------
 # _classify_kind
@@ -727,3 +730,55 @@ def test_project_coding_delins_failed_projection_is_none_not_the_cis_phased_form
     assert _project_coding_delins([pair], _StubCoordinates()) == [
         ProjectionPair(hgvs_c="NM_003345.5:c.151_153delinsGCG", hgvs_g=None, variant_type="delins")
     ]
+
+
+class _InversionCoordinates(_StubCoordinates):
+    """Normalized projection gives ``inv``; the literal one keeps the delins, here with an unchanged flank."""
+
+    def c_to_g(self, c):
+        return "NC_000017.11:g.3498898_3498899inv"
+
+    def c_to_g_literal(self, c):
+        return "NC_000017.11:g.3498897_3498899delinsAGT"
+
+
+@pytest.mark.parametrize(
+    "cli_hgvs_g",
+    ["NC_000017.11:g.3498898_3498899inv", "NC_000017.11:g.[3498898A>G;3498899C>T]"],
+    ids=["cli wrote inv", "cli wrote cis-phased and the reprojection is inv"],
+)
+def test_project_coding_delins_rewrites_an_inversion_as_the_delins_on_its_trimmed_span(cli_hgvs_g):
+    pair = ProjectionPair(hgvs_c="NM_000049.4:c.752_753delinsGT", hgvs_g=cli_hgvs_g, variant_type="delins")
+
+    (projected,) = _project_coding_delins([pair], _InversionCoordinates())
+
+    assert projected.hgvs_g == "NC_000017.11:g.3498898_3498899delinsGT"
+
+
+@pytest.mark.parametrize(
+    "literal",
+    ["NC_000017.11:g.3498898_3498899inv", "NC_000001.11:g.3498898_3498899delinsGT", "NC_000017.11:g.3498899delinsG"],
+    ids=["literal is still an inversion", "different accession", "span does not cover the inversion"],
+)
+def test_project_coding_delins_inversion_it_cannot_rewrite_exactly_is_none(literal):
+    class _Coordinates(_InversionCoordinates):
+        def c_to_g_literal(self, c):
+            return literal
+
+    pair = ProjectionPair(
+        hgvs_c="NM_000049.4:c.752_753delinsGT", hgvs_g="NC_000017.11:g.3498898_3498899inv", variant_type="delins"
+    )
+
+    (projected,) = _project_coding_delins([pair], _Coordinates())
+
+    assert projected.hgvs_g is None
+
+
+def test_project_coding_delins_inversion_without_a_literal_projection_is_none():
+    pair = ProjectionPair(
+        hgvs_c="NM_000049.4:c.752_753delinsGT", hgvs_g="NC_000017.11:g.3498898_3498899inv", variant_type="delins"
+    )
+
+    (projected,) = _project_coding_delins([pair], _StubCoordinates())
+
+    assert projected.hgvs_g is None
