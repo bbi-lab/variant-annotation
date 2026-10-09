@@ -713,8 +713,9 @@ def construct_equivalent_variants(
     for consequence, output_row, pos in zip(batch_consequences, output_rows, batch_positions):
         inp = inputs[pos]
 
+        # Inputs sharing a consequence share its errors; each must see them, so read rather than consume.
         key = (consequence.transcript, consequence.hgvs_p)
-        error_msgs = error_messages_by_key.pop(key, [])
+        error_msgs = error_messages_by_key.get(key, [])
 
         outcome = _build_result(
             inp,

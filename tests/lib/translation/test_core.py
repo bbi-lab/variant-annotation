@@ -631,6 +631,34 @@ def test_rows_dropped_on_every_attempt_are_upstream_unavailable(monkeypatch):
     assert errors[0].reason is TranslationErrorReason.UPSTREAM_UNAVAILABLE
 
 
+def test_inputs_sharing_a_consequence_share_its_upstream_outage(monkeypatch):
+    """Two variants with one protein consequence (e.g. two codons for one missense) each get the
+    outage reason; the second must not read as a translation failure for want of an error message."""
+    monkeypatch.setattr(_core, "_find_reverse_translate_cli", lambda: "/bin/true")
+
+    def _all_dropped(cli, cons, *, config):
+        dropped = [
+            _core._BatchErrorRow(
+                transcript=c.transcript, hgvs_p=c.hgvs_p, error=f"Failed reverse translation ({_UTA_DROP})"
+            )
+            for c in cons
+        ]
+        return [_empty_row() for _ in cons], dropped
+
+    monkeypatch.setattr(_core, "_run_reverse_translate_batch", _all_dropped)
+
+    inputs = [
+        VariantInput(hgvs="NP_000001.1:p.Cys2Trp", transcript="NM_000001.1"),
+        VariantInput(hgvs="NP_000001.1:p.Cys2Trp", transcript="NM_000001.1"),
+    ]
+    results, errors = construct_equivalent_variants(
+        inputs, transcripts=_StubTranscripts(), coordinates=_StubCoordinates(), config=_NO_WAIT
+    )
+    assert results == []
+    assert [e.input for e in errors] == inputs
+    assert [e.reason for e in errors] == [TranslationErrorReason.UPSTREAM_UNAVAILABLE] * 2
+
+
 def test_failed_row_rerun_keeps_rows_from_the_earlier_run(monkeypatch):
     monkeypatch.setattr(_core, "_find_reverse_translate_cli", lambda: "/bin/true")
     calls = []
