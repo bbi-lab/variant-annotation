@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Deduplicate MaveDB variant rows by coding-HGVS value.
 
 MaveDB requires exactly one row per variant. Reference-allele correction can

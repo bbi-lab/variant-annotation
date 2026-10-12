@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Replace rows from multiple CSV/TSV files using a composite key.
 
 Rows are processed in file order. For duplicate keys, later rows replace earlier

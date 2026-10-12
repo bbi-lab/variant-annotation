@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Lift genomic positions between genome assemblies.
 
 Reads a CSV/TSV file and maps coordinates from one genome assembly to another

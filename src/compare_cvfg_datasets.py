@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """
 Compare integrated_variant_effect_dataset_condensed.tsv (A) with
 a CVFG variants flat file (B) via a positional-genome join.

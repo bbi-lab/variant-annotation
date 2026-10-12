@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Translate accessions embedded in HGVS columns between RefSeq and Ensembl namespaces.
 
 Handles three kinds of columns independently, each opted into via a CLI flag:

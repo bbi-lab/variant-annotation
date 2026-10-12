@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Unified CLI for lightweight table utilities.
 
 This module exposes multiple utility commands behind a single entrypoint so

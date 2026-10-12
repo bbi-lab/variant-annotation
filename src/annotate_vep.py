@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Annotate variants with VEP mutational consequences.
 
 This script annotates each input row with VEP mutational consequences derived

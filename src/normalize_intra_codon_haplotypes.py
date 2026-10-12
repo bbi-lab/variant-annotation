@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Rewrite intra-codon c.-haplotypes into delins notation.
 
 This script scans a tabular variant file and rewrites entries in ``raw_hgvs_nt``

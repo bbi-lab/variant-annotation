@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Annotate variant rows with ClinGen Expert Panel classifications from the Evidence Repository.
 
 The ClinGen Evidence Repository (erepo) publishes expert-panel variant classifications.

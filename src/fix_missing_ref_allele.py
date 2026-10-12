@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Insert a missing reference-allele letter in malformed coding-HGVS substitutions.
 
 Some source rows are missing the reference letter in a single-nucleotide

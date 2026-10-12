@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Backward-compatible wrapper for ``src.replace_rows``.
 
 Use ``python -m src.replace_rows`` for the renamed utility.

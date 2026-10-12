@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Replace Ensembl transcript/protein accessions with RefSeq equivalents (or vice versa).
 
 Operates on HGVS-containing columns produced by earlier pipeline steps:
