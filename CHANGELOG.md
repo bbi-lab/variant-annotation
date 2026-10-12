@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.0-beta.2] - 2026-10-12
+
+### Added
+
+- Author ORCID iD in `CITATION.cff`.
+
 ## [1.0.0-beta.1] - 2026-10-12
 
 First beta release of the variant annotation pipeline.
@@ -29,5 +35,6 @@ First beta release of the variant annotation pipeline.
 - Redis-backed response caching across API-calling pipeline stages, with graceful degradation when Redis is unreachable.
 - Docker Compose-based development and execution environment, including a dedicated Hail-enabled service for gnomAD lookups.
 
-[Unreleased]: https://github.com/bbi-lab/variant-annotation/compare/v1.0.0-beta.1...HEAD
+[Unreleased]: https://github.com/bbi-lab/variant-annotation/compare/v1.0.0-beta.2...HEAD
+[1.0.0-beta.2]: https://github.com/bbi-lab/variant-annotation/compare/v1.0.0-beta.1...v1.0.0-beta.2
 [1.0.0-beta.1]: https://github.com/bbi-lab/variant-annotation/releases/tag/v1.0.0-beta.1
