@@ -24,7 +24,7 @@ dependencies = [
     "python-dotenv",
     "redis",
     "requests",
-    "variant-translation==1.1.0b1",
+    "variant-translation==1.2.0",
 ]
 
 [project.optional-dependencies]
