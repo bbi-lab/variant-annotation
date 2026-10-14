@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """ProteinConsequence — the hub type the collapse/expand operation pivots on."""
 
 from __future__ import annotations

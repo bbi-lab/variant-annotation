@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Recognising HGVS expressions that describe no sequence change. Pure — no I/O, no service calls.
 
 Reference-identical rows are ordinary in functional-assay data (a wild-type control), but they are not

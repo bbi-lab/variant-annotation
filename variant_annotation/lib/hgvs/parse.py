@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """HGVS parsing utilities — shared vocabulary, no I/O.
 
 reverse_complement lives here permanently.

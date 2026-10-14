@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """CSV composition root for the equivalence-class construction step.
 
 ColumnConfig is the schema adapter — it owns all row read/write operations,

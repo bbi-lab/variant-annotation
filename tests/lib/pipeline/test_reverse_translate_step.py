@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 import pytest
 
 from variant_annotation.lib.pipeline.reverse_translate_step import ColumnConfig

@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Sequence Ontology molecular-consequence vocabulary — the canonical term set and severity order.
 
 Shared vocabulary: pure data and pure functions, no service dependencies. Any ``lib/`` module and any

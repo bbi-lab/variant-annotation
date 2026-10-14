@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Consumer-owned narrow protocols for translation's backing services.
 
 These protocols are defined here (in the consumer) so that clients/ and

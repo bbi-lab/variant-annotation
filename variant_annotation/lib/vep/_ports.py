@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Consumer-owned narrow protocols for VEP resolution's backing services.
 
 Defined here (in the consumer) so that ``clients/`` and mavedb-api can satisfy them structurally

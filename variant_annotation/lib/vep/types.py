@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Public types for the VEP consequence-resolution API."""
 
 from __future__ import annotations

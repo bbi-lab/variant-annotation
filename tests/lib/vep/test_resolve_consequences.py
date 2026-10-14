@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Unit tests for the VEP resolution orchestration, driven through stub ports.
 
 No HTTP: the ports exist so the batching, fallback, and failure-attribution behaviour can be exercised

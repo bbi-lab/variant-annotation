@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """variant_annotation.vep — public API for molecular-consequence resolution.
 
 Composition roots (``pipeline/``, mavedb-api) import from here.

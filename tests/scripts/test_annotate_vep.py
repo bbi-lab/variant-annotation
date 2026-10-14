@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Tests for src/annotate_vep.py — the CSV/CLI composition root.
 
 Consequence *resolution* is the library's job and is tested in tests/lib/vep/. What is left here is

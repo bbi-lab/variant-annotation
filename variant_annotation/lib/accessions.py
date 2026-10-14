@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Pure accession-classification utilities — no I/O, no external dependencies."""
 
 from __future__ import annotations
