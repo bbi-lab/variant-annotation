@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """
 Compare the mapped_hgvs_g, mapped_hgvs_c, and mapped_hgvs_p columns between
 two TSV files, joining on variant_urn.

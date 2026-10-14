@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Annotate variants with gnomAD allele frequency metrics using a local Hail table cache.
 
 This script annotates each input row using DNA-level ClinGen allele IDs from

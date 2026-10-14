@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Filter and/or rename CSV/TSV columns.
 
 ``filter_columns`` — keep-list or omit-list, no rename.

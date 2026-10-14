@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Merge two CSV/TSV files by key columns, selecting columns from each side.
 
 Typical use is to keep all columns from a base file and add one or more columns

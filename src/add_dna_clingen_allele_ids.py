@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Add a DNA-level ClinGen allele-ID column.
 
 This script writes one output column containing DNA-level ClinGen allele IDs:

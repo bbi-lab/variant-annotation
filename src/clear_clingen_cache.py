@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Clear ClinGen Allele Registry cache keys from Redis.
 
 The pipeline caches ClinGen API responses in Redis under a key namespace

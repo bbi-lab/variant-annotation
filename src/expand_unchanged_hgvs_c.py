@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Expand bare "c.=" (unchanged) coding-HGVS cells into a position or range.
 
 MAVE wild-type/"unchanged" control rows report a coding-variant cell of

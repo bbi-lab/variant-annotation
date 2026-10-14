@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 import csv
 import asyncio
 
@@ -68,7 +71,7 @@ def test_map_variants_default_preserves_input_order(tmp_path, monkeypatch):
     ]
     _write_tsv(input_path, rows)
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, **kwargs):
         per_row = []
         for orig_idx, _, raw_pro, _ in row_entries:
             per_row.append((orig_idx, f"NC_000001.11:g.{orig_idx + 100}A>G", None, None, None))
@@ -108,7 +111,7 @@ def test_map_variants_groups_mode_uses_contiguous_blocks(tmp_path, monkeypatch):
 
     calls = []
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, **kwargs):
         calls.append((group_name, [orig_idx for orig_idx, *_ in row_entries]))
         per_row = []
         for orig_idx, *_ in row_entries:
@@ -150,7 +153,7 @@ def test_map_variants_retries_on_137_with_chunking(tmp_path, monkeypatch):
 
     calls = []
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, **kwargs):
         calls.append((group_name, len(row_entries)))
         if "#retry" not in group_name:
             raise RuntimeError("BLAT process returned error code 137")
@@ -194,7 +197,7 @@ def test_map_variants_no_retry_when_137_retry_disabled(tmp_path, monkeypatch):
     ]
     _write_tsv(input_path, rows)
 
-    async def always_137(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
+    async def always_137(group_name, target_seq, row_entries, dcd, **kwargs):
         raise RuntimeError("BLAT process returned error code 137")
 
     monkeypatch.setattr(mv, "_try_import_dcd_mapping", lambda: object())
@@ -267,7 +270,7 @@ def test_map_variants_with_targets_file_populates_sequence(tmp_path, monkeypatch
 
     output_path = tmp_path / "out.tsv"
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, **kwargs):
         assert target_seq == "SEQ_A", "target_sequence was not merged from targets file"
         return [(orig_idx, f"NC_000001.11:g.{orig_idx}A>G", None, None, None) for orig_idx, *_ in row_entries], "NM_000001.1", None
 
@@ -316,7 +319,7 @@ def test_map_variants_with_targets_file_extra_cols_in_output(tmp_path, monkeypat
 
     output_path = tmp_path / "out.tsv"
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, **kwargs):
         return [(orig_idx, f"NC_000001.11:g.{orig_idx}A>G", None, None, None) for orig_idx, *_ in row_entries], "NM_000001.1", None
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
@@ -494,7 +497,7 @@ def test_map_variants_normalizes_raw_hgvs_pro_in_output(tmp_path, monkeypatch):
             {"variant_urn": "v0", "raw_hgvs_nt": "", "raw_hgvs_pro": "p.A300T", "target_sequence": "SEQ_A"}
         )
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, **kwargs):
         return [(orig_idx, f"NC_000001.11:g.{orig_idx}A>G", None, None, None) for orig_idx, *_ in row_entries], "NM_1", None
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
@@ -534,7 +537,7 @@ def test_map_variants_normalize_hgvs_accepts_no_prefix_protein_and_nt(tmp_path, 
 
     seen_entries = []
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, **kwargs):
         seen_entries.extend(row_entries)
         return [
             (orig_idx, f"NC_000001.11:g.{orig_idx + 1}A>G", None, None, None)
@@ -758,7 +761,7 @@ def test_map_variants_clingen_no_data_preserves_protein_hgvs(tmp_path, monkeypat
             {"variant_urn": "v0", "raw_hgvs_nt": "", "raw_hgvs_pro": "p.Q2Ter", "target_sequence": "SEQ_A"}
         )
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, **kwargs):
         return [(orig_idx, "NP_005624.2:p.Gln2Ter", None, None, None) for orig_idx, *_ in row_entries], "NM_005633.4", None
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
@@ -795,7 +798,7 @@ def test_map_variants_clingen_no_data_preserves_genomic_hgvs(tmp_path, monkeypat
 
     genomic = "NC_000002.12:g.12345A>T"
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, **kwargs):
         return [(orig_idx, genomic, None, None, None) for orig_idx, *_ in row_entries], "NM_005633.4", None
 
     async def fake_clingen_batch(hgvs_strings, max_concurrency=5):
@@ -852,7 +855,7 @@ def test_map_variants_routes_class1_class2_class3(tmp_path, monkeypatch):
             "CA001",
         )
 
-    async def fake_pipeline(group_name, target_seq, row_entries, dcd, preferred_transcript_nm=None):
+    async def fake_pipeline(group_name, target_seq, row_entries, dcd, **kwargs):
         pipeline_calls.append((group_name, target_seq, row_entries))
         per_row = []
         for orig_idx, hgvs_nt, hgvs_pro, case in row_entries:

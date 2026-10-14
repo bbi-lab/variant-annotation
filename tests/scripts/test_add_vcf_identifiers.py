@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 import csv
 import threading
 import time
@@ -310,6 +313,48 @@ def test_apply_vcf_anchor_transcript_deletion(monkeypatch):
     assert start == "75"
     assert ref == "GC"
     assert alt == "G"
+
+
+@pytest.mark.unit
+def test_apply_vcf_anchor_transcript_deletion_missing_ref_resolves_via_genomic_fallback(monkeypatch):
+    """A c./n. deletion with ref unresolved (the bug: `_parse_hgvs` couldn't
+    determine the deleted bases, e.g. because the range crosses an intron
+    boundary like "374_375+1del") must not collapse transcript_ref to just
+    the anchor base. It should fall back to `_fetch_intron_spanning_ref`,
+    which resolves the whole anchor-plus-deleted-region sequence via genomic
+    coordinates (see `_HgvsRefResolver.get_intron_spanning_ref`) -- this
+    works regardless of whether the span is actually intronic.
+    """
+    monkeypatch.setattr(mod, "_get_cds_start_i", lambda acc: 100)
+    calls = []
+
+    def fake_fetch(accession, c_anchor, c_stop):
+        calls.append((accession, c_anchor, c_stop))
+        return "GAGG"
+
+    monkeypatch.setattr(mod, "_fetch_intron_spanning_ref", fake_fetch)
+    start, stop, ref, alt = mod._apply_vcf_anchor(
+        "NM_004656.4:c.374_375+1del", "374", "375+1", "", ""
+    )
+    assert start == "373"
+    assert stop == "375+1"
+    assert ref == "GAGG"
+    assert alt == "G"
+    assert calls == [("NM_004656.4", 373, "375+1")]
+
+
+@pytest.mark.unit
+def test_apply_vcf_anchor_transcript_deletion_missing_ref_unresolvable_leaves_unchanged(monkeypatch):
+    """When even the genomic fallback can't resolve the deleted sequence
+    (UTA unavailable, mapping failure, etc.), values are left unchanged --
+    not collapsed to the anchor-equals-alt bug, and not a fabricated guess.
+    """
+    monkeypatch.setattr(mod, "_get_cds_start_i", lambda acc: 100)
+    monkeypatch.setattr(mod, "_fetch_intron_spanning_ref", lambda *a: None)
+    start, stop, ref, alt = mod._apply_vcf_anchor(
+        "NM_004656.4:c.374_375+1del", "374", "375+1", "", ""
+    )
+    assert (start, stop, ref, alt) == ("374", "375+1", "", "")
 
 
 @pytest.mark.unit

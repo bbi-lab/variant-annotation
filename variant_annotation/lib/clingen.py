@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """ClinGen Allele Registry client helpers with optional Redis caching."""
 
 from __future__ import annotations

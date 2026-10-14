@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "variant-annotation"
-version = "0.1.0-dev.6"
+version = "1.1.0"
 authors = [
     { name="Jeremy Stone", email="74574922+jstone-dev@users.noreply.github.com" },
 ]
@@ -24,7 +24,7 @@ dependencies = [
     "python-dotenv",
     "redis",
     "requests",
-    "variant-translation==1.1.0b1",
+    "variant-translation==1.2.0",
     "pandas (>=2.2.1,<3.0.0)",
 ]
 
@@ -34,6 +34,9 @@ dev = [
 ]
 gnomad = [
     "hail",
+]
+liftover = [
+    "pyliftover",
 ]
 mapping = [
     "dcd-mapping @ git+https://github.com/VariantEffect/dcd_mapping2.git@v2026.1.2",

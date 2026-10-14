@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Construct the set of DNA variants protein-equivalent to each input variant.
 
 CLI entry point. Handles CSV streaming; all translation and column logic lives

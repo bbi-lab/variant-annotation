@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Add VCF-format columns (chromosome, position, ref, alt) for mapped HGVS fields.
 
 Given mapped HGVS columns (genomic/transcript/protein), this script appends:
@@ -66,6 +69,7 @@ class _HgvsRefResolver:
         import hgvs.dataproviders.uta  # type: ignore[import-untyped]
         import hgvs.normalizer  # type: ignore[import-untyped]
         import hgvs.parser  # type: ignore[import-untyped]
+        import hgvs.variantmapper  # type: ignore[import-untyped]
 
         uta_db_url = (os.environ.get("UTA_DB_URL") or "").strip()
         if not uta_db_url:
@@ -75,6 +79,7 @@ class _HgvsRefResolver:
         self._hdp = hdp
         self._parser = hgvs.parser.Parser()
         self._normalizer = hgvs.normalizer.Normalizer(hdp)
+        self._vm = hgvs.variantmapper.VariantMapper(hdp)
 
     def resolve_ref(self, hgvs_value: str) -> Optional[str]:
         var = self._parser.parse_hgvs_variant(hgvs_value)
@@ -118,6 +123,67 @@ class _HgvsRefResolver:
                 except (KeyError, TypeError):
                     pass
             return int(cds_start) if cds_start is not None else None
+        except Exception:
+            return None
+
+    def get_intron_spanning_ref(self, tx_ac: str, c_anchor: int, c_stop: str) -> Optional[str]:
+        """Return the transcript-strand reference sequence for the c. interval
+        ``[c_anchor, c_stop]``, where either endpoint may be an intronic offset
+        position (e.g. ``"375+1"``) -- which the transcript's own spliced
+        sequence has no bases for, so a plain CDS-offset fetch
+        (``cds_start_i + c_pos``, as ``get_cds_start_i`` enables) can't resolve
+        it. Used as the fallback when the deleted sequence for a c./n.
+        deletion couldn't be determined any other way (see
+        ``_apply_vcf_anchor``); mirrors ``correct_reference_alleles.py``'s
+        ``_UtaRefResolver.true_intronic_base``, generalized from one position
+        to a range.
+
+        Maps both endpoints to genomic coordinates via ``hgvs``'s c-to-g
+        mapper (tolerant of a non-substitution, position-only variant -- it
+        doesn't validate the deleted sequence, so a placeholder ``del`` with
+        no explicit bases is fine for this position math), fetches the
+        (always-contiguous) genomic sequence spanning them, and reverse-
+        complements it back to transcript-strand orientation -- which also
+        reorders it from genomic-ascending to transcript-ascending -- when the
+        transcript is on the minus strand. ``c_anchor`` is returned as the
+        first character of the result either way, matching
+        ``_apply_vcf_anchor``'s `anchor + deleted_bases` convention.
+        """
+        try:
+            mapping_options = self._hdp.get_tx_mapping_options(tx_ac)
+            if not mapping_options:
+                return None
+            alt_ac, alt_aln_method = mapping_options[0][1], mapping_options[0][2]
+
+            # A syntactically valid deletion variant is enough for c_to_g's
+            # position mapping -- it doesn't validate the deleted sequence,
+            # so this placeholder ``del`` (no explicit bases) is fine.
+            var_c = self._parser.parse_hgvs_variant(f"{tx_ac}:c.{c_anchor}_{c_stop}del")
+            var_g = self._vm.c_to_g(var_c, alt_ac)
+            g_anchor = var_g.posedit.pos.start.base
+            g_stop = var_g.posedit.pos.end.base
+            if g_anchor is None or g_stop is None:
+                return None
+            g_low, g_high = sorted((g_anchor, g_stop))
+
+            genomic_seq = self._hdp.get_seq(alt_ac, g_low - 1, g_high)
+            if not genomic_seq:
+                return None
+            genomic_seq = genomic_seq.upper()
+
+            exons = self._hdp.get_tx_exons(tx_ac, alt_ac, alt_aln_method)
+            if not exons:
+                return None
+            strand = getattr(exons[0], "alt_strand", None)
+            if strand is None and hasattr(exons[0], "__getitem__"):
+                try:
+                    strand = exons[0]["alt_strand"]
+                except (KeyError, TypeError):
+                    strand = None
+            if strand is None:
+                return None
+
+            return _reverse_complement(genomic_seq) if int(strand) == -1 else genomic_seq
         except Exception:
             return None
 
@@ -180,6 +246,20 @@ def _get_cds_start_i(accession: str) -> Optional[int]:
         return None
     try:
         return resolver.get_cds_start_i(accession)
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=1000)
+def _fetch_intron_spanning_ref(accession: str, c_anchor: int, c_stop: str) -> Optional[str]:
+    """See `_HgvsRefResolver.get_intron_spanning_ref`. Returns None when UTA is
+    unavailable, `c_stop` doesn't parse as HGVS, or position mapping fails.
+    """
+    resolver = _get_hgvs_ref_resolver()
+    if resolver is None:
+        return None
+    try:
+        return resolver.get_intron_spanning_ref(accession, c_anchor, c_stop)
     except Exception:
         return None
 
@@ -270,10 +350,25 @@ def _apply_vcf_anchor(
             anchor_c = start_int - 1
             if anchor_c < 1:
                 return start, stop, ref, alt
-            anchor = _fetch_ref_seq(accession, _tx_pos(anchor_c), _tx_pos(anchor_c))
-            if anchor is None:
-                return start, stop, ref, alt
-            return str(anchor_c), stop, anchor + (ref or ""), anchor
+            if ref:
+                anchor = _fetch_ref_seq(accession, _tx_pos(anchor_c), _tx_pos(anchor_c))
+                if anchor is None:
+                    return start, stop, ref, alt
+                return str(anchor_c), stop, anchor + ref, anchor
+            else:
+                # Deleted bases unknown. A plain CDS-offset fetch (the `if
+                # ref` branch above) only resolves the single anchor base,
+                # and only works when it's exonic -- it can't locate a
+                # `stop` that crosses into an intron ("375+1"-style), since
+                # the transcript's own spliced sequence has no bases there.
+                # Resolve the whole anchor-plus-deleted-region sequence via
+                # genomic coordinates instead, which handles both the
+                # purely-exonic and intron-spanning cases (see
+                # `_HgvsRefResolver.get_intron_spanning_ref`).
+                full_seq = _fetch_intron_spanning_ref(accession, anchor_c, stop)
+                if full_seq is None:
+                    return start, stop, ref, alt
+                return str(anchor_c), stop, full_seq, full_seq[0]
 
     else:  # g.
         if is_insertion:

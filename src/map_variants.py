@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Map variants from a CSV/TSV input file to human-genome reference HGVS strings.
 
 Provenance

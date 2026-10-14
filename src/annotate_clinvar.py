@@ -1,3 +1,6 @@
+# Copyright (C) 2026 Jeremy Stone
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
 """Annotate variant rows with ClinVar clinical-significance data.
 
 For each row produced by ``map_variants.py`` (or ``reverse_translate_protein_variants.py``),
