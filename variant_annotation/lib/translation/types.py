@@ -67,22 +67,20 @@ class ProjectionPair:
     by co-membership in the equivalence class, not here.) A ProjectionPair holds
     that deterministic pairing as one object: the coding allele, its genomic
     projection, and the variant type the reverse-translate-variants CLI assigned
-    it. The CLI emits these three columns position-aligned per candidate (with
-    ``--one-row-per-input``); this dataclass is that row-wise unit, so the
-    pairing survives instead of being split into two lists that downstream must
-    re-zip by index.
+    it, so the pairing survives instead of being split into two lists that
+    downstream must re-zip by index.
 
     Fields:
         hgvs_c: The coding (c.) HGVS expression. Always present — a pair is
             keyed by its coding candidate.
-        hgvs_g: The genomic (g.) HGVS projection, or ``None`` when the c→g
-            projection failed (e.g. an intronic candidate the mapper cannot
-            resolve). ``None`` is a well-formed one-sided pair, NOT a
-            list-desync — this is the case the old two-list shape silently
-            dropped, misaligning every candidate after it. A single coding
-            delins projects to a single genomic delins, never a cis-phased
-            ``g.[a;b]`` set, so it identifies as the same allele dcd-mapping
-            and the lab pipeline produce for that change.
+        hgvs_g: The genomic (g.) HGVS projection made by
+            :func:`~variant_annotation.lib.translation.projection.coding_to_genomic`,
+            or ``None`` when no single genomic change describes the coding one
+            (a codon split by an intron) or hgvs cannot project it. ``None`` is
+            a well-formed one-sided pair. A single coding delins projects to a
+            single genomic delins, never a cis-phased ``g.[a;b]`` set, so it
+            identifies as the same allele dcd-mapping and the lab pipeline
+            produce for that change.
         variant_type: The CLI's classification of the candidate ("snv",
             "insertion", "deletion", "delins"), or ``None`` if unreported.
 

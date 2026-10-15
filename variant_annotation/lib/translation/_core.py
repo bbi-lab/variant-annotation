@@ -28,7 +28,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from ..accessions import (
     extract_accession,
@@ -37,6 +37,7 @@ from ..accessions import (
 )
 from ..consequence import ProteinConsequence
 from ._ports import CoordinateTranslator, TranscriptSource
+from .projection import coding_to_genomic
 from .types import (
     ProjectionPair,
     TranslationConfig,
@@ -125,9 +126,8 @@ class _BatchOutputRow:
     """Parsed output for one consequence from the reverse-translate-variants subprocess.
 
     projection_pairs holds the consequence's fanned-out equivalence class as
-    ProjectionPair objects — one per coding candidate, carrying its genomic
-    projection and variant type. The pairing is parsed straight from the CLI's
-    position-aligned columns, never re-derived by index.
+    ProjectionPair objects — one per coding candidate, with its variant type.
+    Their genomic projections are added by :func:`_build_result`.
     """
 
     projection_pairs: list[ProjectionPair]
@@ -145,10 +145,9 @@ class _BatchErrorRow:
 def _split_aligned(value: str) -> list[str]:
     """Split a join-delimited candidate column into its per-candidate cells.
 
-    Unlike a naive filter-empties split, this preserves empty cells: an empty
-    genomic cell is a meaningful position holder (a candidate whose c→g
-    projection failed), so the columns must stay index-aligned. An entirely
-    blank column means zero candidates and returns an empty list.
+    Unlike a naive filter-empties split, this preserves empty cells, so the
+    columns stay index-aligned. An entirely blank column means zero candidates
+    and returns an empty list.
     """
     return value.split(_JOIN_DELIMITER) if value.strip() else []
 
@@ -157,14 +156,12 @@ def _parse_projection_pairs(row: dict[str, str]) -> list[ProjectionPair]:
     """Parse one CLI output row into position-aligned ProjectionPair objects.
 
     The reverse-translate-variants CLI (run with --one-row-per-input) emits the
-    equivalence class as parallel pipe-joined columns — variant_type[i],
-    hgvs_c[i] and hgvs_g[i] all describe candidate i. We zip them column-wise so
-    each candidate's fields land in a single pair. A pair is keyed by its coding
-    expression; an empty genomic cell becomes hgvs_g=None (projection failed)
-    rather than shifting subsequent candidates out of alignment.
+    equivalence class as parallel pipe-joined columns — variant_type[i] and
+    hgvs_c[i] describe candidate i. We zip them column-wise so each candidate's
+    fields land in a single pair. The CLI's genomic column is not read: every
+    genomic projection is made by :func:`.projection.coding_to_genomic`.
     """
     coding = _split_aligned(row.get("hgvs_c") or "")
-    genomic = _split_aligned(row.get("hgvs_g") or "")
     variant_types = _split_aligned(row.get("variant_type") or "")
 
     pairs: list[ProjectionPair] = []
@@ -175,15 +172,8 @@ def _parse_projection_pairs(row: dict[str, str]) -> list[ProjectionPair]:
         if not hgvs_c:
             continue
 
-        hgvs_g = genomic[i].strip() if i < len(genomic) else ""
         variant_type = variant_types[i].strip() if i < len(variant_types) else ""
-        pairs.append(
-            ProjectionPair(
-                hgvs_c=hgvs_c,
-                hgvs_g=hgvs_g or None,
-                variant_type=variant_type or None,
-            )
-        )
+        pairs.append(ProjectionPair(hgvs_c=hgvs_c, variant_type=variant_type or None))
 
     return pairs
 
@@ -461,18 +451,12 @@ def _apply_wt_codon(
     *,
     config: TranslationConfig,
     transcripts: TranscriptSource,
-    coordinates: CoordinateTranslator,
 ) -> list[ProjectionPair]:
-    """Append the WT-codon delins projection pair when applicable.
+    """Append the WT-codon delins pair when applicable.
 
     The WT codon is a synonymous intra-codon delins (the reference codon spelled
-    out) that the reverse-translate tool does not itself emit. We add it as a
-    whole ProjectionPair — coding expression, its genomic projection (None if
-    c→g fails), and variant_type "delins" — so the coding/genomic pairing is
-    added atomically. Appending one paired object (rather than pushing onto two
-    independent lists) makes the coding/genomic desync impossible by
-    construction: a failed genomic projection yields hgvs_g=None on the same
-    pair, never a shorter genomic list.
+    out) that the reverse-translate tool does not itself emit. Its genomic
+    projection is added with every other pair's by :func:`_build_result`.
     """
     if config.wt_codon_mode is WtCodonMode.NONE:
         return pairs
@@ -493,85 +477,7 @@ def _apply_wt_codon(
     if any(pair.hgvs_c == wt_c for pair in pairs):
         return pairs
 
-    try:
-        wt_g = coordinates.c_to_g(wt_c)
-    except Exception:
-        wt_g = None
-
-    return pairs + [ProjectionPair(hgvs_c=wt_c, hgvs_g=wt_g or None, variant_type="delins")]
-
-
-_SINGLE_CODING_DELINS_RE = re.compile(r":c\.\d+_\d+delins[ACGT]+$")
-_GENOMIC_INVERSION_RE = re.compile(r"^(?P<ac>[^:]+):g\.(?P<start>\d+)_(?P<end>\d+)inv$")
-_CODING_INSERTION_RE = re.compile(r":c\.\d+_\d+ins[ACGT]+$")
-_GENOMIC_DELETION_RE = re.compile(r":g\.\d+_\d+del")
-_GENOMIC_DELINS_RE = re.compile(r"^(?P<ac>[^:]+):g\.(?P<start>\d+)(?:_(?P<end>\d+))?delins(?P<alt>[ACGTN]+)$")
-
-
-def _inversion_as_delins(inversion: str, hgvs_c: str, coordinates: CoordinateTranslator) -> str | None:
-    """Rewrite a genomic ``inv`` as the delins it stands for, or ``None`` if that can't be done exactly.
-
-    HGVS normalization writes a delins whose inserted bases are the reverse complement of the reference
-    as ``inv``, which VRS cannot translate. The normalized ``inv`` carries the trimmed span; the
-    unnormalized projection of the same coding delins carries the inserted bases over a span that may
-    include unchanged flanking bases. Cutting those bases to the trimmed span gives the delins
-    normalization would have written, with no sequence lookup.
-    """
-    inv = _GENOMIC_INVERSION_RE.match(inversion)
-    literal = _GENOMIC_DELINS_RE.match(coordinates.c_to_g_literal(hgvs_c))
-    if inv is None or literal is None or literal["ac"] != inv["ac"]:
-        return None
-
-    start, end = int(inv["start"]), int(inv["end"])
-    literal_start = int(literal["start"])
-    literal_end = int(literal["end"] or literal_start)
-    alt = literal["alt"]
-    if len(alt) != literal_end - literal_start + 1 or not literal_start <= start <= end <= literal_end:
-        return None
-
-    return f"{inv['ac']}:g.{start}_{end}delins{alt[start - literal_start : end - literal_start + 1]}"
-
-
-def _repair_genomic_projections(pairs: list[ProjectionPair], coordinates: CoordinateTranslator) -> list[ProjectionPair]:
-    """Correct, or drop, genomic projections from reverse-translate-variants that misstate the coding change.
-
-    Each pair's genomic member should be the coding member's change on the genome, written the way
-    dcd-mapping and the WT-codon pair below write it. The CLI departs from that in three ways:
-
-    * a codon change with an unchanged middle base becomes a cis-phased pair (``g.[1315654A>G;1315656T>G]``),
-      a different VRS type that never matches the same change mapped as a delins: re-projected as one delins;
-    * a delins whose inserted bases are the reverse complement of the reference becomes ``inv``, which VRS
-      cannot translate: rewritten as the delins it stands for;
-    * an insertion between two exons' bases (``c.1903_1904insGAA`` at an exon junction) becomes a delins
-      deleting the intron between them: dropped. The CLI also emits the same coding allele inside one exon,
-      whose projection is correct.
-
-    A projection that can't be corrected is ``hgvs_g=None``, as in :func:`_apply_wt_codon`, never the
-    original form.
-    """
-    projected: list[ProjectionPair] = []
-    for pair in pairs:
-        hgvs_g = pair.hgvs_g
-        if hgvs_g and _CODING_INSERTION_RE.search(pair.hgvs_c) and _GENOMIC_DELETION_RE.search(hgvs_g):
-            projected.append(ProjectionPair(hgvs_c=pair.hgvs_c, hgvs_g=None, variant_type=pair.variant_type))
-            continue
-
-        cis_phased = bool(hgvs_g and ":g.[" in hgvs_g)
-        inversion = bool(hgvs_g and _GENOMIC_INVERSION_RE.match(hgvs_g))
-        if not ((cis_phased or inversion) and _SINGLE_CODING_DELINS_RE.search(pair.hgvs_c)):
-            projected.append(pair)
-            continue
-
-        try:
-            reprojected: str | None = coordinates.c_to_g(pair.hgvs_c) if cis_phased else hgvs_g
-            if reprojected and _GENOMIC_INVERSION_RE.match(reprojected):
-                reprojected = _inversion_as_delins(reprojected, pair.hgvs_c, coordinates)
-        except Exception:
-            logger.warning("Could not project coding delins %s to genomic", pair.hgvs_c, exc_info=True)
-            reprojected = None
-        projected.append(ProjectionPair(hgvs_c=pair.hgvs_c, hgvs_g=reprojected or None, variant_type=pair.variant_type))
-
-    return projected
+    return pairs + [ProjectionPair(hgvs_c=wt_c, variant_type="delins")]
 
 
 def _build_result(
@@ -582,15 +488,12 @@ def _build_result(
     *,
     config: TranslationConfig,
     transcripts: TranscriptSource,
-    coordinates: CoordinateTranslator,
+    project: Callable[[str], str | None],
 ) -> TranslationResult | TranslationError:
-    pairs = _apply_wt_codon(
-        _repair_genomic_projections(output_row.projection_pairs, coordinates),
-        consequence,
-        config=config,
-        transcripts=transcripts,
-        coordinates=coordinates,
-    )
+    pairs = [
+        ProjectionPair(hgvs_c=pair.hgvs_c, hgvs_g=project(pair.hgvs_c), variant_type=pair.variant_type)
+        for pair in _apply_wt_codon(output_row.projection_pairs, consequence, config=config, transcripts=transcripts)
+    ]
     error = error_messages[0] if error_messages else None
 
     if not pairs:
@@ -642,6 +545,11 @@ def construct_equivalent_variants(
     The output set includes the input variant itself when it is a c./g. input
     that encodes its own protein consequence — the library makes no exclusions.
     Callers (e.g. mavedb-api) can deduplicate via vrs_digest before DB writes.
+
+    Raises when a genomic projection fails for a reason other than the
+    candidate itself (see :func:`.projection.coding_to_genomic`), such as an
+    unreachable data provider, rather than reporting the candidates it could
+    not project as having no genomic form.
     """
     if not inputs:
         return [], []
@@ -709,7 +617,15 @@ def construct_equivalent_variants(
     for err in error_rows:
         error_messages_by_key[(err.transcript, err.hgvs_p)].append(err.error)
 
-    # Phase 3: build results, applying WT codon mode per consequence.
+    # Phase 3: build results, applying WT codon mode per consequence. Inputs sharing a consequence
+    # share its candidates, so each candidate is projected once.
+    projections: dict[str, str | None] = {}
+
+    def project(hgvs_c: str) -> str | None:
+        if hgvs_c not in projections:
+            projections[hgvs_c] = coding_to_genomic(hgvs_c, coordinates)
+        return projections[hgvs_c]
+
     results: list[TranslationResult] = []
     late_errors: list[TranslationError] = []
 
@@ -727,7 +643,7 @@ def construct_equivalent_variants(
             error_msgs,
             config=config,
             transcripts=transcripts,
-            coordinates=coordinates,
+            project=project,
         )
         if isinstance(outcome, TranslationResult):
             results.append(outcome)

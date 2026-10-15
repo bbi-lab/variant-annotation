@@ -49,7 +49,15 @@ class CoordinateTranslator(Protocol):
     def c_to_g_literal(self, c_hgvs: str) -> str:
         """Project a coding HGVS string to genomic without HGVS normalization.
 
-        Keeps a delins a delins (normalization may rewrite it as ``inv``) at the cost of untrimmed flanking
-        bases. Used only to recover the inserted bases of a projection that normalized to ``inv``.
+        Keeps each end where it maps and a delins a delins (normalization may shift it, or rewrite it as
+        ``inv``). Used to check a projection's span and to recover the inserted bases of an ``inv``.
         """
+        ...
+
+    def g_to_c_literal(self, g_hgvs: str, transcript: str) -> str:
+        """Project a genomic HGVS string to coding on transcript without HGVS normalization."""
+        ...
+
+    def c_to_n(self, c_hgvs: str) -> str:
+        """Project a coding HGVS string to transcript (``n.``) coordinates, which count exonic bases only."""
         ...

@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Every coding↔genomic projection goes through `variant_annotation.lib.translation.coding_to_genomic` / `genomic_to_coding`, so reverse translation's candidates, its WT-codon candidate and consumers' own projections follow one set of rules. The `reverse-translate-variants` CLI's genomic column is no longer read.
+- `CoordinateTranslator` gains `g_to_c_literal` and `c_to_n`; `HgvsMapper` implements both.
+- A genomic projection that hgvs cannot make for a reason other than the variant (an unreachable data provider) is raised from `construct_equivalent_variants` instead of being reported as a candidate with no genomic form.
+
+### Fixed
+
+- A coding change across an exon junction (a codon split by an intron, an insertion between two exons' bases, or the WT codon at a split codon) no longer projects to a genomic change that deletes the intron. It has no genomic projection.
+
 ## [1.1.0] - 2026-10-12
 
 ### Changed

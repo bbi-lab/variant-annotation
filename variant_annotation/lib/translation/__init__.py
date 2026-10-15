@@ -8,6 +8,7 @@ Composition roots (pipeline/, mavedb-api) import from here.
 
 from ._core import construct_equivalent_variants, construct_one
 from ._ports import CoordinateTranslator, TranscriptSource
+from .projection import coding_to_genomic, genomic_to_coding
 from .types import (
     ProjectionPair,
     TranslationConfig,
@@ -19,8 +20,10 @@ from .types import (
 )
 
 __all__ = [
+    "coding_to_genomic",
     "construct_equivalent_variants",
     "construct_one",
+    "genomic_to_coding",
     "ProjectionPair",
     "CoordinateTranslator",
     "TranscriptSource",

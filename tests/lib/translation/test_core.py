@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
 import pytest
+from hgvs.exceptions import HGVSInvalidVariantError
 
 from variant_annotation.lib.consequence import ProteinConsequence
 from variant_annotation.lib.translation import _core
@@ -12,7 +13,6 @@ from variant_annotation.lib.translation._core import (
     _classify_kind,
     _parse_projection_pairs,
     _parse_protein_aa_change,
-    _repair_genomic_projections,
     _untranslatable_edit_reason,
     construct_equivalent_variants,
     construct_one,
@@ -39,17 +39,43 @@ class _StubTranscripts:
 
 
 class _StubCoordinates:
+    """Projects nothing: hgvs rejects every candidate, so each pair's genomic form is None."""
+
     def c_to_p(self, c):
         raise NotImplementedError
 
     def g_to_c(self, g, tx):
         raise NotImplementedError
 
+    def _reject(self, hgvs):
+        raise HGVSInvalidVariantError(f"cannot project {hgvs}")
+
     def c_to_g(self, c):
-        raise NotImplementedError
+        self._reject(c)
 
     def c_to_g_literal(self, c):
-        raise NotImplementedError
+        self._reject(c)
+
+    def g_to_c_literal(self, g, tx):
+        self._reject(g)
+
+    def c_to_n(self, c):
+        self._reject(c)
+
+
+class _GenomicCoordinates(_StubCoordinates):
+    """Projects the coding changes in ``genomic``; every coding interval spans the same bases on both levels."""
+
+    def __init__(self, genomic: dict[str, str]):
+        self.genomic = genomic
+
+    def c_to_g(self, c):
+        return self.genomic[c] if c in self.genomic else self._reject(c)
+
+    c_to_g_literal = c_to_g
+
+    def c_to_n(self, c):
+        return c.replace(":c.", ":n.")
 
 
 # ---------------------------------------------------------------------------
@@ -326,27 +352,19 @@ def test_wt_codon_member_added_for_parenthesized_synonymous(monkeypatch):
         def codon_at(self, tx, pos):
             return "TTT"
 
-    class _Coordinates:
-        def c_to_p(self, c):
-            raise NotImplementedError
-
-        def g_to_c(self, g, tx):
-            raise NotImplementedError
-
-        def c_to_g(self, c):
-            return "NC_000013.11:g.32346894delinsTTT"
+    coordinates = _GenomicCoordinates({"NM_000059.4:c.7003_7005delinsTTT": "NC_000013.11:g.32346892_32346894delinsAAA"})
 
     result = _core.construct_one(
         VariantInput(hgvs="NP_000050.3:p.(Phe2335=)", transcript="NM_000059.4"),
         transcripts=_Transcripts(),
-        coordinates=_Coordinates(),
+        coordinates=coordinates,
         config=TranslationConfig(wt_codon_mode=WtCodonMode.ALL, include_indels=True),
     )
     assert isinstance(result, TranslationResult)
     # The WT codon rides in as a whole projection pair: its coding and genomic
     # expressions live on the same object (never on two independently-appended lists).
     wt = next(c for c in result.projection_pairs if c.hgvs_c == "NM_000059.4:c.7003_7005delinsTTT")
-    assert wt.hgvs_g == "NC_000013.11:g.32346894delinsTTT"
+    assert wt.hgvs_g == "NC_000013.11:g.32346892_32346894delinsAAA"
     assert wt.variant_type == "delins"
 
 
@@ -365,7 +383,8 @@ def test_construct_one_returns_error_for_unresolvable_input():
 
 def test_parse_projection_pairs_degenerate_consequence_yields_n_pairs():
     # A degenerate protein consequence fans out into N coding candidates, each
-    # paired with its genomic projection and variant type, in CLI column order.
+    # with its variant type, in CLI column order. The CLI's genomic column is
+    # not read; genomic forms are projected later.
     row = {
         "variant_type": "snv|snv|snv",
         "hgvs_c": "NM_1:c.1A>G|NM_1:c.1A>C|NM_1:c.1A>T",
@@ -374,27 +393,20 @@ def test_parse_projection_pairs_degenerate_consequence_yields_n_pairs():
     candidates = _parse_projection_pairs(row)
 
     assert [c.hgvs_c for c in candidates] == ["NM_1:c.1A>G", "NM_1:c.1A>C", "NM_1:c.1A>T"]
-    assert [c.hgvs_g for c in candidates] == ["NC_1:g.1A>G", "NC_1:g.1A>C", "NC_1:g.1A>T"]
+    assert all(c.hgvs_g is None for c in candidates)
     assert all(c.variant_type == "snv" for c in candidates)
 
 
-def test_parse_projection_pairs_projection_failed_is_none_not_desync():
-    # The bug this refactor fixes: a candidate whose genomic projection failed
-    # leaves an empty g cell. Under the old filter-empties split the g list went
-    # short and every later candidate paired with the wrong g. Row-wise parsing
-    # keeps the coding candidate with hgvs_g=None and preserves alignment of the
-    # candidates on either side.
-    row = {
-        "variant_type": "snv|snv|snv",
-        "hgvs_c": "NM_1:c.1A>G|NM_1:c.1A>C|NM_1:c.1A>T",
-        "hgvs_g": "NC_1:g.1A>G||NC_1:g.1A>T",  # middle candidate's projection failed
-    }
+def test_parse_projection_pairs_skipped_candidate_keeps_alignment():
+    # A candidate with no coding cell is skipped without pairing later candidates
+    # with the wrong variant type.
+    row = {"variant_type": "snv|insertion|delins", "hgvs_c": "NM_1:c.1A>G||NM_1:c.1_3delinsTTT", "hgvs_g": ""}
     candidates = _parse_projection_pairs(row)
 
-    assert len(candidates) == 3
-    assert candidates[0].hgvs_c == "NM_1:c.1A>G" and candidates[0].hgvs_g == "NC_1:g.1A>G"
-    assert candidates[1].hgvs_c == "NM_1:c.1A>C" and candidates[1].hgvs_g is None
-    assert candidates[2].hgvs_c == "NM_1:c.1A>T" and candidates[2].hgvs_g == "NC_1:g.1A>T"
+    assert [(c.hgvs_c, c.variant_type) for c in candidates] == [
+        ("NM_1:c.1A>G", "snv"),
+        ("NM_1:c.1_3delinsTTT", "delins"),
+    ]
 
 
 def test_parse_projection_pairs_no_candidates_is_empty():
@@ -402,15 +414,11 @@ def test_parse_projection_pairs_no_candidates_is_empty():
 
 
 # ---------------------------------------------------------------------------
-# _apply_wt_codon — WT-genomic-fails preserves alignment by construction (A3)
+# _apply_wt_codon
 # ---------------------------------------------------------------------------
 
 
-def test_apply_wt_codon_genomic_failure_yields_paired_none_not_desync():
-    # Regression for the latent desync: when the WT codon's c->g projection
-    # fails, the coding candidate must still be appended with hgvs_g=None as a
-    # single projection pair -- never a coding entry with no matching genomic
-    # entry (which the old two-list append produced).
+def test_apply_wt_codon_appends_the_reference_codon_delins():
     class _Transcripts:
         def transcript_for_protein(self, acc):
             return None
@@ -418,35 +426,22 @@ def test_apply_wt_codon_genomic_failure_yields_paired_none_not_desync():
         def codon_at(self, tx, pos):
             return "TTT"
 
-    class _Coordinates:
-        def c_to_p(self, c):
-            raise NotImplementedError
-
-        def g_to_c(self, g, tx):
-            raise NotImplementedError
-
-        def c_to_g(self, c):
-            raise RuntimeError("intronic projection unavailable")
-
-    existing = [ProjectionPair(hgvs_c="NM_000059.4:c.7005T>C", hgvs_g="NC_000013.11:g.32346894T>C")]
+    existing = [ProjectionPair(hgvs_c="NM_000059.4:c.7005T>C")]
     out = _apply_wt_codon(
         existing,
         ProteinConsequence(hgvs_p="NP_000050.3:p.(Phe2335=)", transcript="NM_000059.4"),
         config=TranslationConfig(wt_codon_mode=WtCodonMode.ALL, include_indels=True),
         transcripts=_Transcripts(),
-        coordinates=_Coordinates(),
     )
 
-    assert len(out) == 2
-    wt = out[-1]
-    assert wt.hgvs_c == "NM_000059.4:c.7003_7005delinsTTT"
-    assert wt.hgvs_g is None  # projection failed, but the pair object is intact
-    assert wt.variant_type == "delins"
+    assert out[:1] == existing
+    assert out[-1] == ProjectionPair(hgvs_c="NM_000059.4:c.7003_7005delinsTTT", variant_type="delins")
 
 
 def test_construct_equivalent_variants_end_to_end_returns_projection_pairs(monkeypatch):
     # End-to-end (subprocess stubbed): the equivalence class arrives as
-    # ProjectionPair objects, projection-failed members carrying hgvs_g=None.
+    # ProjectionPair objects, each projected to genomic, with hgvs_g=None where
+    # the projection is rejected.
     monkeypatch.setattr(_core, "_find_reverse_translate_cli", lambda: "/bin/true")
     monkeypatch.setattr(
         _core,
@@ -455,8 +450,8 @@ def test_construct_equivalent_variants_end_to_end_returns_projection_pairs(monke
             [
                 _core._BatchOutputRow(
                     projection_pairs=[
-                        ProjectionPair(hgvs_c="NM_1:c.3G>A", hgvs_g="NC_1:g.3G>A", variant_type="snv"),
-                        ProjectionPair(hgvs_c="NM_1:c.3G>T", hgvs_g=None, variant_type="snv"),
+                        ProjectionPair(hgvs_c="NM_1:c.3G>A", variant_type="snv"),
+                        ProjectionPair(hgvs_c="NM_1:c.3G>T", variant_type="snv"),
                     ]
                 )
             ],
@@ -467,7 +462,7 @@ def test_construct_equivalent_variants_end_to_end_returns_projection_pairs(monke
     results, errors = _core.construct_equivalent_variants(
         [VariantInput(hgvs="NP_1:p.Trp1Cys", transcript="NM_1")],
         transcripts=_StubTranscripts(),
-        coordinates=_StubCoordinates(),
+        coordinates=_GenomicCoordinates({"NM_1:c.3G>A": "NC_1:g.3G>A"}),
     )
     assert errors == []
     assert len(results) == 1
@@ -706,134 +701,49 @@ def test_empty_row_with_non_transient_error_is_not_retried(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# _repair_genomic_projections — genomic projections the CLI misstates
+# genomic projection of candidates
 # ---------------------------------------------------------------------------
 
 
-class _DelinsCoordinates(_StubCoordinates):
-    def c_to_g(self, c):
-        assert c == "NM_003345.5:c.151_153delinsGCG"
-        return "NC_000016.10:g.1315654_1315656delinsGCG"
-
-
-def test_repair_genomic_projections_replaces_a_cis_phased_projection_with_a_single_delins():
-    pairs = [
-        ProjectionPair(
-            hgvs_c="NM_003345.5:c.151_153delinsGCG",
-            hgvs_g="NC_000016.10:g.[1315654A>G;1315656T>G]",
-            variant_type="delins",
-        )
-    ]
-
-    assert _repair_genomic_projections(pairs, _DelinsCoordinates()) == [
-        ProjectionPair(
-            hgvs_c="NM_003345.5:c.151_153delinsGCG",
-            hgvs_g="NC_000016.10:g.1315654_1315656delinsGCG",
-            variant_type="delins",
-        )
-    ]
-
-
-@pytest.mark.parametrize(
-    "pair",
-    [
-        ProjectionPair(hgvs_c="NM_003345.5:c.151A>G", hgvs_g="NC_000016.10:g.1315654A>G", variant_type="snv"),
-        ProjectionPair(
-            hgvs_c="NM_003345.5:c.151_153delinsGCG",
-            hgvs_g="NC_000016.10:g.1315654_1315656delinsGCG",
-            variant_type="delins",
-        ),
-        ProjectionPair(hgvs_c="NM_003345.5:c.151_153delinsGCG", hgvs_g=None, variant_type="delins"),
-    ],
-    ids=["snv", "already a delins", "projection failed"],
-)
-def test_repair_genomic_projections_leaves_other_pairs_untouched(pair):
-    assert _repair_genomic_projections([pair], _StubCoordinates()) == [pair]
-
-
-def test_repair_genomic_projections_failed_projection_is_none_not_the_cis_phased_form():
-    pair = ProjectionPair(
-        hgvs_c="NM_003345.5:c.151_153delinsGCG",
-        hgvs_g="NC_000016.10:g.[1315654A>G;1315656T>G]",
-        variant_type="delins",
+def _stub_one_candidate(monkeypatch, hgvs_c):
+    monkeypatch.setattr(_core, "_find_reverse_translate_cli", lambda: "/bin/true")
+    monkeypatch.setattr(
+        _core,
+        "_run_reverse_translate_batch",
+        lambda cli, cons, *, config: ([_row(hgvs_c) for _ in cons], []),
     )
 
-    assert _repair_genomic_projections([pair], _StubCoordinates()) == [
-        ProjectionPair(hgvs_c="NM_003345.5:c.151_153delinsGCG", hgvs_g=None, variant_type="delins")
-    ]
+
+def test_inputs_sharing_a_consequence_project_each_candidate_once(monkeypatch):
+    _stub_one_candidate(monkeypatch, "NM_000001.1:c.2C>T")
+    calls = []
+
+    class _Counting(_GenomicCoordinates):
+        def c_to_g(self, c):
+            calls.append(c)
+            return super().c_to_g(c)
+
+    results, errors = construct_equivalent_variants(
+        [VariantInput(hgvs="NP_000001.1:p.Ala1Val", transcript="NM_000001.1")] * 2,
+        transcripts=_StubTranscripts(),
+        coordinates=_Counting({"NM_000001.1:c.2C>T": "NC_1:g.2C>T"}),
+    )
+
+    assert errors == []
+    assert [r.projection_pairs[0].hgvs_g for r in results] == ["NC_1:g.2C>T", "NC_1:g.2C>T"]
+    assert calls == ["NM_000001.1:c.2C>T"]
 
 
-class _InversionCoordinates(_StubCoordinates):
-    """Normalized projection gives ``inv``; the literal one keeps the delins, here with an unchanged flank."""
+def test_an_unreachable_coordinate_service_is_raised_not_reported_as_no_projection(monkeypatch):
+    _stub_one_candidate(monkeypatch, "NM_000001.1:c.2C>T")
 
-    def c_to_g(self, c):
-        return "NC_000017.11:g.3498898_3498899inv"
-
-    def c_to_g_literal(self, c):
-        return "NC_000017.11:g.3498897_3498899delinsAGT"
-
-
-@pytest.mark.parametrize(
-    "cli_hgvs_g",
-    ["NC_000017.11:g.3498898_3498899inv", "NC_000017.11:g.[3498898A>G;3498899C>T]"],
-    ids=["cli wrote inv", "cli wrote cis-phased and the reprojection is inv"],
-)
-def test_repair_genomic_projections_rewrites_an_inversion_as_the_delins_on_its_trimmed_span(cli_hgvs_g):
-    pair = ProjectionPair(hgvs_c="NM_000049.4:c.752_753delinsGT", hgvs_g=cli_hgvs_g, variant_type="delins")
-
-    (projected,) = _repair_genomic_projections([pair], _InversionCoordinates())
-
-    assert projected.hgvs_g == "NC_000017.11:g.3498898_3498899delinsGT"
-
-
-@pytest.mark.parametrize(
-    "literal",
-    ["NC_000017.11:g.3498898_3498899inv", "NC_000001.11:g.3498898_3498899delinsGT", "NC_000017.11:g.3498899delinsG"],
-    ids=["literal is still an inversion", "different accession", "span does not cover the inversion"],
-)
-def test_repair_genomic_projections_inversion_it_cannot_rewrite_exactly_is_none(literal):
-    class _Coordinates(_InversionCoordinates):
+    class _Unreachable(_StubCoordinates):
         def c_to_g_literal(self, c):
-            return literal
+            raise ConnectionError("cdot-rest unreachable")
 
-    pair = ProjectionPair(
-        hgvs_c="NM_000049.4:c.752_753delinsGT", hgvs_g="NC_000017.11:g.3498898_3498899inv", variant_type="delins"
-    )
-
-    (projected,) = _repair_genomic_projections([pair], _Coordinates())
-
-    assert projected.hgvs_g is None
-
-
-def test_repair_genomic_projections_inversion_without_a_literal_projection_is_none():
-    pair = ProjectionPair(
-        hgvs_c="NM_000049.4:c.752_753delinsGT", hgvs_g="NC_000017.11:g.3498898_3498899inv", variant_type="delins"
-    )
-
-    (projected,) = _repair_genomic_projections([pair], _StubCoordinates())
-
-    assert projected.hgvs_g is None
-
-
-@pytest.mark.parametrize(
-    "hgvs_g",
-    ["NC_000002.12:g.214730509_214745065delinsTT", "NC_000002.12:g.214730511_214745065del"],
-    ids=["delins across the intron", "deletion across the intron"],
-)
-def test_repair_genomic_projections_drops_an_insertion_projected_across_an_intron(hgvs_g):
-    pair = ProjectionPair(hgvs_c="NM_000465.4:c.1903_1904insGAA", hgvs_g=hgvs_g, variant_type="insertion")
-
-    (projected,) = _repair_genomic_projections([pair], _StubCoordinates())
-
-    assert projected == ProjectionPair(hgvs_c="NM_000465.4:c.1903_1904insGAA", hgvs_g=None, variant_type="insertion")
-
-
-@pytest.mark.parametrize(
-    "hgvs_g",
-    ["NC_000002.12:g.214730508_214730509insTTC", "NC_000002.12:g.214730508_214730510dup"],
-    ids=["insertion", "duplication"],
-)
-def test_repair_genomic_projections_keeps_an_insertion_projected_within_an_exon(hgvs_g):
-    pair = ProjectionPair(hgvs_c="NM_000465.4:c.1904_1905insAAG", hgvs_g=hgvs_g, variant_type="insertion")
-
-    assert _repair_genomic_projections([pair], _StubCoordinates()) == [pair]
+    with pytest.raises(ConnectionError):
+        construct_equivalent_variants(
+            [VariantInput(hgvs="NP_000001.1:p.Ala1Val", transcript="NM_000001.1")],
+            transcripts=_StubTranscripts(),
+            coordinates=_Unreachable(),
+        )

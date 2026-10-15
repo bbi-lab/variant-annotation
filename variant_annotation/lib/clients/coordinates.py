@@ -50,3 +50,11 @@ class HgvsMapper:
     def c_to_g_literal(self, c_hgvs: str) -> str:
         var = self._parser.parse(c_hgvs)
         return str(self._literal_mapper.c_to_g(var))
+
+    def g_to_c_literal(self, g_hgvs: str, transcript: str) -> str:
+        var = self._parser.parse(g_hgvs)
+        return str(self._literal_mapper.g_to_t(var, transcript))
+
+    def c_to_n(self, c_hgvs: str) -> str:
+        var = self._parser.parse(c_hgvs)
+        return str(self._literal_mapper.c_to_n(var))

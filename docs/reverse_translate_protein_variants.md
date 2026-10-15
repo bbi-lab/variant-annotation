@@ -72,7 +72,7 @@ If no transcript accession can be resolved, the row is skipped with `reverse_tra
 | `touches_intronic_region` | Pipe-delimited boolean flags (`"true"`/`"false"`) aligned to `mapped_hgvs_c` candidates |
 | `spans_intron` | Pipe-delimited boolean flags (`"true"`/`"false"`) aligned to `mapped_hgvs_c` candidates |
 
-All pipe-delimited output columns are position-aligned: index 0 of `mapped_hgvs_c`, `mapped_hgvs_g`, `mapped_hgvs_c_start`, … all refer to the same candidate. An empty slot (e.g. `||` in a 3-candidate row) means that candidate could not be resolved.
+All pipe-delimited output columns are position-aligned: index 0 of `mapped_hgvs_c`, `mapped_hgvs_g`, `mapped_hgvs_c_start`, … all refer to the same candidate. An empty slot (e.g. `||` in a 3-candidate row) means that candidate could not be resolved. A genomic slot is also empty when the coding candidate crosses an exon junction (a codon split by an intron, or an insertion between two exons' bases): no single genomic change describes it.
 
 ---
 
