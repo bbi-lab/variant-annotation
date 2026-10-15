@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.0-beta.1] - 2026-10-15
+
 ### Changed
 
 - Every coding↔genomic projection goes through `variant_annotation.lib.translation.coding_to_genomic` / `genomic_to_coding`, so reverse translation's candidates, its WT-codon candidate and consumers' own projections follow one set of rules. The `reverse-translate-variants` CLI's genomic column is no longer read.
@@ -55,7 +57,8 @@ First beta release of the variant annotation pipeline.
 - Redis-backed response caching across API-calling pipeline stages, with graceful degradation when Redis is unreachable.
 - Docker Compose-based development and execution environment, including a dedicated Hail-enabled service for gnomAD lookups.
 
-[Unreleased]: https://github.com/bbi-lab/variant-annotation/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/bbi-lab/variant-annotation/compare/v1.2.0-beta.1...HEAD
+[1.2.0-beta.1]: https://github.com/bbi-lab/variant-annotation/compare/v1.1.0...v1.2.0-beta.1
 [1.1.0]: https://github.com/bbi-lab/variant-annotation/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/bbi-lab/variant-annotation/compare/v1.0.0-beta.2...v1.0.0
 [1.0.0-beta.2]: https://github.com/bbi-lab/variant-annotation/compare/v1.0.0-beta.1...v1.0.0-beta.2
