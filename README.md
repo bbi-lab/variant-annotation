@@ -1336,6 +1336,12 @@ When annotating, the pipeline tries candidates in order and returns the first su
 
 ## Local installation (without Docker)
 
+The library is published on PyPI as `bbi-variant-annotation` (`variant-annotation` is too close to an existing project's name) and imports as `variant_annotation`:
+
+```bash
+pip install bbi-variant-annotation
+```
+
 Install the package in editable mode with all extras:
 
 ```bash
