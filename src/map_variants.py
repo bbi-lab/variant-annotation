@@ -69,7 +69,7 @@ Example::
 
 Library usage::
 
-    from src.map_variants import map_variants
+    from map_variants import map_variants
 
     map_variants(
         input_file="variants.tsv",
@@ -95,7 +95,7 @@ from typing import Optional
 import click
 from dotenv import load_dotenv
 import requests
-from src.lib.clingen import query_clingen_by_hgvs
+from variant_annotation.lib.clingen import query_clingen_by_hgvs
 
 
 load_dotenv()
@@ -1318,7 +1318,7 @@ def _patch_dcd_clingen_fetch() -> None:
         return
 
     import dcd_mapping.vrs_map as _vrs_map_module  # noqa: PLC0415
-    from src.lib.clingen import _cache_get, _cache_prefix, _cache_set  # noqa: PLC0415
+    from variant_annotation.lib.clingen import _cache_get, _cache_prefix, _cache_set  # noqa: PLC0415
 
     _NONE_SENTINEL = "__NONE__"
 

@@ -48,7 +48,9 @@ RUN mkdir /usr/src/app
 WORKDIR /usr/src/app
 COPY . .
 
-RUN pip install -e '.[dev,gnomad,mapping,tests]'
+RUN pip install -e '.[dev,gnomad,tests]'
+# PyPI rejects git dependencies in package metadata, so dcd-mapping is installed here rather than as an extra.
+RUN pip install 'dcd-mapping @ git+https://github.com/VariantEffect/dcd_mapping2.git@v2026.1.2'
 # Under linux/amd64 emulation on Apple Silicon, default polars runtime may
 # require CPU features (AVX/AVX2/FMA) unavailable via emulation.
 RUN pip install --upgrade "polars[rtcompat]<1.38.0"
