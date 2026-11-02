@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `fetch_mavedb_scores`: builds the pipeline's input table from a list of MaveDB score sets via the public MaveDB API, with an optional per-score-set preferred transcript for `map_variants` and optional MaveDB mapping columns (`--include-mavedb-mappings`).
+
 ## [1.1.0] - 2026-10-12
 
 ### Changed

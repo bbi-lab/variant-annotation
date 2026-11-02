@@ -160,6 +160,18 @@ services:
       - .:/usr/src/app
       - ${VARIANT_DATA_DIR:-./data}:/work
 
+  fetch-mavedb-scores:
+    <<: *tools-image
+    profiles:
+      - tools
+    env_file:
+      - settings/.env
+    entrypoint: ["python", "-m", "src.fetch_mavedb_scores"]
+    command: ["--help"]
+    volumes:
+      - .:/usr/src/app
+      - ${VARIANT_DATA_DIR:-./data}:/work
+
   annotate-predictors:
     <<: *tools-image
     profiles:

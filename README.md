@@ -182,7 +182,7 @@ The annotation pipeline comprises multiple stages that build upon each other. Al
 The complete pipeline flow is:
 
 ```
-Input variants
+Input variants (or [0] fetch_mavedb_scores ──→ MaveDB score sets as input variants)
     ↓
 [1] map_variants ──→ mapped HGVS (c./g./p.)
     ↓
@@ -212,6 +212,22 @@ Output: one row per DNA variant (or fully annotated variants)
 ```
 
 For a detailed comparison with MaveDB's annotation workflow, see [docs/differences_from_mavedb.md](docs/differences_from_mavedb.md).
+
+### Step 0: Fetch MaveDB Score Sets (Optional)
+
+**Purpose:** Build the pipeline's input table from MaveDB score sets, via the public MaveDB API.
+
+See [docs/fetch_mavedb_scores.md](docs/fetch_mavedb_scores.md) for full reference documentation.
+
+**Input:** a CSV/TSV with a `score_set_urn` column and optional `preferred_transcript` column, and/or `--score-set-urn` options
+
+**Output columns:** `gene_symbol`, `score_set_title`, `variant_urn`, `raw_hgvs_nt`, `raw_hgvs_pro`, `score`, `rna_score`, `rna_score_d6`, `rna_score_d20`, `score_data`, `reference_based`, `target_sequence_type`, `target_sequence`, `preferred_transcript`; optionally MaveDB's own mappings (`mavedb_mapped_hgvs_g`/`_c`/`_p`) with `--include-mavedb-mappings`
+
+**Command:**
+```bash
+src/scripts/run_fetch_mavedb_scores.sh data/excalibr_domainome/excalibr_domainome.0.tsv \
+    --score-sets-file data/excalibr_domainome/score_sets.tsv
+```
 
 ### Step 1: Map Variants (Required)
 
