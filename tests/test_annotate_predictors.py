@@ -193,6 +193,25 @@ def test_lookup_revel_transcript_mode_version_stripped_match(tmp_path):
     assert result == "0.5000"
 
 
+def test_lookup_revel_transcript_mode_matches_semicolon_list(tmp_path):
+    """REVEL lists every transcript sharing the change; our transcript can be any entry."""
+    lines = [
+        "1\t69094\tT\tA\t0.9900\tT\tI\tENST00000123456;ENST00000222222",  # other transcripts
+        "1\t69094\tT\tA\t0.4200\tT\tI\tENST00000111111;ENST00000999999",  # includes ours
+    ]
+    dummy_path = tmp_path / "revel.tsv.gz"
+    dummy_path.touch()
+    cache: dict = {}
+
+    with patch.object(mod, "_run_tabix", return_value=lines):
+        result = _lookup_revel(
+            dummy_path, "1", 69094, "T", "A", cache,
+            mode="transcript", transcript_id="ENST00000999999.2",
+        )
+
+    assert result == "0.4200"
+
+
 def test_lookup_revel_transcript_mode_no_transcript_id_returns_none(tmp_path):
     """No resolved transcript (e.g. RefSeq → Ensembl mapping missed) → no score, no tabix call."""
     dummy_path = tmp_path / "revel.tsv.gz"
@@ -298,6 +317,13 @@ def test_transcript_ids_match_version_stripped_fallback():
 
 def test_transcript_ids_match_different_transcript():
     assert _transcript_ids_match("ENST00000357654.9", "ENST00000111111.1") is False
+
+
+def test_transcript_ids_match_semicolon_list():
+    listed = "ENST00000221996;ENST00000539067"
+    assert _transcript_ids_match(listed, "ENST00000539067") is True
+    assert _transcript_ids_match(listed, "ENST00000221996.8") is True
+    assert _transcript_ids_match(listed, "ENST00000111111") is False
 
 
 def test_transcript_ids_match_empty_values():

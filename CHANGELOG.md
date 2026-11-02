@@ -10,6 +10,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - `fetch_mavedb_scores`: builds the pipeline's input table from a list of MaveDB score sets via the public MaveDB API, with an optional per-score-set preferred transcript for `map_variants` and optional MaveDB mapping columns (`--include-mavedb-mappings`).
 
+### Fixed
+
+- `annotate_predictors`: `--revel-mode transcript` (the default) now matches any entry in REVEL's semicolon-separated transcript field. It previously compared the whole field, so rows listing more than one transcript never matched and those variants got a blank `revel.score`.
+
 ## [1.1.0] - 2026-10-12
 
 ### Changed

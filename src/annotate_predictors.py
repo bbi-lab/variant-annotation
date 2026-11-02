@@ -597,19 +597,25 @@ def _lookup_mutpred2_train(
 
 
 def _transcript_ids_match(revel_transcript_id: str, target_transcript_id: str) -> bool:
-    """Compare an Ensembl transcript accession from REVEL against the resolved target.
+    """Compare Ensembl transcript accession(s) from REVEL against the resolved target.
 
+    REVEL's transcript field is a semicolon-separated list when the same
+    amino-acid change applies to several transcripts; any entry can match.
     Tries an exact (versioned) match first, then falls back to the
     version-stripped base accession, since REVEL and a MANE mapping may pin
     different versions of the same underlying transcript.
     """
     if not revel_transcript_id or not target_transcript_id:
         return False
-    if revel_transcript_id == target_transcript_id:
-        return True
-    base_a = revel_transcript_id.rsplit(".", 1)[0] if "." in revel_transcript_id else revel_transcript_id
     base_b = target_transcript_id.rsplit(".", 1)[0] if "." in target_transcript_id else target_transcript_id
-    return base_a == base_b
+    for candidate in revel_transcript_id.split(";"):
+        candidate = candidate.strip()
+        if candidate == target_transcript_id:
+            return True
+        base_a = candidate.rsplit(".", 1)[0] if "." in candidate else candidate
+        if base_a == base_b:
+            return True
+    return False
 
 
 def _resolve_ensembl_transcript(

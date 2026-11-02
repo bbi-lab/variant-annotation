@@ -32,12 +32,12 @@ The two training-set columns are independent, optional additions — they can be
 
 ## REVEL disambiguation modes
 
-REVEL's precomputed file has one row per genomic position **per overlapping transcript**. A genomic position can be missense on one transcript and non-missense (e.g. synonymous) on the transcript this project annotates — so which row(s) count matters. `--revel-mode {coordinate,transcript,aa}` (default: `transcript`) controls it:
+REVEL's precomputed file has one row per genomic position **per distinct amino-acid change**, with the transcripts sharing that change listed in a semicolon-separated transcript field. A genomic position can be missense on one transcript and non-missense (e.g. synonymous) on the transcript this project annotates — so which row(s) count matters. `--revel-mode {coordinate,transcript,aa}` (default: `transcript`) controls it:
 
 | Mode | Behavior | Requires |
 |---|---|---|
 | `coordinate` | Max score across every row matching `(chrom, pos, ref, alt)`, regardless of transcript. Legacy behavior; can attach a score to a variant this project itself calls non-missense. | Plain 5-column `revel_hg38.tsv.gz` |
-| `transcript` (default) | Additionally require the row's Ensembl transcript ID to match this variant's own transcript (mapped from RefSeq via `--revel-mane-file` or `--revel-transcript-mapping-file`). | Extended `revel_hg38.tsv.gz` (see "Data file preparation" below) + a transcript mapping |
+| `transcript` (default) | Additionally require one of the row's Ensembl transcript IDs to match this variant's own transcript (mapped from RefSeq via `--revel-mane-file` or `--revel-transcript-mapping-file`). | Extended `revel_hg38.tsv.gz` (see "Data file preparation" below) + a transcript mapping |
 | `aa` | Additionally require the row's `aaref`/`aaalt` to equal this variant's own amino-acid ref/alt. Since REVEL's rows are always missense (`aaref != aaalt`), a variant with `aa_ref == aa_alt` (synonymous) can never match. Reproduces the join used by the original pipeline notebook. | Extended `revel_hg38.tsv.gz` |
 
 `transcript` mode reads the variant's RefSeq transcript from `--mapped-hgvs-c-transcript-col` (default: `mapped_hgvs_c_transcript`) and needs exactly one of:
