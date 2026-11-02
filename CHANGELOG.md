@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - `fetch_mavedb_scores`: builds the pipeline's input table from a list of MaveDB score sets via the public MaveDB API, with an optional per-score-set preferred transcript for `map_variants` and optional MaveDB mapping columns (`--include-mavedb-mappings`).
+- `annotate_simplified_consequence`: adds `simplified_consequence`, `condensed_consequence`, `splice_variant`, and `splice_var_amino` from VEP consequences and SpliceAI scores. `splice_variant` is blank for a DNA candidate with neither.
 
 ### Fixed
 
