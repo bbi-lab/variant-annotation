@@ -40,6 +40,7 @@ def get_dna_variant_columns(df: pd.DataFrame) -> List[str]:
     - Hard-coded DNA variant columns (mapped_hgvs_g, mapped_hgvs_c, dna_clingen_allele_id)
     - Parsed position/allele columns (mapped_hgvs_*_{start,stop,ref,alt})
     - Intronic region flags (touches_intronic_region, spans_intron)
+    - Per-candidate consequence columns (simplified_consequence, splice_variant)
     - Any columns with known annotation prefixes (spliceai., clinvar., gnomad.)
 
     Args:
@@ -66,6 +67,8 @@ def get_dna_variant_columns(df: pd.DataFrame) -> List[str]:
         "touches_intronic_region",
         "spans_intron",
         "dna_clingen_allele_id",
+        "simplified_consequence",
+        "splice_variant",
     ]
 
     # Annotation prefixes that get pipe-delimited for multi-candidate rows

@@ -121,6 +121,29 @@ class TestGetDnaVariantColumns:
         assert cols == []
 
 
+class TestConsequenceColumns:
+    """Per-candidate consequence columns split; variant-level summaries don't."""
+
+    def test_splits_per_candidate_columns_only(self, tmp_path):
+        input_path = tmp_path / "in.tsv"
+        output_path = tmp_path / "out.tsv"
+        pd.DataFrame({
+            "mapped_hgvs_g": ["g.1A>T|g.2A>T|g.3A>T"],
+            "simplified_consequence": ["missense_variant|splice_site_variant|"],
+            "condensed_consequence": ["conflict_consequence"],
+            "splice_variant": ["No|Yes|"],
+            "splice_var_amino": ["Yes"],
+        }).to_csv(input_path, sep="\t", index=False)
+
+        flatten_dna_variants(input_path, output_path)
+
+        rows = pd.read_csv(output_path, sep="\t", dtype=str, keep_default_na=False)
+        assert rows["simplified_consequence"].tolist() == ["missense_variant", "splice_site_variant", ""]
+        assert rows["splice_variant"].tolist() == ["No", "Yes", ""]
+        assert rows["condensed_consequence"].tolist() == ["conflict_consequence"] * 3
+        assert rows["splice_var_amino"].tolist() == ["Yes"] * 3
+
+
 class TestHasDnaVariants:
     """Tests for checking if a row has DNA variants."""
 
