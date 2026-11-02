@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 
 - `annotate_predictors`: `--revel-mode transcript` (the default) now matches any entry in REVEL's semicolon-separated transcript field. It previously compared the whole field, so rows listing more than one transcript never matched and those variants got a blank `revel.score`.
+- `filter_rows` (`utilities filter-rows`): output now has LF line endings instead of CRLF.
 
 ## [1.1.0] - 2026-10-12
 

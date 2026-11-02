@@ -60,6 +60,17 @@ def test_filter_rows_all_mode(tmp_path):
     assert rows == [{"id": "1", "a": "x", "b": "y"}]
 
 
+@pytest.mark.parametrize("input_line_ending", ["\n", "\r\n"])
+def test_filter_rows_writes_lf_line_endings(tmp_path, input_line_ending):
+    in_path = tmp_path / "in.tsv"
+    out_path = tmp_path / "out.tsv"
+    in_path.write_bytes(input_line_ending.join(["id\ta", "1\tx", "2\t", ""]).encode())
+
+    filter_rows(str(in_path), str(out_path), ["a"], match="any")
+
+    assert out_path.read_bytes() == b"id\ta\n1\tx\n"
+
+
 def test_filter_rows_missing_column_raises(tmp_path):
     in_path = tmp_path / "in.tsv"
     out_path = tmp_path / "out.tsv"

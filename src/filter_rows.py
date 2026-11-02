@@ -90,6 +90,7 @@ def filter_rows(
                 out_fh,
                 fieldnames=fieldnames,
                 delimiter=out_sep,
+                lineterminator="\n",
                 extrasaction="ignore",
             )
             writer.writeheader()
